@@ -23,6 +23,15 @@ const TREASURY_ABI = [
   "function keeperBountyAmount() external view returns (uint256)"
 ];
 
+// AaveHedgeManager ABI (for monitoring the AAVE V3 hedge on the DN pool)
+// totalCollateralBase / totalDebtBase / availableBorrowsBase: USD with 8 decimals
+// (Chainlink base-currency convention)
+// healthFactor: 1e18 fixed-point
+const AAVE_HEDGE_ABI = [
+  "function getHedgeData() external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase)",
+  "function getHealthFactor() external view returns (uint256)"
+];
+
 function createContracts(provider) {
   const rangeManager = new ethers.Contract(
     process.env.RANGEMANAGER_ADDRESS,
@@ -34,7 +43,16 @@ function createContracts(provider) {
     VAULT_ABI,
     provider
   );
-  return { rangeManager, vault };
+  // hedgeManager is optional — only attached when AAVE_HEDGE_MANAGER_ADDRESS is configured.
+  let hedgeManager = null;
+  if (process.env.AAVE_HEDGE_MANAGER_ADDRESS) {
+    hedgeManager = new ethers.Contract(
+      process.env.AAVE_HEDGE_MANAGER_ADDRESS,
+      AAVE_HEDGE_ABI,
+      provider
+    );
+  }
+  return { rangeManager, vault, hedgeManager };
 }
 
-module.exports = { RANGEMANAGER_ABI, VAULT_ABI, TREASURY_ABI, createContracts };
+module.exports = { RANGEMANAGER_ABI, VAULT_ABI, TREASURY_ABI, AAVE_HEDGE_ABI, createContracts };

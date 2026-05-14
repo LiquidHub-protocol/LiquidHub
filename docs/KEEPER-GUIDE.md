@@ -75,11 +75,51 @@ This prints the current pool state, whether a rebalance is needed, and the curre
 
 ---
 
-## Keeper Bounty
+## Keeper Bounties
 
-- If enabled by the protocol, each successful rebalance pays `KEEPER_BOUNTY_AMOUNT` USDC from the Treasury.
-- The bounty is paid automatically at the end of the rebalance — no manual claim is needed.
-- If the bounty is disabled or the Treasury has insufficient funds, the rebalance still completes successfully (bounty payment is wrapped in a try/catch).
+Two distinct bounties can be earned by community keepers, paid in USDC directly from the Treasury contract on the same chain.
+
+### 1. Rebalance Bounty (Phase 1)
+
+- Paid for every successful `rebalance()` execution during the 2-minute community priority window.
+- Default amount: **0.5 USDC** per rebalance (`KEEPER_BOUNTY_AMOUNT=500000`).
+- Paid automatically at the end of the rebalance — no manual claim.
+- The internal protocol bot waits 2 minutes (configurable on-chain via `keeperWindow`) before doing the rebalance itself, leaving the priority window open for community keepers.
+- **Silent no-op**: if the bounty is disabled or the Treasury has insufficient funds, the rebalance still completes successfully (bounty payment is wrapped in a try/catch by the contract).
+
+### 2. Bridge Bounty (Phase 2)
+
+Once the protocol transitions to Phase 2 (admin withdrawal irreversibly disabled via `disableAdminWithdraw()`), the protocol fees accumulated in the Treasury must be sent to the StakingRewards contract on the staking chain. This is permissionless — anyone can trigger it.
+
+- Paid for every successful `bridgeToStakers()` or `collectAndBridge()` call.
+- Default amount: **2 USDC** per bridge (`BRIDGE_BOUNTY_AMOUNT=2000000`), designed to cover the Stargate cross-chain fees (~$1–3) plus a small incentive on top.
+- The caller pays the cross-chain Stargate fees in native ETH via `msg.value`.
+- The destination address is configured by the multisig and locked into the contract — the keeper cannot redirect funds.
+- **Silent no-op** when disabled or insufficient balance, same pattern as the rebalance bounty.
+
+#### Anti-drain protections (read carefully)
+
+The bridge bounty includes two **on-chain rate-limiters** to prevent abuse:
+
+1. **Cooldown** (default 6h): the bounty is paid at most once per cooldown window. Spamming bridges only earns one bounty per window.
+2. **Minimum bridged amount** (default 50× the bounty): with a 2 USDC bounty, you must bridge ≥ 100 USDC in a single call to earn the bounty.
+
+The bridge function is always callable, only the bounty payment is rate-limited. Read `bridgeBountyCooldown`, `bridgeBountyMinRatio`, `lastBridgeBountyAt` and the Treasury USDC balance on-chain before deciding to bridge.
+
+#### Community priority window
+
+The protocol's internal fallback bot runs the bridge **every 12h** while the on-chain cooldown is **6h**. This means each cooldown cycle has a **6-hour community-priority window**: any community keeper who calls the bridge during that window earns the bounty before the internal bot can. If no keeper acts within those 6h, the internal bot bridges as a fallback at the next 12h tick.
+
+A reference Phase 2 keeper implementation is provided in [`/keepers/bridge-keeper`](../keepers/bridge-keeper/).
+
+### Bounty payment guarantees
+
+```
+- Bounties are paid by the Treasury, not the user
+- Both bounties cannot revert the underlying action (rebalance or bridge)
+- Bounties are paid to msg.sender (whoever called the function)
+- All payments emit events (KeeperBountyPaid, BridgeBountyPaid) for audit
+```
 
 ---
 

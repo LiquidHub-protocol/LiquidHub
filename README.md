@@ -20,7 +20,7 @@ Two branches:
 | **RangeManager** | Uniswap V3 price range management, on-chain swaps via SwapRouter, permissionless rebalancing |
 | **RangeOperations** | Library for tick/range calculations |
 | **SecureBotModule** | Gnosis Safe module whitelisting specific function selectors for automated operations |
-| **Treasury** | Protocol fee collection, keeper bounties, admin withdrawals with monthly cap, LayerZero bridge (Phase 2) |
+| **Treasury** | Protocol fee collection, dual bounty system (rebalance/closure + bridge), capped admin withdrawals (Phase 1), permissionless cross-chain distribution to stakers (Phase 2) |
 | **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: supply/borrow, flash loan settlement, health factor monitoring |
 | **TradingVault** | *(Trading)* ERC-4626 USDC vault for GMX v2 perpetual trading with on-chain risk limits |
 | **TradingBotModule** | *(Trading)* Safe module for trading bot — whitelists open/close/updateSL/updateTP |

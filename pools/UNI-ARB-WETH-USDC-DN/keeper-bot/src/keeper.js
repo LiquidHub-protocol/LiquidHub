@@ -1,4 +1,4 @@
-require('dotenv').config({ path: require('path').join(__dirname, '..', '..', '.env.example') });
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 
 const { ethers } = require('ethers');
 const { RPCPool } = require('./utils/rpc');
@@ -60,43 +60,46 @@ async function main() {
       );
 
       console.log(`  Position: ${hasPosition ? '#' + tokenId.toString() : 'none'}`);
-      console.log(`  Needs rebalance: ${needsRebalance}`);
-      console.log(`  Action: ${action}`);
-      console.log(`  Reason: ${reason}`);
+      if (hasPosition) {
+        console.log(`  Needs rebalance: ${needsRebalance}`);
+      }
 
-      // DN: Show hedge health
+      // DN: Show AAVE hedge state. Mirrors the format used by the protocol's
+      // dn-aave-watcher (`aave-watcher.js`) so logs are easy to compare.
+      // getHedgeData() returns: totalCollateralBase, totalDebtBase, healthFactor,
+      // availableBorrowsBase (all 8-decimal USD except healthFactor in 1e18).
       if (hedgeManager) {
         try {
-          const hf = await hedgeManager.getHealthFactor();
-          const hfFloat = Number(hf) / 1e18;
-          const warnThreshold = parseFloat(process.env.AAVE_HEALTH_WARN || '1.25');
-          let status = 'OK';
-          if (hfFloat < parseFloat(process.env.AAVE_HEALTH_EMERGENCY || '1.05')) status = 'EMERGENCY';
-          else if (hfFloat < parseFloat(process.env.AAVE_HEALTH_DELEVERAGE || '1.15')) status = 'DELEVERAGE';
-          else if (hfFloat < warnThreshold) status = 'WARNING';
-          console.log(`  AAVE Health Factor: ${hfFloat.toFixed(4)} (${status})`);
+          const [totalCollateralBase, totalDebtBase, healthFactor] = await hedgeManager.getHedgeData();
+          const totalCollateralUSD = Number(totalCollateralBase) / 1e8;
+          const totalDebtUSD = Number(totalDebtBase) / 1e8;
+          if (totalCollateralUSD < 1 && totalDebtUSD < 1) {
+            console.log(`  [UNI-ARB-WETH-USDC-DN] No AAVE position (collateral=$${totalCollateralUSD.toFixed(2)}, debt=$${totalDebtUSD.toFixed(2)}) — skip`);
+          } else {
+            const hfFloat = Number(healthFactor) / 1e18;
+            const warnThreshold = parseFloat(process.env.AAVE_HEALTH_WARN || '1.25');
+            let status = 'OK';
+            if (hfFloat < parseFloat(process.env.AAVE_HEALTH_EMERGENCY || '1.05')) status = 'EMERGENCY';
+            else if (hfFloat < parseFloat(process.env.AAVE_HEALTH_DELEVERAGE || '1.15')) status = 'DELEVERAGE';
+            else if (hfFloat < warnThreshold) status = 'WARNING';
+            console.log(`  AAVE: collateral=$${totalCollateralUSD.toFixed(2)}, debt=$${totalDebtUSD.toFixed(2)}, HF=${hfFloat.toFixed(4)} (${status})`);
+          }
         } catch (e) {
-          console.log(`  AAVE Health Factor: unavailable`);
+          console.log(`  AAVE: unavailable (${(e.message || '').slice(0, 80)})`);
         }
       }
 
-      if (!needsRebalance) {
+      // Public keepers can ONLY call rebalance() — it is the only public function
+      // on the RangeManager. Other actions (MINT_INITIAL, etc.) are gated on-chain
+      // by `onlyAuthorized` and reserved for the protocol bot / Safe, so we just
+      // wait silently for the next cycle.
+      if (!needsRebalance || action !== 'REBALANCE') {
         console.log('  -> No action needed\n');
       } else if (CHECK_ONLY) {
         console.log('  -> Rebalance needed (check-only mode, skipping)\n');
       } else {
-        console.log(`  -> Executing ${action}...`);
-
-        let result;
-        if (action === 'REBALANCE') {
-          result = await rebalancer.executeRebalance(tokenId);
-        } else if (action === 'MINT_INITIAL') {
-          result = await rebalancer.executeMint();
-        } else {
-          console.log(`  -> Unknown action: ${action}, skipping\n`);
-          continue;
-        }
-
+        console.log('  -> Executing REBALANCE...');
+        const result = await rebalancer.executeRebalance(tokenId);
         if (result.success) {
           console.log(`  -> Success (${result.txHashes.length} txs)\n`);
         } else {

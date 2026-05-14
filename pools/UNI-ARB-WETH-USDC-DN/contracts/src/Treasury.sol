@@ -75,10 +75,21 @@ contract Treasury is Ownable {
     bool public adminWithdrawEnabled;
     address public stakingRewardsAddress;
 
-    // --- Keeper Bounty ---
+    // --- Keeper Bounty (rebalance) ---
     bool public keeperBountyEnabled;
     uint256 public keeperBountyAmount;
     mapping(address => bool) public authorizedRangeManagers;
+
+    // --- Bridge Bounty (Phase 2) — paid to whoever calls bridgeToStakers / collectAndBridge ---
+    // Anti-drain protections (configurable by multisig):
+    //  - cooldown:  bounty paid at most once per `bridgeBountyCooldown` seconds
+    //  - min ratio: bridged amount must be >= bridgeBountyAmount * BRIDGE_BOUNTY_MIN_RATIO
+    //               (default 50, ie. you must bridge >= 50× the bounty value to earn it)
+    bool public bridgeBountyEnabled;
+    uint256 public bridgeBountyAmount;
+    uint64 public bridgeBountyCooldown;     // seconds between two bounty payments
+    uint64 public lastBridgeBountyAt;       // unix timestamp of the last paid bounty
+    uint16 public bridgeBountyMinRatio;     // bounty paid only if bridged >= bountyAmount * ratio
 
     // --- Bridge (Stargate v2) ---
     bool public bridgeEnabled;
@@ -94,6 +105,9 @@ contract Treasury is Ownable {
     event SwappedToUSDC(address indexed tokenIn, uint24 fee, uint256 amountIn, uint256 usdcOut);
     event KeeperBountyPaid(address indexed keeper, uint256 amount);
     event KeeperBountyConfigured(bool enabled, uint256 amount);
+    event BridgeBountyPaid(address indexed keeper, uint256 amount);
+    event BridgeBountyConfigured(bool enabled, uint256 amount);
+    event BridgeBountyCooldownConfigured(uint64 cooldown, uint16 minRatio);
     event BridgeConfigured(bool enabled, uint32 dstEid, address destination);
     event BridgedToStakers(uint256 amountSent, uint256 amountReceived, uint32 dstEid, bytes32 guid);
     event RangeManagerAuthorized(address indexed rangeManager, bool authorized);
@@ -182,6 +196,21 @@ contract Treasury is Ownable {
             stargatePool.sendToken{value: fee.nativeFee}(sendParam, fee, msg.sender);
 
         emit BridgedToStakers(oftReceipt.amountSentLD, oftReceipt.amountReceivedLD, bridgeDestinationEid, msgReceipt.guid);
+        _payBridgeBounty(msg.sender, oftReceipt.amountSentLD);
+    }
+
+    /// @dev Pays the bridge bounty to `keeper` if enabled, the treasury holds enough USDC,
+    ///      the cooldown has passed, and `bridgedAmount` is large enough to justify the bounty.
+    ///      Silent no-op otherwise — never blocks the bridge itself.
+    function _payBridgeBounty(address keeper, uint256 bridgedAmount) internal {
+        if (!bridgeBountyEnabled || bridgeBountyAmount == 0) return;
+        if (block.timestamp < uint256(lastBridgeBountyAt) + uint256(bridgeBountyCooldown)) return;
+        uint256 ratio = uint256(bridgeBountyMinRatio);
+        if (ratio > 0 && bridgedAmount < bridgeBountyAmount * ratio) return;
+        if (usdc.balanceOf(address(this)) < bridgeBountyAmount) return;
+        lastBridgeBountyAt = uint64(block.timestamp);
+        usdc.safeTransfer(keeper, bridgeBountyAmount);
+        emit BridgeBountyPaid(keeper, bridgeBountyAmount);
     }
 
     /// @notice Swap token to USDC + bridge to staking in one transaction. Callable by anyone.
@@ -248,6 +277,7 @@ contract Treasury is Ownable {
 
         usdcBridged = oftReceipt.amountReceivedLD;
         emit CollectedAndBridged(tokenIn, usdcAmount, usdcBridged, bridgeDestinationEid);
+        _payBridgeBounty(msg.sender, oftReceipt.amountSentLD);
     }
 
     /// @notice Estimate bridge fee in native token (ETH/AVAX/MATIC/BNB)
@@ -340,6 +370,23 @@ contract Treasury is Ownable {
         keeperBountyEnabled = _enabled;
         keeperBountyAmount = _amount;
         emit KeeperBountyConfigured(_enabled, _amount);
+    }
+
+    /// @notice Configure the bridge bounty (paid to whoever calls bridgeToStakers / collectAndBridge).
+    function setBridgeBounty(bool _enabled, uint256 _amount) external onlyOwner {
+        bridgeBountyEnabled = _enabled;
+        bridgeBountyAmount = _amount;
+        emit BridgeBountyConfigured(_enabled, _amount);
+    }
+
+    /// @notice Configure the anti-drain protections for the bridge bounty.
+    /// @param _cooldown Minimum seconds between two paid bounties (e.g. 21600 = 6h).
+    /// @param _minRatio Minimum ratio of bridged amount over bounty amount (e.g. 50 means
+    ///        you must bridge at least 50× the bounty value to earn it). 0 disables the check.
+    function setBridgeBountyCooldown(uint64 _cooldown, uint16 _minRatio) external onlyOwner {
+        bridgeBountyCooldown = _cooldown;
+        bridgeBountyMinRatio = _minRatio;
+        emit BridgeBountyCooldownConfigured(_cooldown, _minRatio);
     }
 
     function authorizeRangeManager(address _rangeManager, bool _authorized) external onlyOwner {

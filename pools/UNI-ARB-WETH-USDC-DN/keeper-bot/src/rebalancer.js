@@ -21,9 +21,10 @@ function divideIntoChunks(totalAmount, numChunks) {
  * Permissionless: no keeper role required — anyone can trigger when needsRebalance is true.
  */
 class Rebalancer {
-  constructor(rangeManager, vault, wallet) {
+  constructor(rangeManager, vault, hedgeManager, wallet) {
     this.rangeManager = rangeManager;
     this.vault = vault;
+    this.hedgeManager = hedgeManager;
     this.wallet = wallet;
     this.rmConnected = this.rangeManager.connect(wallet);
   }
@@ -79,26 +80,6 @@ class Rebalancer {
       return { success: true, txHashes: [receipt.hash] };
     } catch (error) {
       console.error(`Rebalance failed: ${error.message}`);
-      return { success: false, error: error.message, txHashes: [] };
-    }
-  }
-
-  async executeMint() {
-    console.log('\n=== Minting initial position (no swap) ===');
-
-    try {
-      // Empty arrays → contract skips swap, just burns (no-op) + mints + unlocks
-      const tx = await this.rmConnected.rebalance(
-        [],
-        [],
-        process.env.TOKEN0_ADDRESS,
-        process.env.TOKEN1_ADDRESS
-      );
-      const receipt = await tx.wait();
-      console.log(`  Mint complete: ${receipt.hash}`);
-      return { success: true, txHashes: [receipt.hash] };
-    } catch (error) {
-      console.error(`Mint failed: ${error.message}`);
       return { success: false, error: error.message, txHashes: [] };
     }
   }

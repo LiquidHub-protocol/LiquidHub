@@ -53,6 +53,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 totalFeesEarnedToken1;
         uint256 timeWeightedShares;
         uint256 lastTimeUpdate;
+        uint256 firstDepositTime;   // Timestamp du premier dépôt d'une période de détention. Reset à 0 sur withdraw 100%.
     }
     
     struct PendingDeposit {
@@ -351,8 +352,13 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             _updateTimeWeightedShares(pd.user);
             
             // Sauvegarder les time-weighted shares AVANT ajout des nouvelles shares
-            uint256 timeWeightedSharesBeforeDeposit = user.timeWeightedShares;            
-            
+            uint256 timeWeightedSharesBeforeDeposit = user.timeWeightedShares;
+
+            // Marquer le début d'une période de détention si l'utilisateur entre (ou rentre après withdraw total)
+            if (user.shares == 0) {
+                user.firstDepositTime = block.timestamp;
+            }
+
             // Ajouter les nouvelles shares
             user.shares += sharesToMint;
             user.depositedToken0 += pd.amount0;
@@ -462,6 +468,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         _updateTimeWeightedShares(pd.user);
         uint256 timeWeightedSharesBeforeDeposit = user.timeWeightedShares;
+
+        if (user.shares == 0) {
+            user.firstDepositTime = block.timestamp;
+        }
 
         user.shares += sharesToMint;
         user.depositedToken0 += pd.amount0;
@@ -715,10 +725,14 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 bool valid
             ) {
                 if (!valid) return 0;
-                
-                uint256 value0 = (bal0 * uint256(price0)) / 1e18;
-                uint256 value1 = (bal1 * uint256(price1)) / 1e6;
-                
+
+                // Decimales depuis RangeManager pour generaliser a toutes les paires
+                // (anciennement 1e18 / 1e6 hardcodes pour WETH/USDC).
+                RangeOperations.RangeConfig memory config = rangeManager.config();
+
+                uint256 value0 = (bal0 * uint256(price0)) / (10 ** config.token0Decimals);
+                uint256 value1 = (bal1 * uint256(price1)) / (10 ** config.token1Decimals);
+
                 return value0 + value1;
             } catch {
                 return 0;
@@ -817,7 +831,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 depositedValueUSD,
         uint256 lastDepositTime,
         uint256 totalFeesToken0,
-        uint256 totalFeesToken1
+        uint256 totalFeesToken1,
+        uint256 firstDepositTime
     ) {
         UserInfo memory info = userInfo[user];
         shares = info.shares;
@@ -825,6 +840,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         depositedToken1 = info.depositedToken1;
         depositedValueUSD = info.depositedValueUSD;
         lastDepositTime = info.lastDepositTime;
+        firstDepositTime = info.firstDepositTime;
 
         if (info.shares > 0 && totalShares > 0) {
             // Fees deja creditees (comptable)
@@ -1081,6 +1097,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             user.totalFeesEarnedToken1 = 0;
             user.timeWeightedShares = 0;
             user.lastTimeUpdate = 0;
+            user.firstDepositTime = 0;
         } else {
             // Sinon, réduire proportionnellement
             uint256 percentWithdrawn = (shareAmount * 1e18) / (user.shares + shareAmount);

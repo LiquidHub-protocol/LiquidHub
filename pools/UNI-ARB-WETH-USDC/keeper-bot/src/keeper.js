@@ -1,4 +1,4 @@
-require('dotenv').config({ path: require('path').join(__dirname, '..', '..', '.env.example') });
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 
 const { ethers } = require('ethers');
 const { RPCPool } = require('./utils/rpc');
@@ -61,27 +61,21 @@ async function main() {
       );
 
       console.log(`  Position: ${hasPosition ? '#' + tokenId.toString() : 'none'}`);
-      console.log(`  Needs rebalance: ${needsRebalance}`);
-      console.log(`  Action: ${action}`);
-      console.log(`  Reason: ${reason}`);
+      if (hasPosition) {
+        console.log(`  Needs rebalance: ${needsRebalance}`);
+      }
 
-      if (!needsRebalance) {
+      // Public keepers can ONLY call rebalance() — it is the only public function
+      // on the RangeManager. Other actions (MINT_INITIAL, etc.) are gated on-chain
+      // by `onlyAuthorized` and reserved for the protocol bot / Safe, so we just
+      // wait silently for the next cycle.
+      if (!needsRebalance || action !== 'REBALANCE') {
         console.log('  -> No action needed\n');
       } else if (CHECK_ONLY) {
         console.log('  -> Rebalance needed (check-only mode, skipping)\n');
       } else {
-        console.log(`  -> Executing ${action}...`);
-
-        let result;
-        if (action === 'REBALANCE') {
-          result = await rebalancer.executeRebalance(tokenId);
-        } else if (action === 'MINT_INITIAL') {
-          result = await rebalancer.executeMint();
-        } else {
-          console.log(`  -> Unknown action: ${action}, skipping\n`);
-          continue;
-        }
-
+        console.log('  -> Executing REBALANCE...');
+        const result = await rebalancer.executeRebalance(tokenId);
         if (result.success) {
           console.log(`  -> Success (${result.txHashes.length} txs)\n`);
         } else {
