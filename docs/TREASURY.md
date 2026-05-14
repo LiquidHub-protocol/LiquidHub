@@ -8,23 +8,39 @@ One Treasury contract is deployed per network for the LP pools.
 
 ---
 
+## Decentralization Status — Phase 1
+
+The protocol is currently in **Phase 1 of its decentralization roadmap**. What this means for the Treasury:
+
+| Aspect | Phase 1 (current) | Phase 2 (planned) |
+|--------|-------------------|-------------------|
+| Governance | Gnosis Safe 2-of-3 multisig controls all configuration | Same multisig, but admin withdrawals locked |
+| Admin withdrawals | Enabled, capped by a configurable monthly limit | `disableAdminWithdraw()` called irreversibly — Treasury locked against any admin withdrawal |
+| Keeper bounty | **Not yet enabled** — disabled by default at deployment _(soon)_ | Permissionless, fully active |
+| Bridge to stakers | Not yet deployed _(soon)_ | `bridgeToStakers()` / `collectAndBridge()` live, fees routed to stakers |
+
+We believe clarity on what is and isn't decentralized matters more than marketing claims. Every function described below already exists on-chain and is verified on the block explorer — the table above states what is *enabled* today versus what is planned.
+
+---
+
 ## Fee Sources
 
 | Source | Tokens | Mechanism |
 |--------|--------|-----------|
 | LP commissions | token0 + token1 (e.g. WETH + USDC) | Collected during each rebalance, sent from vault to Treasury |
 | Frontend swap commissions | Any ERC-20 | Via DEX aggregator partner fee (`PARTNER_FEE_BPS`, e.g. 0.03%) |
-| Keeper bounty fund | USDC | Pre-funded by protocol for incentive payments (see below) |
+| Keeper bounty fund | USDC | Pre-funded by protocol for incentive payments _(soon — see below)_ |
 
 ---
 
-## Admin Withdrawal
+## Admin Withdrawal (Phase 1)
 
 - **Monthly cap**: `USDC_MONTHLY_CAP` (initial: 15,000 USDC).
 - **Only the owner** (Gnosis Safe multisig) can call `adminWithdraw(amount, to)`.
 - The cap resets every 30 days automatically.
 - The cap can be modified at any time via `setMonthlyCap(newCap)` (multisig).
 - Each withdrawal emits an on-chain event (`AdminWithdrawal`) that anyone can audit, and is also documented off-chain on the public **Treasury Transparency** page on liquidhub.app.
+- In **Phase 2**, `disableAdminWithdraw()` can be called irreversibly, permanently locking the Treasury against any admin withdrawal.
 
 ---
 
@@ -42,9 +58,11 @@ Converts **any ERC-20 token** held by the Treasury to USDC via Uniswap V3.
 
 ---
 
-## Keeper Bounty
+## Keeper Bounty _(soon — not yet enabled)_
 
-The Treasury includes a keeper bounty system that rewards community keepers who execute critical maintenance operations, with USDC paid directly from the Treasury. The bounty is **silent no-op** when disabled or when the Treasury balance is insufficient — it never blocks the underlying action.
+The Treasury includes a keeper bounty system that rewards community keepers who execute critical maintenance operations, with USDC paid directly from the Treasury. The bounty is **disabled by default at deployment** and is **not yet enabled** — it is part of the Phase 1 → Phase 2 rollout. It is configurable by the multisig in Phase 1 and becomes fully permissionless once admin withdrawals are irreversibly disabled in Phase 2.
+
+The bounty is a **silent no-op** when disabled (which is the case today) or when the Treasury balance is insufficient — it never blocks the underlying action.
 
 - **LP rebalances**: paid when a community keeper calls `rebalance()` on the RangeManager during the priority window. The RangeManager itself triggers `payKeeperBounty(keeper)` on the Treasury inside a try/catch.
 - **Configurable on-chain** via `setKeeperBounty(enabled, amount)` on the Treasury (multisig only).
@@ -53,12 +71,12 @@ The Treasury includes a keeper bounty system that rewards community keepers who 
 
 ### Bounty payment semantics
 
-The bounty system uses a best-effort safety pattern: if the bounty cannot be paid (disabled, or insufficient Treasury balance), the payment is skipped silently and the underlying rebalance still succeeds.
+The bounty system uses a best-effort safety pattern: if the bounty cannot be paid (disabled — which is the case today — or insufficient Treasury balance), the payment is skipped silently and the underlying rebalance still succeeds.
 
 This guarantees:
 - **No revert** of the rebalance if the bounty cannot be paid
 - **Predictable user experience** for community keepers (bounty is best-effort, action is guaranteed)
-- **Multisig safety** — disabling the bounty during a configuration change cannot lock anything
+- **Multisig safety** — enabling or disabling the bounty during a configuration change cannot lock anything
 
 ---
 
@@ -75,14 +93,15 @@ Both functions are `onlyOwner`.
 
 ## Configuration Functions (multisig only)
 
-| Function | Purpose |
-|----------|---------|
-| `setMonthlyCap(newCap)` | Modify the admin withdrawal cap |
-| `setKeeperBounty(enabled, amount)` | Configure the rebalance bounty |
-| `authorizeRangeManager(rm, authorized)` | Whitelist a RangeManager for `payKeeperBounty()` |
-| `rescueToken(token, to, amount)` | Recover ERC-20 sent by mistake (non-USDC) |
-| `rescueETH(to, amount)` | Recover native ETH sent by mistake |
-| `transferOwnership(newOwner)` | Transfer Treasury ownership (e.g. to a Timelock) |
+| Function | Purpose | Status |
+|----------|---------|--------|
+| `setMonthlyCap(newCap)` | Modify the admin withdrawal cap | Active (Phase 1) |
+| `setKeeperBounty(enabled, amount)` | Configure the rebalance bounty | _soon — disabled by default_ |
+| `authorizeRangeManager(rm, authorized)` | Whitelist a RangeManager for `payKeeperBounty()` | Active (Phase 1) |
+| `disableAdminWithdraw()` | Irreversibly lock the Treasury against admin withdrawals | _Phase 2_ |
+| `rescueToken(token, to, amount)` | Recover ERC-20 sent by mistake (non-USDC) | Active |
+| `rescueETH(to, amount)` | Recover native ETH sent by mistake | Active |
+| `transferOwnership(newOwner)` | Transfer Treasury ownership (e.g. to a Timelock) | Active |
 
 ---
 
@@ -92,7 +111,7 @@ Both functions are `onlyOwner`.
 |----------|---------|
 | `monthlyCap()` | Current monthly cap in USDC (6 decimals) |
 | `currentMonthWithdrawn()` | Already withdrawn this month |
-| `keeperBountyEnabled()` / `keeperBountyAmount()` | Rebalance bounty config |
+| `keeperBountyEnabled()` / `keeperBountyAmount()` | Rebalance bounty config (currently disabled) |
 
 ---
 
