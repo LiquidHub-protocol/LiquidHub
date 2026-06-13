@@ -4,7 +4,7 @@
 
 After deploying all Liquid Hub contracts, the following Gnosis Safe multisig transactions must be executed to configure the system. Each step requires 2-of-3 signer approval.
 
-Use the **Transaction Builder** app in the Gnosis Safe UI. For each step, paste the contract address, the JSON ABI, select the function, and fill in the parameters.
+Use the **Transaction Builder** app in the Gnosis Safe UI. For each step, paste the contract address, the JSON ABI, select the function, and fill in the parameters. The deployed contract addresses are published on the Contracts page: **http://liquidhub.app/docs#contracts-addresses**.
 
 ## Prerequisites
 

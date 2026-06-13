@@ -27,46 +27,54 @@ class Rebalancer {
     this.hedgeManager = hedgeManager;
     this.wallet = wallet;
     this.rmConnected = this.rangeManager.connect(wallet);
+    this.vaultConnected = this.vault.connect(wallet);
   }
 
   async executeRebalance(tokenId) {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
     try {
-      // 1. Read optimal swap params (what the contract would expect)
-      const swapParams = await this.rangeManager.getOptimalSwapParams();
+      // 1. AUDIT M-01 : en DN, le plan de swap du rebalance doit viser une composition LP compatible avec la
+      // DETTE AAVE FIXE (rebalance() ne touche pas AAVE) : wethInLP ≈ effectiveShort/H. Sinon le post-check DN
+      // on-chain reverte. On utilise donc la vue dédiée getRebalanceSwapParams (Vault) au lieu du plan range
+      // getOptimalSwapParams — valable que le rebalance soit déclenché par le range OU par un drift DN in-range.
+      const [zeroForOne, amountIn] = await this.vault.getRebalanceSwapParams();
 
       let swapAmounts = [];
       let minOuts = [];
       let tokenIn = process.env.TOKEN0_ADDRESS;
       let tokenOut = process.env.TOKEN1_ADDRESS;
 
-      if (swapParams.swapNeeded && swapParams.amountIn > 0n) {
+      if (amountIn > 0n) {
         const token0 = process.env.TOKEN0_ADDRESS;
         const token1 = process.env.TOKEN1_ADDRESS;
-        tokenIn = swapParams.zeroForOne ? token0 : token1;
-        tokenOut = swapParams.zeroForOne ? token1 : token0;
+        tokenIn = zeroForOne ? token0 : token1;
+        tokenOut = zeroForOne ? token1 : token0;
 
         // Read on-chain chunk cap (initMultiSwapTvl in USD, contract value)
         const initMultiSwapTvl = await this.rangeManager.initMultiSwapTvl();
         const priceCache = await this.rangeManager.priceCache();
-        const decimals = swapParams.zeroForOne
-          ? parseInt(process.env.TOKEN0_DECIMALS || '18', 10)
-          : parseInt(process.env.TOKEN1_DECIMALS || '6', 10);
-        const price = swapParams.zeroForOne
+        // Decimals read ON-CHAIN from config() (generic for any pair, not the .env) — same source as processDeposit
+        const cfg = await this.rangeManager.config();
+        const dec0 = Number(cfg.token0Decimals);
+        const dec1 = Number(cfg.token1Decimals);
+        const decimals = zeroForOne ? dec0 : dec1;
+        const price = zeroForOne
           ? Number(priceCache.price0) / 1e8
           : Number(priceCache.price1) / 1e8;
 
-        const amountUSD = parseFloat(ethers.formatUnits(swapParams.amountIn, decimals)) * price;
+        const amountUSD = parseFloat(ethers.formatUnits(amountIn, decimals)) * price;
         const capUSD = Number(initMultiSwapTvl);
 
         // Number of chunks to stay under the on-chain per-chunk cap
         const numSwaps = capUSD > 0 ? Math.max(1, Math.ceil(amountUSD / capUSD)) : 1;
-        swapAmounts = divideIntoChunks(swapParams.amountIn, numSwaps);
-        // Contract handles per-pool slippage; 0 = use pool defaults
-        minOuts = swapAmounts.map(() => 0n);
+        swapAmounts = divideIntoChunks(amountIn, numSwaps);
+        // AUDIT H-03 : minOut DOIT respecter le plancher oracle on-chain (validateMinOutsAgainstOracle) —
+        // 0 ferait revert "minOut<floor". Même calcul que le dépôt (_oracleMinOut), pas de 0.
+        const slippageBps = Number(cfg.maxSlippageBps);
+        minOuts = swapAmounts.map((amt) => this._oracleMinOut(zeroForOne, amt, priceCache, dec0, dec1, slippageBps));
 
-        console.log(`  Swap: ${numSwaps} chunk(s), ~$${amountUSD.toFixed(0)} total (cap $${capUSD}/chunk)`);
+        console.log(`  Swap: ${numSwaps} chunk(s), ~$${amountUSD.toFixed(0)} total (cap $${capUSD}/chunk), minOut oracle-floored`);
       } else {
         console.log('  No swap needed (already balanced)');
       }
@@ -82,6 +90,95 @@ class Rebalancer {
       console.error(`Rebalance failed: ${error.message}`);
       return { success: false, error: error.message, txHashes: [] };
     }
+  }
+
+  /**
+   * Processes ONE queued user deposit permissionlessly (earns the deposit bounty).
+   *
+   * CRITICAL anti-MEV difference vs rebalance: the rebalance keeper can pass minOut=0 (the contract
+   * uses pool defaults), but for DEPOSITS the contract requires minAmountsOut[i] >= an on-chain
+   * oracle floor. So we MUST compute minOuts from the Chainlink price here (not 0), otherwise the
+   * tx reverts with the deposit error. The contract re-validates everything on-chain.
+   *
+   * DN note (audit L-01) : the deposit path DOES open the AAVE hedge ATOMICALLY on-chain, inside
+   * processDepositPermissionless (via DnDepositLib.openDepositHedge) + a strict post-check. The keeper
+   * does not touch AAVE directly; the contract handles supply/borrow/sweep and reverts if the resulting
+   * hedge drifts beyond tolerance.
+   */
+  async processDeposit() {
+    console.log('\n=== Processing queued deposit (permissionless) ===');
+    try {
+      // AUDIT H-01 : pour un DÉPÔT, on utilise la vue DÉDIÉE du Vault (état post-transfert du dépôt +
+      // post-ouverture du hedge), PAS rangeManager.getOptimalSwapParams (qui reflète l état rebalance/post-burn
+      // — inclut le NFT, ignore le dépôt + le WETH emprunté → 0 swap erroné ou swap sur fonds bloqués).
+      const [zeroForOne, amountIn] = await this.vault.getDepositSwapParams();
+
+      let swapAmounts = [];
+      let minOuts = [];
+      let tokenIn = process.env.TOKEN0_ADDRESS;
+      let tokenOut = process.env.TOKEN1_ADDRESS;
+
+      if (amountIn > 0n) {
+        const token0 = process.env.TOKEN0_ADDRESS;
+        const token1 = process.env.TOKEN1_ADDRESS;
+        tokenIn = zeroForOne ? token0 : token1;
+        tokenOut = zeroForOne ? token1 : token0;
+
+        const initMultiSwapTvl = await this.rangeManager.initMultiSwapTvl();
+        const priceCache = await this.rangeManager.priceCache();
+        const cfg = await this.rangeManager.config();
+
+        const dec0 = Number(cfg.token0Decimals);
+        const dec1 = Number(cfg.token1Decimals);
+        const decimals = zeroForOne ? dec0 : dec1;
+        const price = zeroForOne ? Number(priceCache.price0) / 1e8 : Number(priceCache.price1) / 1e8;
+
+        const amountUSD = parseFloat(ethers.formatUnits(amountIn, decimals)) * price;
+        const capUSD = Number(initMultiSwapTvl);
+        const numSwaps = capUSD > 0 ? Math.max(1, Math.ceil(amountUSD / capUSD)) : 1;
+        // AUDIT : cap anti-DoS on-chain DN_MAX_SWAP_CHUNKS=8. Au-delà, processDepositPermissionless reverte
+        // (E_DEPOSIT_TOO_LARGE). On SKIP proprement plutôt que d'envoyer une tx condamnée (pas de gas gaspillé).
+        // Le dépôt reste en tête de file (remboursable via refundStaleHeadDeposit après délai).
+        if (numSwaps > 8) {
+          console.log(`  Deposit needs ${numSwaps} swaps > 8 (anti-DoS cap) -> skip (no tx sent, deposit left in queue).`);
+          return { success: false, error: 'deposit too large (> 8 swap chunks)', txHashes: [] };
+        }
+        swapAmounts = divideIntoChunks(amountIn, numSwaps);
+
+        // Oracle-floored minOuts (same math as the contract floor, RangeOperations.oracleMinOut).
+        const slippageBps = Number(cfg.maxSlippageBps);
+        minOuts = swapAmounts.map((amt) => this._oracleMinOut(zeroForOne, amt, priceCache, dec0, dec1, slippageBps));
+
+        console.log(`  Swap: ${numSwaps} chunk(s), ~$${amountUSD.toFixed(0)} total (cap $${capUSD}/chunk), minOut floored by oracle`);
+      } else {
+        console.log('  No swap needed (deposit already balanced)');
+      }
+
+      console.log('  Executing processDepositPermissionless() on-chain...');
+      const tx = await this.vaultConnected.processDepositPermissionless(swapAmounts, minOuts, tokenIn, tokenOut);
+      const receipt = await tx.wait();
+      console.log(`  Deposit processed: ${receipt.hash}`);
+
+      return { success: true, txHashes: [receipt.hash] };
+    } catch (error) {
+      console.log(`  Deposit: skipped (${(error.reason || error.message || '').slice(0, 90)})`);
+      return { success: false, error: error.message, txHashes: [] };
+    }
+  }
+
+  /**
+   * Replicates RangeOperations.oracleMinOut (on-chain) as a BigInt computation, so the
+   * keeper-supplied minOut meets the contract floor exactly. amountIn / output in token native units.
+   */
+  _oracleMinOut(tokenInIsToken0, amountIn, priceCache, dec0, dec1, slippageBps) {
+    const priceIn = tokenInIsToken0 ? BigInt(priceCache.price0) : BigInt(priceCache.price1);
+    const priceOut = tokenInIsToken0 ? BigInt(priceCache.price1) : BigInt(priceCache.price0);
+    const decIn = tokenInIsToken0 ? dec0 : dec1;
+    const decOut = tokenInIsToken0 ? dec1 : dec0;
+    if (priceOut === 0n) return 0n;
+    const theo = (BigInt(amountIn) * priceIn * (10n ** BigInt(decOut))) / (priceOut * (10n ** BigInt(decIn)));
+    const slip = slippageBps >= 10000 ? 9999n : BigInt(slippageBps);
+    return (theo * (10000n - slip)) / 10000n;
   }
 }
 

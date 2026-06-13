@@ -4,5 +4,12 @@ node_modules/
 .DS_Store
 *.code-workspace
 .claude/
+
+# Pool contract sources are public audit artifacts and must stay trackable.
+!pools/
+!pools/**/
+!pools/**/contracts/
+!pools/**/contracts/src/
+!pools/**/contracts/src/**/*.sol
 trading/
 bridge/

@@ -2,17 +2,28 @@
 
 ## What is a Keeper?
 
-Anyone can run a keeper bot to monitor and execute rebalances for Liquid Hub pools. Keepers watch for out-of-range LP positions and trigger the rebalance process when needed. In return, keepers receive a bounty in USDC (if enabled by the protocol).
+Anyone can run a keeper bot to perform the protocol's permissionless actions for Liquid Hub pools. In return, keepers receive a bounty in USDC (if enabled and the Treasury is funded). There are four keeper actions:
+
+- **Rebalance** an out-of-range LP position (`rebalance()`) — keeper bounty
+- **Process a queued user deposit** (`processDepositPermissionless()`) that converts a pending deposit into LP liquidity — deposit bounty
+- **Record a price snapshot** (`recordPriceSnapshot()`) that feeds the on-chain range calculation — metrics bounty
+- **(Delta-Neutral only) Adjust the AAVE hedge** (`adjustHedge()`) — hedge bounty
 
 ---
 
 ## How It Works
 
-1. The keeper calls `getBotInstructions()` on the `RangeManager` contract.
-2. If `needsRebalance` is `true`, the keeper executes the full rebalance sequence.
-3. After a successful rebalance, the keeper receives a bounty from the Treasury (if enabled).
+Each cycle the keeper:
 
-**Important**: Ranges are configured on-chain by the protocol's Gnosis Safe multisig. The keeper does **not** need to configure or calculate ranges — it only needs to execute the rebalance when instructed.
+1. Calls `getBotInstructions()` on the `RangeManager`; if `needsRebalance` is `true`, executes `rebalance()`.
+2. Reads `getPendingDepositsCount()`; if `> 0`, a position NFT exists, and the vault is not locked, calls `processDepositPermissionless()` to process one queued deposit (atomic; reverts if the queue is empty, no NFT exists, or the oracle cache is stale).
+3. Calls `isSnapshotDue()`; if `true`, calls `recordPriceSnapshot()` (the contract reverts if a snapshot is not yet due).
+4. **(DN only)** Tries `adjustHedge()`; it executes only if the hedge drift exceeds the on-chain threshold, otherwise it reverts (no-op).
+5. After any successful action, the bounty is paid from the Treasury (if enabled).
+
+**Important — oracle freshness**: the keeper records a price snapshot **before** rebalancing/processing deposits (it earns the metrics bounty). Note: `rebalance()` **does refresh the price cache itself** (refresh-and-validate guard at the top), so rebalance freshness no longer depends on this snapshot — keeping the order simply lets one cycle both snapshot and rebalance on a fresh price. `processDepositPermissionless()` also refreshes the oracle atomically on-chain and bounds swap outputs by the oracle (anti-MEV). The keeper must compute `minAmountsOut` from the Chainlink oracle floor for **both** deposits and rebalances (the contract enforces the floor on both paths — never pass 0).
+
+**Important**: the range is computed **100% on-chain** by the `RangeManager` (high/low amplitude over N days, trimmed, scaled by a governance multiplier, rounded to a step). The keeper does **not** configure or calculate ranges — it only feeds price snapshots and executes rebalances. The hedge target and the deposit share count are likewise computed on-chain (on the Chainlink oracle).
 
 ---
 
@@ -44,13 +55,15 @@ This prints the current pool state, whether a rebalance is needed, and the curre
 
 ## Environment Variables
 
+> **Contract addresses** — the official deployed addresses (RangeManager, Vault, Treasury, AaveHedgeManager) are listed on the protocol's Contracts page: **http://liquidhub.app/docs#contracts-addresses**. Always copy them from there; never guess or hardcode an address.
+
 ### Required
 
 | Variable | Description |
 |----------|-------------|
 | `RPC_URL` | Arbitrum RPC endpoint |
-| `RANGEMANAGER_ADDRESS` | RangeManager contract address |
-| `VAULT_ADDRESS` | MultiUserVault contract address |
+| `RANGEMANAGER_ADDRESS` | RangeManager contract address (from the Contracts page) |
+| `VAULT_ADDRESS` | MultiUserVault contract address (from the Contracts page) |
 | `TOKEN0_ADDRESS` | Token0 address (e.g., WETH) |
 | `TOKEN1_ADDRESS` | Token1 address (e.g., USDC) |
 | `KEEPER_PRIVATE_KEY` | Private key of the keeper wallet |
@@ -61,6 +74,7 @@ This prints the current pool state, whether a rebalance is needed, and the curre
 |----------|-------------|---------|
 | `RPC_BACKUP_1` | Backup RPC endpoint 1 | — |
 | `RPC_BACKUP_2` | Backup RPC endpoint 2 | — |
+| `TREASURY_ADDRESS` | Treasury address — lets the bot read the USDC balance and warn when a bounty would be skipped (falls back to `vault.treasuryAddress()`) | — |
 | `CHECK_INTERVAL_MIN` | Minutes between checks | 10 |
 | `INIT_MULTI_SWAP_TVL` | Max USD per swap chunk | 10000 |
 
@@ -75,15 +89,23 @@ This prints the current pool state, whether a rebalance is needed, and the curre
 
 ---
 
-## Keeper Bounty
+## Keeper Bounties
 
-Community keepers earn a bounty in USDC, paid directly from the Treasury contract.
+Community keepers earn bounties in USDC, paid directly from the Treasury contract to whoever sends the transaction (`msg.sender`):
 
-- Paid for every successful `rebalance()` execution during the community priority window.
-- Default amount: **0.5 USDC** per rebalance (`KEEPER_BOUNTY_AMOUNT=500000`).
-- Paid automatically at the end of the rebalance — no manual claim.
-- The internal protocol bot waits 2 minutes (configurable on-chain via `keeperWindow`) before doing the rebalance itself, leaving the priority window open for community keepers.
-- **Silent no-op**: if the bounty is disabled or the Treasury has insufficient funds, the rebalance still completes successfully (bounty payment is wrapped in a try/catch by the contract).
+| Action | Bounty |
+|--------|--------|
+| `rebalance()` | Keeper bounty |
+| `processDepositPermissionless()` | Deposit bounty |
+| `recordPriceSnapshot()` | Metrics bounty |
+| `adjustHedge()` (DN) | Hedge bounty |
+
+> **Amounts** are published on the protocol's Decentralization page (https://liquidhub.app/docs#decentralization) and are set on-chain by the multisig. Read the live value on the Treasury contract (`keeperBountyAmount()`, `depositBountyAmount()`, …) before relying on it — never assume a fixed figure.
+
+- Paid automatically at the end of the action — no manual claim.
+- The internal protocol bot waits **1 minute** before doing the action itself, leaving the priority window open for community keepers.
+- Anti-drain: `recordPriceSnapshot()` reverts unless a snapshot is due; `adjustHedge()` reverts unless the hedge drift exceeds the on-chain threshold **and** the on-chain cooldown (`hedgeAdjustCooldown`) has elapsed since the last adjustment.
+- **Silent no-op**: if a bounty is disabled or the Treasury has insufficient USDC, the action still completes successfully (the payment is wrapped in a try/catch by the contract) — only the bounty is skipped. Set `TREASURY_ADDRESS` so the bot warns you when the Treasury is underfunded; verify the balance on-chain before relying on bounty income.
 
 ### Bounty payment guarantees
 

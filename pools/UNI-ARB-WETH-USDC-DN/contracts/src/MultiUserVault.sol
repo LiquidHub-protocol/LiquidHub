@@ -8,6 +8,7 @@ import "openzeppelin-contracts/contracts/access/Ownable.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "./RangeOperations.sol";
+import "./DnDepositLib.sol"; // EIP-170 : orchestration hedge au dépôt déportée (delegatecall)
 
 // Interface etendue pour RangeManager
 interface IRangeManagerExtended {
@@ -15,18 +16,47 @@ interface IRangeManagerExtended {
     function setAuthorizedExecutor(address _executor, bool _authorized) external;
     function safeAddress() external view returns (address);
     function authorizedExecutors(address) external view returns (bool);
+    function setDynamicRangeConfig(
+        bool _enabled,
+        uint8 _maxSnapshotsPerDay,
+        uint8 _volatMoyDay,
+        uint8 _volatTrimDay,
+        uint16 _rangeStepBps,
+        uint16 _rangeMultiplicatorBps
+    ) external;
 }
 
 interface IAaveHedgeSettlement {
-    function settleProportional(uint256 wethReceived, uint256 proportionBps, bool isFullWithdraw, address recipient) external;
-    function emergencySettleForVault(uint256 wethReceived, uint256 proportionBps, bool isFullWithdraw, address recipient) external;
+    function settleProportional(uint256 wethReceived, uint256 proportionX18, bool isFullWithdraw, address recipient) external;
+    function emergencySettleForVault(uint256 wethReceived, uint256 proportionX18, bool isFullWithdraw, address recipient) external;
+    /// @dev Retourne collat/dette/HF/borrowable depuis AAVE V3. Valeurs en USD a 8 decimales (AAVE base).
+    function getHedgeData() external view returns (
+        uint256 totalCollateralBase,
+        uint256 totalDebtBase,
+        uint256 healthFactor,
+        uint256 availableBorrowsBase
+    );
+    /// @dev WETH (token0) libre detenu par le HedgeManager (en wei). Ce WETH est l'actif emprunte
+    ///      sur AAVE, garde idle comme BUFFER DE REPAY zero-slippage (eviter un swap USDC->WETH au
+    ///      moment de rembourser). Le hedge delta-neutral lui-meme est la DETTE WETH sur AAVE (jambe
+    ///      short), pas ce WETH idle. Mais cet actif est bien detenu par le protocole : il doit etre
+    ///      compte dans le NAV, sinon (en ne comptant que collat-dette) le denominateur de mint de
+    ///      shares sous-estime la valeur reelle.
+    function getWethDebt() external view returns (uint256);
+    // REFONTE DN : ouverture/réduction du hedge déclenchée par le Vault au dépôt permissionless hedgé
+    // (montants EXACTS, destination figée RM). onlySafeOrVault côté HedgeManager.
+    function supplyAndBorrow(uint256 collateralAmountUsdc, uint256 borrowAmountWeth) external;
+    function sweepWethAmount(uint256 amount, address to) external;
+    function withdrawCollateral(uint256 amountUsdc, address to) external;
+    function hedgeTargetBps() external view returns (uint16);
+    function reserveHfTargetBps() external view returns (uint16);
+    function liqThresholdBps() external view returns (uint16);
+    function getHealthFactor() external view returns (uint256);
 }
 
 interface IRangeManager {
     function getOwnerPositions() external view returns (uint256[] memory);
-    function getCurrentPortfolioValue() external view returns (uint256);
     function priceCache() external view returns (uint128, uint128, uint160, int24, uint64, bool);
-    function reportFeesToVault() external;
     function getCurrentBalances() external view returns (uint256, uint256);
     function positionManager() external view returns (INonfungiblePositionManager);
     function pool() external view returns (IUniswapV3Pool);
@@ -39,23 +69,47 @@ interface IRangeManager {
             address recipient
     ) external returns (uint256 amount0Sent, uint256 amount1Sent);
     function config() external view returns (RangeOperations.RangeConfig memory);
+    // protectionConfig getter (audit V1) : struct étendu V3 → (sandwichDet, mev, failure, sandwichBps,
+    // maxOracleDeviationBps, maxAge0, maxAge1). Doit matcher l'ABI du struct public sinon decode faux.
+    function protectionConfig() external view returns (bool, bool, bool, uint16, uint16, uint32, uint32);
+    // audit V1 (V3-H1) : le vault rafraîchit le cache (slot0+oracle LIVE) avant chaque mint/withdraw de shares.
+    function refreshPriceCache() external;
     function addLiquidityToPosition() external;
+    function mintInitialPosition() external returns (uint256 tokenId, uint128 liquidity);
     function collectFeesForVault() external returns (uint256 fees0, uint256 fees1);
+    // --- depot permissionless ---
+    function executeSwap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut) external returns (uint256);
+    function getOptimalSwapParams() external view returns (RangeOperations.OptimalSwapParams memory);
+    function initMultiSwapTvl() external view returns (uint256);
+    // REFONTE DN : le Vault transfère l'USDC collatéral RM -> HedgeManager (destination figée on-chain).
+    function sendTokenForHedge(address token, uint256 amount, address to) external;
+}
+
+interface ITreasuryDeposit {
+    function payDepositBounty(address keeper, uint256 depositValueUsd) external;
 }
 
 contract MultiUserVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ===== CUSTOM ERRORS =====
-    error E01(); error E02(); error E03(); error E04();
+    // AUDIT (nettoyage code mort) : E02, E04, E41, E42, E50-E53, E67-E69 RETIRÉES (jamais revert).
+    error E01(); error E03();
     error E11(); error E12(); error E13(); error E14();
     error E15(); error E16(); error E17(); error E18(); error E19();
     error E21(); error E22(); error E23(); error E24(); error E25();
     error E31(); error E32(); error E33(); error E40();
-    error E41(); error E42(); error E43(); error E44(); error E45(); error E46();
-    error E50(); error E51(); error E52(); error E53();
-    error E67(); error E68(); error E69();
+    error E43(); error E44(); error E45(); error E46();
     error E70(); // DN pools: token0 deposits not allowed, use token1 only
+    error E72(); // processDepositPermissionless: oracle cache stale / invalid / swap pair-cap-floor
+    error E73(); // getCurrentPortfolioValue: lecture hedge AAVE en echec alors qu'un hedgeManager existe (fail-closed)
+    error E_SAME_BLOCK(); // withdraw in the same block as a deposit processing (anti flash-loan, V1+V3 audit)
+    // REFONTE DN — dépôt permissionless hedgé
+    // AUDIT (nettoyage code mort) : E_PRE_ADJUST_REQUIRED + E_INSUFFICIENT_COLLATERAL RETIRÉES du Vault
+    // (jamais revert ici ; les équivalents PreAdjustRequired/InsufficientCollateral vivent dans DnDepositLib).
+    error E_DEPOSIT_TOO_LARGE();   // dépôt en tête > plafond compatible MAX_SWAP_CHUNKS → anti-DoS file
+    error E_NOT_REFUNDABLE();      // remboursement dépôt en tête demandé avant expiration
+    error E_ZERO_SHARES(); // depot processe pour 0 share / 0 valeur (audit V1)
 
     // ===== STRUCTURES =====
     
@@ -67,9 +121,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 lastDepositTime;
         uint256 totalFeesEarnedToken0;
         uint256 totalFeesEarnedToken1;
-        uint256 timeWeightedShares;
-        uint256 lastTimeUpdate;
+        // AUDIT (nettoyage code mort) : timeWeightedShares + lastTimeUpdate RETIRÉS (jamais écrits, modèle
+        // accFeePerShare). ABIs off-chain userInfo() mises à jour en conséquence (décodage positionnel).
         uint256 firstDepositTime;   // Timestamp du premier dépôt d'une période de détention. Reset à 0 sur withdraw 100%.
+        uint256 lastDepositBlock;   // Block du dernier dépôt processé. Bloque deposit+withdraw atomique (anti-flash-loan).
     }
     
     struct PendingDeposit {
@@ -91,18 +146,22 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     IRangeManager public rangeManager;
     IERC20 public immutable token0;
     IERC20 public immutable token1;
+    address private immutable pauseController;
 
     mapping(address => UserInfo) public userInfo;
-    address[] private users; // Liste de tous les utilisateurs avec shares > 0
-    mapping(address => bool) private isUser; // Pour éviter les doublons
+    address[] private users; // Liste des utilisateurs actuellement actifs (shares > 0)
+    // audit V1 (M3-B) : index 1-based de chaque user dans `users` (0 = absent). Permet le swap-and-pop O(1)
+    // au retrait total (pruning) — `users` ne grandit plus indefiniment, eliminant le DoS gas historique.
+    // Remplace l'ancien mapping isUser (bool) : un index != 0 vaut "present".
+    mapping(address => uint256) private userIndexPlusOne;
 
     // Commission et treasury
     uint256 public commissionRate;
     address public treasuryAddress;
 
     // ===== DELTA NEUTRAL HEDGE =====
-    // Le collatéral AAVE est calculé dynamiquement par le bot via H_opt
-    // Le vault envoie tout l'USDC au RangeManager, le bot gère la répartition AAVE/LP
+    // Le collatéral AAVE et la dette cible DN sont calculés on-chain via DnDepositLib/hedgeTargetBps.
+    // Le vault envoie les dépôts au RangeManager puis ouvre le hedge atomiquement quand une position existe.
     
     //securbotmodule
     address public botModule;
@@ -117,7 +176,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     address public hedgeManager;
 
     PendingDeposit[] public pendingDeposits;
-    
+    // SÉCURITÉ (audit V1 — DoS gas A) : pointeur de tête de file (O(1) par dépôt, cf. std). File vide quand
+    // _pendingHead >= length ; compactage (delete + reset) une fois vidée.
+    uint256 private _pendingHead;
+
+    function _pendingCount() internal view returns (uint256) {
+        uint256 len = pendingDeposits.length;
+        return len > _pendingHead ? len - _pendingHead : 0;
+    }
+
     uint256 public totalShares;
     uint256 private constant DEAD_SHARES = 1000; // Brûlées au premier dépôt (anti-inflation attack)
 
@@ -131,23 +198,42 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     uint256 public lastCollectedFees1;
     
     bool private _processingRebalance;
-    
+    uint64 private _rebalanceStartedAt;
+
     uint256 public minDepositUSD;
+    address public emergencySafe;
+
+    // Age max (secondes) du cache prix accepte par processDepositPermissionless (anti-prix-perime).
+    // Reglable par la Safe sans redeploiement. Defaut 3600 (1h).
+    uint256 public depositMaxCacheAge = 3600;
+
+    // ===== REFONTE DN — dépôt permissionless hedgé (paramètres gouvernance) =====
+    uint16 public dnPostCheckMaxDriftBps = 300;     // tolérance post-check effectiveShort vs cible (3%)
+    uint256 public dnDustFloorUsd = 50e8;           // plancher anti-poussière (USD 8 déc) : sous ce target, pas de post-check strict
+    uint256 public dnMaxDepositUsd = 0;             // plafond dépôt en tête (USD 8 déc) anti-DoS file ; 0 = désactivé
+    uint256 public dnDepositRefundDelay = 7 days;   // délai après lequel un dépôt en tête inexécutable peut être remboursé au déposant
+    uint8 private constant DN_MAX_SWAP_CHUNKS = 8;  // borne agrégée de swaps (cohérent keepers)
     
-    // Système de tracking des fees time-weighted
-    uint256 public totalTimeWeightedShares;
-    uint256 public lastGlobalTimeUpdate;
-    uint256 public cumulativeFeePerTimeWeightedShare0;
-    uint256 public cumulativeFeePerTimeWeightedShare1;
-    mapping(address => uint256) public userTimeWeightedShares;
-    mapping(address => uint256) public userLastTimeUpdate;
+    // audit V1 (M3-B-fix, retour Codex) : COMPTA DES FEES — accFeePerShare pro-rata des SHARES courantes.
+    // Modele MasterChef standard, prouve correct et O(1). Remplace l'ancien "time-weighted + accumulateur
+    // monotone" qui SURCOMPTAIT apres plusieurs distributions sans checkpoint (les TW-shares historiques
+    // etaient re-remunerees aux nouveaux taux -> 3F au lieu de 2F). Les distributions sont DISCRETES (a chaque
+    // rebalance) et les fees auto-compoundees : repartir au prorata des shares courantes a chaque distribution
+    // est economiquement correct (equivalent time-weighted par periode) et sans le bug.
+    // accFeePerShareX (echelle 1e36) : fees cumulees par share, MONOTONE. pending = shares*acc - debt, avec
+    // debt fige a chaque interaction (deposit/withdraw/lecture mutative) -> shares CONSTANT entre 2 checkpoints
+    // (contrairement aux TW-shares qui croissaient), ce qui rend la formule exacte.
+    uint256 public accFeePerShare0;
+    uint256 public accFeePerShare1;
           
     // ===== EVENTS =====
     
     event Deposit(address indexed user, uint256 amount0, uint256 amount1, uint256 shares);
     event Withdraw(address indexed user, uint256 amount0, uint256 amount1, uint256 shares);
     event PendingDepositAdded(address indexed user, uint256 amount0, uint256 amount1);
-    event DepositsProcessed(uint256 count, uint256 totalAmount0, uint256 totalAmount1);
+    event DepositRefunded(address indexed user, uint256 amount0, uint256 amount1); // refonte DN : remboursement dépôt en tête expiré
+    event DnDepositParamsConfigured(uint16 postCheckMaxDriftBps, uint256 dustFloorUsd, uint256 maxDepositUsd, uint256 refundDelay);
+    // event DepositsProcessed supprimé avec la fonction batch processPendingDeposits (audit V1)
     event FeesDistributed(uint256 fees0, uint256 fees1);
     event CommissionRateUpdated(uint256 oldRate, uint256 newRate);
     event RebalancingStarted(uint256 timestamp);
@@ -168,7 +254,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     event ExecutorAuthorizedOnRangeManager(address indexed executor, bool authorized);
     event BotModuleUpdated(address indexed oldModule, address indexed newModule);
     event TokenRescued(address indexed token, address indexed to, uint256 amount);
-    // Events hedge reserve supprimés (H_opt: bot gère la répartition)
+    event EmergencySafeUpdated(address indexed oldSafe, address indexed newSafe);
+    // Events hedge reserve supprimés (répartition AAVE/LP pilotée par hedgeTargetBps + DnDepositLib)
     event HedgeManagerSet(address indexed hedgeManager);
     
     // ===== MODIFIERS =====
@@ -182,6 +269,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 if (msg.sender != owner() && msg.sender != botModule && msg.sender != address(rangeManager)) revert E03();
                 _;
         }
+
+        modifier onlyEmergencySafe() {
+                if (msg.sender != emergencySafe) revert E03();
+                _;
+        }
     
     // ===== CONSTRUCTOR =====
     
@@ -189,17 +281,20 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         address _rangeManager,
         address _token0,
         address _token1,
+        address _pauseController,
         address _treasuryAddress,
         uint256 _commissionRate,
         uint256 _minDepositUSD
     ) {
         if (_rangeManager == address(0)) revert E11();
         if (_token0 == address(0) || _token1 == address(0)) revert E12();
+        if (_pauseController == address(0)) revert E12();
         if (_treasuryAddress == address(0)) revert E13();
 
         rangeManager = IRangeManager(_rangeManager);
         token0 = IERC20(_token0);
         token1 = IERC20(_token1);
+        pauseController = _pauseController;
 
         treasuryAddress = _treasuryAddress;
 
@@ -207,9 +302,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (commissionRate > 3000) revert E14();
 
         minDepositUSD = _minDepositUSD;
-
-        // Initialiser le système time-weighted shares
-        lastGlobalTimeUpdate = block.timestamp;
+        emergencySafe = msg.sender;
+        // audit V1 (M3-B-fix) : plus d'init time-weighted (modele accFeePerShare, accumulateurs a 0 par defaut).
     }
     
     // ===== FONCTIONS DE CONFIGURATION RANGEMANAGER =====
@@ -237,50 +331,28 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         IRangeManagerExtended(address(rangeManager)).setAuthorizedExecutor(executor, authorized);
         emit ExecutorAuthorizedOnRangeManager(executor, authorized);
     }
-    
-     /**
-     * @notice Calcule la part proportionnelle des fees pour un utilisateur
-     * @param tokensOwed0 Total des fees en token0
-     * @param tokensOwed1 Total des fees en token1
-     * @param userShares Nombre de shares de l'utilisateur
-     * @return userFees0 Part de l'utilisateur en token0
-     * @return userFees1 Part de l'utilisateur en token1
-     */
-    function calculateUserShareOfFees(
-        uint128 tokensOwed0,
-        uint128 tokensOwed1,
-        uint256 userShares
-    ) public view returns (uint256 userFees0, uint256 userFees1) {
-        if (totalShares == 0) return (0, 0);
-        
-        userFees0 = (uint256(tokensOwed0) * userShares) / totalShares;
-        userFees1 = (uint256(tokensOwed1) * userShares) / totalShares;
+
+    /// @notice Relaie setDynamicRangeConfig au RangeManager (dont ce Vault est l'owner).
+    /// @dev Permet de configurer le range dynamique au deploiement : le RangeManager appartient
+    ///      au Vault des sa construction, donc le deployeur ne peut pas l'appeler directement
+    ///      (onlyAuthorized => E99). Le deployeur (owner du Vault a ce stade) passe par ici.
+    function setDynamicRangeConfigOnRangeManager(
+        bool _enabled,
+        uint8 _maxSnapshotsPerDay,
+        uint8 _volatMoyDay,
+        uint8 _volatTrimDay,
+        uint16 _rangeStepBps,
+        uint16 _rangeMultiplicatorBps
+    ) external onlyOwner {
+        IRangeManagerExtended(address(rangeManager)).setDynamicRangeConfig(
+            _enabled, _maxSnapshotsPerDay, _volatMoyDay, _volatTrimDay, _rangeStepBps, _rangeMultiplicatorBps
+        );
     }
-        
-    /**
-     * @notice Estime les fees totales (crystallisees + non crystallisees) d'une position
-     * @param tokenId L'ID de la position
-     * @return fees0 Estimation des fees en token0
-     * @return fees1 Estimation des fees en token1
-     */
-    function estimateTotalFees(uint256 tokenId) public view returns (uint256 fees0, uint256 fees1) {
-        INonfungiblePositionManager positionManager = rangeManager.positionManager();
 
-        (,,,,,int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128,
-         uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1) = positionManager.positions(tokenId);
+    // REFONTE DN (nettoyage EIP-170) : calculateUserShareOfFees + estimateTotalFees (+ helpers
+    // _estimateUncollectedFees/_calculateFeeGrowth) RETIRÉS — code mort (ancien modèle de fees, remplacé
+    // par accFeePerShare ; aucun appelant bot/keeper/frontend). Gain bytecode pour le dépôt DN hedgé.
 
-        fees0 = uint256(tokensOwed0);
-        fees1 = uint256(tokensOwed1);
-
-        if (liquidity > 0) {
-            (uint256 uncollected0, uint256 uncollected1) = _estimateUncollectedFees(
-                liquidity, tickLower, tickUpper, feeGrowthInside0LastX128, feeGrowthInside1LastX128
-            );
-            fees0 += uncollected0;
-            fees1 += uncollected1;
-        }
-    }
-    
     // ===== SETTER POUR RANGEMANAGER =====
     
     bool private rangeManagerSet;
@@ -299,6 +371,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // ===== DEPOSIT FUNCTIONS =====
     
     function deposit(uint256 amount0, uint256 amount1) external nonReentrant {
+        _requirePause(0x5ea9e82a); // requireInflowsActive()
         if (amount0 == 0 && amount1 == 0) revert E21();
         // DN pools: dépôts USDC uniquement (token0/WETH non accepté en dépôt direct)
         if (hedgeManager != address(0) && amount0 > 0) revert E70();
@@ -309,7 +382,13 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             uint256 depositValueUSD = _calculateDepositValue(amount0, amount1);
             if (depositValueUSD < minDepositUSD) revert E23();
         }
-        
+        // Anti-DoS file (refonte DN) : plafond de dépôt compatible avec DN_MAX_SWAP_CHUNKS, pour qu'un dépôt
+        // ne puisse pas exiger > 8 chunks de swap (sinon il bloquerait la tête de file en permissionless).
+        if (dnMaxDepositUsd > 0) {
+            uint256 depUsd = _calculateDepositValue(amount0, amount1);
+            if (depUsd > dnMaxDepositUsd) revert E_DEPOSIT_TOO_LARGE();
+        }
+
         // Transferer les tokens au vault
         if (amount0 > 0) {
             token0.safeTransferFrom(msg.sender, address(this), amount0);
@@ -327,108 +406,43 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }));
         
         hasPendingDeposit[msg.sender] = true;
-        
+
         emit PendingDepositAdded(msg.sender, amount0, amount1);
     }
-    
-    // ===== PROCESS DEPOSITS ET WITHDRAW =====
-    
-    function processPendingDeposits() external onlyBot {
 
-        uint256 depositsCount = pendingDeposits.length;
-        if (depositsCount == 0) revert E24();
-        
-        uint256 totalAmount0;
-        uint256 totalAmount1;
-        uint256 totalDepositValueUSD;
-        uint256 currentTotalValue = getCurrentPortfolioValue();
-        
-        // Mettre à jour les time-weighted shares globales AVANT modification de totalShares
-        _updateGlobalTimeWeightedShares();
+    /// @notice Rembourse PERMISSIONLESS le dépôt en TÊTE de file s'il est resté trop longtemps non traité
+    ///         (ex. devenu inexécutable après un mouvement de marché → post-check qui revert en boucle).
+    /// @dev Anti-DoS file (refonte DN, E.2b) : sans ce chemin, un dépôt bloqué en tête figerait toute la file.
+    ///      Les fonds sont renvoyés EXCLUSIVEMENT au déposant enregistré (jamais une adresse arbitraire).
+    ///      Déclenchable par n'importe qui après `dnDepositRefundDelay`. Avance la tête comme un traitement.
+    function refundStaleHeadDeposit() external nonReentrant {
+        if (_pendingCount() == 0) revert E24();
+        PendingDeposit memory pd = pendingDeposits[_pendingHead];
+        if (block.timestamp < pd.timestamp + dnDepositRefundDelay) revert E_NOT_REFUNDABLE();
 
-        // Traiter chaque depot
-        for (uint256 i = 0; i < depositsCount; i++) {
-            
-            PendingDeposit memory pd = pendingDeposits[i];
-            
-            // Calculer les shares
-            uint256 depositValue = _calculateDepositValue(pd.amount0, pd.amount1);
-            uint256 sharesToMint;
-            
-            if (totalShares <= DEAD_SHARES) {
-                // Premier dépôt (ou re-dépôt après withdraw total, ne reste que les dead shares)
-                totalShares = 0; // Reset pour recalculer proprement
-                sharesToMint = depositValue * 1e10;
-                if (sharesToMint <= DEAD_SHARES) revert E24(); // "First deposit too small"
-                sharesToMint -= DEAD_SHARES;
-                totalShares += DEAD_SHARES; // Dead shares permanentes (pas attribuées)
-            } else {
-                if (currentTotalValue == 0) revert E25();
-                sharesToMint = (depositValue * totalShares) / currentTotalValue;
-            }
-            
-            // Mettre a jour les infos utilisateur
-            UserInfo storage user = userInfo[pd.user];
-            
-            // Mettre à jour les time-weighted shares avant modification
-            _updateTimeWeightedShares(pd.user);
-            
-            // Sauvegarder les time-weighted shares AVANT ajout des nouvelles shares
-            uint256 timeWeightedSharesBeforeDeposit = user.timeWeightedShares;
-
-            // Marquer le début d'une période de détention si l'utilisateur entre (ou rentre après withdraw total)
-            if (user.shares == 0) {
-                user.firstDepositTime = block.timestamp;
-            }
-
-            // Ajouter les nouvelles shares
-            user.shares += sharesToMint;
-            user.depositedToken0 += pd.amount0;
-            user.depositedToken1 += pd.amount1;
-
-            // Stocker la valeur USD au moment du dépôt (fixe, ne change plus)
-            user.depositedValueUSD += depositValue;
-
-            user.lastDepositTime = block.timestamp;
-
-            // Ajouter l'utilisateur à la liste s'il n'y est pas déjà
-            if (!isUser[pd.user]) {
-                users.push(pd.user);
-                isUser[pd.user] = true;
-            }
-                        
-            // Initialiser la dette basée sur time-weighted shares AVANT le dépôt
-            userFeeDebtToken0[pd.user] = timeWeightedSharesBeforeDeposit * cumulativeFeePerTimeWeightedShare0;
-            userFeeDebtToken1[pd.user] = timeWeightedSharesBeforeDeposit * cumulativeFeePerTimeWeightedShare1;
-            
-            // Pour un nouveau dépôt, s'assurer que lastTimeUpdate est initialisé
-            if (user.lastTimeUpdate == 0) {
-                user.lastTimeUpdate = block.timestamp;
-            }
-            
-            totalShares += sharesToMint;
-            totalAmount0 += pd.amount0;
-            totalAmount1 += pd.amount1;
-            totalDepositValueUSD += depositValue;
-            
-            hasPendingDeposit[pd.user] = false;
-            
-            emit Deposit(pd.user, pd.amount0, pd.amount1, sharesToMint);
-        }
-        
-        // Envoyer tous les fonds au RangeManager (le bot gère la répartition AAVE/LP via H_opt)
-        if (totalAmount0 > 0) {
-            token0.safeTransfer(address(rangeManager), totalAmount0);
-        }
-        if (totalAmount1 > 0) {
-            token1.safeTransfer(address(rangeManager), totalAmount1);
+        // Libérer le flag + avancer la tête (mêmes invariants que _processOneDeposit).
+        hasPendingDeposit[pd.user] = false;
+        _pendingHead++;
+        if (_pendingHead >= pendingDeposits.length) {
+            delete pendingDeposits;
+            _pendingHead = 0;
         }
 
-        // Vider la queue
-        delete pendingDeposits;
+        // Rembourser le déposant (fonds encore détenus par le vault tant que non traités). Destinataire FIGÉ = pd.user.
+        if (pd.amount0 > 0) token0.safeTransfer(pd.user, pd.amount0);
+        if (pd.amount1 > 0) token1.safeTransfer(pd.user, pd.amount1);
 
-        emit DepositsProcessed(depositsCount, totalAmount0, totalAmount1);
+        emit DepositRefunded(pd.user, pd.amount0, pd.amount1);
     }
+
+    // ===== PROCESS DEPOSITS ET WITHDRAW =====
+
+    // SÉCURITÉ (audit V1) : la fonction batch processPendingDeposits() a été SUPPRIMÉE. Elle figeait
+    // currentTotalValue (getCurrentPortfolioValue) avant la boucle tout en incrémentant totalShares à
+    // chaque itération → sur-mint des shares aux dépôts tardifs d'un même lot (dilution des holders).
+    // Elle était `onlyBot` mais le selector restait whitelisté dans le module → atteignable par une clé
+    // bot compromise. En DN, le traitement des dépôts se fait UNIQUEMENT via processDepositPermissionless(),
+    // qui traite un seul dépôt, ouvre le hedge AAVE dans la même transaction, puis post-check la couverture.
 
     // ===== TRAITEMENT INDIVIDUEL DES DEPOTS =====
 
@@ -447,23 +461,65 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 timestamp,
         bool exists
     ) {
-        if (pendingDeposits.length == 0) {
+        if (_pendingCount() == 0) {
             return (address(0), 0, 0, 0, false);
         }
-        PendingDeposit memory pd = pendingDeposits[0];
+        PendingDeposit memory pd = pendingDeposits[_pendingHead];
         return (pd.user, pd.amount0, pd.amount1, pd.timestamp, true);
     }
 
-    /**
-     * @notice Traite UN SEUL dépôt (le premier de la queue)
-     * @dev Le bot doit ensuite faire les multi-swaps et appeler addLiquidityToPosition
-     *      Chaque utilisateur paie ses propres frais de swap proportionnels à son dépôt
-     */
-    function processSingleDeposit() external onlyBot {
-        if (pendingDeposits.length == 0) revert E24();
+    /// @notice AUDIT H-01 : plan de swap correct pour le PROCHAIN dépôt (état post-transfert + post-hedge),
+    ///         à utiliser par les keepers/bot pour processDepositPermissionless — PAS getOptimalSwapParams
+    ///         (qui reflète l'état rebalance/post-burn et donnerait un plan faux pour un dépôt).
+    /// @return zeroForOne true si swap token0→token1 ; amountIn en unités natives du token d'entrée (0 = pas de swap).
+    function getDepositSwapParams() external view returns (bool zeroForOne, uint256 amountIn) {
+        if (_pendingCount() == 0) return (false, 0);
+        PendingDeposit memory pd = pendingDeposits[_pendingHead];
+        // DnDepositLib lit lui-même priceCache/config via le RangeManager (évite de décoder les gros structs
+        // côté Vault — EIP-170). On ne passe que le rangeManager + les montants du dépôt en tête.
+        return DnDepositLib.getDepositSwapParams(address(rangeManager), pd.amount0, pd.amount1);
+    }
 
-        // Récupérer le premier dépôt
-        PendingDeposit memory pd = pendingDeposits[0];
+    /**
+     * @notice Logique partagee de traitement d'UN depot de la file (premier element).
+     * @dev Calcule les shares, met a jour l'accounting utilisateur, transfere les fonds du depot au
+     *      RangeManager, retire le depot de la file, emet Deposit. Le caller gere hedge/swaps/mint/bounty.
+     */
+    function _processOneDeposit() private returns (uint256, uint256, uint256) {
+        _requirePause(0x5ea9e82a); // requireInflowsActive()
+        // SÉCURITÉ (audit V1 — High #1) : refuser le mint des shares si le prix POOL (slot0) diverge de
+        // l'ORACLE Chainlink au-delà du seuil. getCurrentPortfolioValue() (dénominateur) dépend du slot0
+        // manipulable ; depositValue vient de l'oracle. Couvre les 2 chemins (single + permissionless).
+        // V3-H1 : on REFRESH d'abord (slot0+oracle LIVE) pour éliminer le risque de cache obsolète vs le
+        // slot0 lu par getCurrentBalances ; updatePriceCache invalide le cache si déviation > seuil.
+        {
+            rangeManager.refreshPriceCache();
+            (uint128 _p0, uint128 _p1, uint160 _sqrtP, , , bool _valid) = rangeManager.priceCache();
+            if (!_valid) revert E72(); // cache invalide (deviation pool/oracle ou feed stale) -> bloque le mint
+            (, , , , uint16 _maxDevBps, , ) = rangeManager.protectionConfig();
+            RangeOperations.RangeConfig memory _cfg = rangeManager.config();
+            RangeOperations.PriceCache memory _pc = RangeOperations.PriceCache({
+                price0: _p0, price1: _p1, poolSqrtPriceX96: _sqrtP, poolTick: 0, timestamp: 0, valid: _valid
+            });
+            RangeOperations.checkOracleDeviation(_pc, _maxDevBps, _cfg.token0Decimals, _cfg.token1Decimals);
+        }
+
+        // Récupérer le premier dépôt EN ATTENTE (tête = _pendingHead)
+        PendingDeposit memory pd = pendingDeposits[_pendingHead];
+
+        // audit V1 (M3-B-fix2, retour Codex — Medium) : CRISTALLISER les fees Uniswap AVANT de calculer les
+        // shares. getCurrentBalances() ne valorise que tokens libres + liquidite + tokensOwed DEJA cristallises,
+        // PAS le feeGrowth latent dans la position. Sans cette collecte, un deposant entrerait avec un
+        // denominateur SOUS-EVALUE puis capterait une part des fees pre-depot d'autrui lors de la prochaine
+        // collecte. collectFeesForVault() appelle positionManager.collect() (qui cristallise via pool.burn(...,0)
+        // en interne) -> pousse le feeGrowth, met a jour accFeePerShare (via recordFeesCollected) pour les
+        // porteurs EXISTANTS, et libere les tokens (donc getCurrentPortfolioValue ci-dessous est exact). Le
+        // nouvel user est checkpointe APRES (debt=shares*acc).
+        // FAIL-CLOSED : collect() n'est plus wrappe en try/catch dans la library -> si la collecte revert
+        // (position existante), le mint revert plutot que de minter sur une valeur fausse (retry au cycle suivant).
+        if (rangeManager.getOwnerPositions().length > 0) {
+            rangeManager.collectFeesForVault();
+        }
 
         uint256 currentTotalValue = getCurrentPortfolioValue();
 
@@ -480,17 +536,19 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             totalShares += DEAD_SHARES; // Dead shares permanentes (pas attribuées)
         } else {
             if (currentTotalValue == 0) revert E25();
+            if (depositValue == 0) revert E_ZERO_SHARES(); // audit V1 (Medium)
             sharesToMint = (depositValue * totalShares) / currentTotalValue;
+            if (sharesToMint == 0) revert E_ZERO_SHARES(); // audit V1 (Medium)
         }
-
-        // Mettre à jour les time-weighted shares globales AVANT modification de totalShares
-        _updateGlobalTimeWeightedShares();
 
         // Mettre a jour les infos utilisateur
         UserInfo storage user = userInfo[pd.user];
 
-        _updateTimeWeightedShares(pd.user);
-        uint256 timeWeightedSharesBeforeDeposit = user.timeWeightedShares;
+        // audit V1 (M3-B-fix) — COMPTA accFeePerShare : REGLER les fees AVANT d'ajouter les nouvelles shares
+        // (fige la dette sur l'ancien solde -> credite (shares*acc - debt) dans totalFeesEarned). Sans cet
+        // appel, le depot ECRASERAIT la dette et perdrait les fees dues. No-op si shares==0 (1er depot / re-depot
+        // apres retrait total) : dette remise a 0.
+        _updateUserFees(pd.user);
 
         if (user.shares == 0) {
             user.firstDepositTime = block.timestamp;
@@ -501,23 +559,20 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         user.depositedToken1 += pd.amount1;
         user.depositedValueUSD += depositValue;
         user.lastDepositTime = block.timestamp;
+        // Anti-flash-loan: bloque withdraw dans le meme bloc que le processing du depot. Voir audit V1+V3.
+        user.lastDepositBlock = block.number;
 
-        if (!isUser[pd.user]) {
-            users.push(pd.user);
-            isUser[pd.user] = true;
-        }
+        _registerUser(pd.user);
 
-        userFeeDebtToken0[pd.user] = timeWeightedSharesBeforeDeposit * cumulativeFeePerTimeWeightedShare0;
-        userFeeDebtToken1[pd.user] = timeWeightedSharesBeforeDeposit * cumulativeFeePerTimeWeightedShare1;
-
-        if (user.lastTimeUpdate == 0) {
-            user.lastTimeUpdate = block.timestamp;
-        }
+        // audit V1 (M3-B-fix) — RE-CHECKPOINT la dette sur le NOUVEAU solde de shares : les shares fraichement
+        // mintees ne doivent PAS reclamer les fees passees (acc deja accumule). debt = shares * acc.
+        userFeeDebtToken0[pd.user] = user.shares * accFeePerShare0;
+        userFeeDebtToken1[pd.user] = user.shares * accFeePerShare1;
 
         totalShares += sharesToMint;
         hasPendingDeposit[pd.user] = false;
 
-        // Envoyer tous les fonds de CE DEPOT au RangeManager (bot gère la répartition via H_opt)
+        // Envoyer tous les fonds de CE DEPOT au RangeManager ; le hedge DN est ouvert juste après on-chain.
         if (pd.amount0 > 0) {
             token0.safeTransfer(address(rangeManager), pd.amount0);
         }
@@ -525,13 +580,117 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             token1.safeTransfer(address(rangeManager), pd.amount1);
         }
 
-        // Retirer ce dépôt de la queue (shift array)
-        for (uint256 i = 0; i < pendingDeposits.length - 1; i++) {
-            pendingDeposits[i] = pendingDeposits[i + 1];
+        // Retirer ce dépôt : avancer la tête (O(1), audit V1 — DoS gas A) au lieu du shift O(n).
+        _pendingHead++;
+        if (_pendingHead >= pendingDeposits.length) {
+            delete pendingDeposits;
+            _pendingHead = 0;
         }
-        pendingDeposits.pop();
 
         emit Deposit(pd.user, pd.amount0, pd.amount1, sharesToMint);
+        return (pd.amount0, pd.amount1, depositValue);
+    }
+
+    /**
+     * @notice Traite UN depot de la file de maniere PERMISSIONLESS et ATOMIQUE.
+     * @dev Decentralise le dernier maillon : n'importe qui (keeper) peut convertir un depot en file
+     *      en liquidite LP, sans le bot du fondateur. En UNE tx : refresh oracle -> calcul shares
+     *      (oracle) -> transfert fonds au RM -> swaps bornes oracle (anti-MEV) -> addLiquidity ->
+     *      deposit bounty. Verrou _processingRebalance pose pendant toute la fonction (un withdraw
+     *      concurrent revert E32). En DN, couvre aussi le mint initial : hedge AAVE atomique via
+     *      DnDepositLib, mint/addLiquidity puis post-check strict.
+     */
+    function processDepositPermissionless(
+        uint256[] calldata swapAmountsIn,
+        uint256[] calldata minAmountsOut,
+        address tokenIn,
+        address tokenOut
+    ) external nonReentrant {
+        if (swapAmountsIn.length != minAmountsOut.length) revert E72();
+        // Anti-DoS file (refonte DN) : borne agrégée du nombre de swaps.
+        if (swapAmountsIn.length > DN_MAX_SWAP_CHUNKS) revert E_DEPOSIT_TOO_LARGE();
+        // 1. File non vide (anti-drain bounty)
+        if (_pendingCount() == 0) revert E24();
+        // 2. Etat LP : si aucun NFT n'existe, cette tx mintera la position initiale hedgée.
+        bool hasPosition = rangeManager.getOwnerPositions().length > 0;
+        // 3. Refresh oracle atomique. audit V1 (V3-R4 Point 3, retour Codex) : on REFRESH d'abord le cache
+        // (slot0+oracle LIVE) de façon INCONDITIONNELLE — avant ne se faisait que via recordPriceSnapshot()
+        // qui revert si le snapshot n'est pas dû (catché), laissant le check depositMaxCacheAge buter sur un
+        // cache ancien et BLOQUER le chemin permissionless. refreshPriceCache() ne dépend pas du timing snapshot.
+        rangeManager.refreshPriceCache();
+        // AUDIT MED-2 : on NE rappelle PLUS recordPriceSnapshot() ici. Le bounty metrics de cette fonction est
+        // versé à msg.sender = le VAULT (pas au keeper qui déclenche le dépôt) → fuite/incohérence de bounty.
+        // La fraîcheur du cache est déjà garantie par refreshPriceCache() ci-dessus ; le ring-buffer des
+        // snapshots est entretenu par la cadence keeper/bot dédiée (recordPriceSnapshot direct), pas ici.
+        RangeOperations.RangeConfig memory cfg = rangeManager.config();
+        (uint128 price0, uint128 price1,,, uint64 ts, bool valid) = rangeManager.priceCache();
+        if (!valid || price0 == 0 || price1 == 0) revert E72();
+        if (block.timestamp - uint256(ts) > depositMaxCacheAge) revert E72();
+
+        // 4. VERROU (un withdraw concurrent revert E32)
+        _processingRebalance = true;
+
+        // 5. Shares + transfert des fonds au RangeManager.
+        (,, uint256 depositValue) = _processOneDeposit();
+
+        // 5b. REFONTE DN : ouvrir le hedge ATOMIQUEMENT (avant les swaps, pour que le WETH emprunté soit
+        // sur le RM au moment du calcul/exécution des swaps + addLiquidity). Cible GLOBALE (corrige aussi le
+        // drift existant). Si pas de hedgeManager (std) ou collateral=0 (déjà assez short) → no-op ici.
+        if (hedgeManager != address(0)) {
+            DnDepositLib.openDepositHedge(
+                DnDepositLib.Addrs(hedgeManager, address(rangeManager), address(token0), address(token1)),
+                price0, price1, cfg.token0Decimals, cfg.token1Decimals
+            );
+        }
+
+        // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk
+        uint256 n = swapAmountsIn.length;
+        if (n > 0) {
+            bool tokenInIsToken0 = (tokenIn == address(token0));
+            if (!((tokenIn == address(token0) && tokenOut == address(token1)) ||
+                  (tokenIn == address(token1) && tokenOut == address(token0)))) revert E72();
+            RangeOperations.PriceCache memory pc = RangeOperations.PriceCache({
+                price0: price0, price1: price1, poolSqrtPriceX96: 0, poolTick: 0, timestamp: ts, valid: valid
+            });
+            uint256 cap = rangeManager.initMultiSwapTvl();
+            uint256 priceInUsd = tokenInIsToken0 ? uint256(price0) : uint256(price1);
+            uint256 decIn = tokenInIsToken0 ? cfg.token0Decimals : cfg.token1Decimals;
+            uint256 maxTotalSwapUsd = depositValue * 2;
+            uint256 totalSwapUsd;
+            for (uint256 i = 0; i < n; i++) {
+                uint256 chunkUsd = (swapAmountsIn[i] * priceInUsd) / (10 ** decIn);
+                totalSwapUsd += chunkUsd;
+                if (totalSwapUsd > maxTotalSwapUsd) revert E72();
+                if (cap > 0) {
+                    if (chunkUsd > cap * 1e8) revert E72();
+                }
+                uint256 floor = RangeOperations.oracleMinOut(tokenInIsToken0, swapAmountsIn[i], pc, cfg, cfg.maxSlippageBps);
+                if (minAmountsOut[i] < floor) revert E72();
+                rangeManager.executeSwap(tokenIn, tokenOut, swapAmountsIn[i], minAmountsOut[i]);
+            }
+        }
+
+        // 7. Ajouter a la position existante, ou minter la position initiale après hedge + swaps.
+        if (hasPosition) rangeManager.addLiquidityToPosition();
+        else rangeManager.mintInitialPosition();
+
+        // 7b. REFONTE DN : POST-CHECK strict. effectiveShort doit ≈ cible (tolérance dnPostCheckMaxDriftBps),
+        // sinon REVERT toute la tx (le dépôt reste en file ; un rebalance/adjust approprié puis retente). + HF sain.
+        if (hedgeManager != address(0)) {
+            RangeOperations.RangeConfig memory cfgPc = rangeManager.config();
+            DnDepositLib.postCheckDepositHedge(
+                DnDepositLib.Addrs(hedgeManager, address(rangeManager), address(token0), address(token1)),
+                price0, cfgPc.token0Decimals, dnPostCheckMaxDriftBps, dnDustFloorUsd
+            );
+        }
+
+        // 8. DEVERROU
+        _processingRebalance = false;
+
+        // 9. Deposit bounty (silent: ne jamais bloquer l'action) — payé APRÈS succès complet
+        if (treasuryAddress != address(0)) {
+            try ITreasuryDeposit(treasuryAddress).payDepositBounty(msg.sender, depositValue) {} catch {}
+        }
     }
 
     /**
@@ -539,15 +698,16 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @dev Utilisé par le bot pour calculer le nombre de swaps nécessaires
      */
     function getNextDepositValueUSD() external view returns (uint256 valueUSD) {
-        if (pendingDeposits.length == 0) {
+        if (_pendingCount() == 0) {
             return 0;
         }
-        PendingDeposit memory pd = pendingDeposits[0];
+        PendingDeposit memory pd = pendingDeposits[_pendingHead];
         return _calculateDepositValue(pd.amount0, pd.amount1);
     }
 
     function startRebalance() external onlyBot {
         _processingRebalance = true;
+        _rebalanceStartedAt = uint64(block.timestamp);
     }
     
     function endRebalance() external onlyBot {
@@ -555,7 +715,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
     
     function isRebalancing() external view returns (bool) {
-        return _processingRebalance;
+        return _processingRebalance && block.timestamp <= uint256(_rebalanceStartedAt) + 30 minutes;
     }
     
     function withdraw(uint256 shareAmount) external nonReentrant {
@@ -578,45 +738,74 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      */
     function _withdrawInternal(uint256 shareAmount) internal {
         // ===== CHECKS =====
-        if (_processingRebalance) revert E32();
+        if (_processingRebalance && block.timestamp <= uint256(_rebalanceStartedAt) + 30 minutes) revert E32();
         UserInfo storage user = userInfo[msg.sender];
         if (user.shares < shareAmount || shareAmount == 0 || totalShares == 0) revert E33();
+        // Anti-flash-loan: refuse tout withdraw dans le meme bloc que le processing du dernier
+        // depot de l'utilisateur. Casse l'atomicite requise par l'exploit (V1+V3 audit).
+        if (block.number <= user.lastDepositBlock) revert E_SAME_BLOCK();
+        _requireWithdrawalAllowed(user.lastDepositTime);
 
-        // Calculer le pourcentage de shares retirées par rapport au total du vault
-        uint256 vaultSharesPercent = (shareAmount * 10000) / totalShares;
-        bool isFullWithdraw = vaultSharesPercent >= 9999;
+        // SÉCURITÉ (audit V1 — High/Medium) : refuser le retrait si le prix POOL diverge de l'ORACLE
+        // au-delà du seuil (le burn de liquidité utilise amount0Min/1Min=0 → sandwichable sur slot0 manipulé).
+        // V3-H1 : REFRESH d'abord (slot0+oracle LIVE), updatePriceCache invalide le cache si déviation.
+        {
+            rangeManager.refreshPriceCache();
+            (uint128 _p0, uint128 _p1, uint160 _sqrtP, , , bool _valid) = rangeManager.priceCache();
+            if (!_valid) revert E72(); // cache invalide (deviation pool/oracle ou feed stale) -> bloque le retrait
+            (, , , , uint16 _maxDevBps, , ) = rangeManager.protectionConfig();
+            RangeOperations.RangeConfig memory _cfg = rangeManager.config();
+            RangeOperations.PriceCache memory _pc = RangeOperations.PriceCache({
+                price0: _p0, price1: _p1, poolSqrtPriceX96: _sqrtP, poolTick: 0, timestamp: 0, valid: _valid
+            });
+            RangeOperations.checkOracleDeviation(_pc, _maxDevBps, _cfg.token0Decimals, _cfg.token1Decimals);
+        }
 
-        // Mise à jour fees avant calculs
-        _updateTimeWeightedShares(msg.sender);
+        uint256 totalSharesBefore = totalShares;
+        bool isFullWithdraw = totalSharesBefore - shareAmount <= DEAD_SHARES;
+
+        // Mise à jour fees avant calculs (regle sur l'ancien solde de shares, fige la dette).
         _updateUserFees(msg.sender);
         _handleUnclaimedFeesOnWithdraw(user, shareAmount);
 
         // Calculer montants pour le retrait (commission = 0, deja au Treasury)
         (uint256 commission0, uint256 commission1, uint256 principal0, uint256 principal1) =
-            _calculateWithdrawAmounts(shareAmount);
+            _calculateWithdrawAmounts(shareAmount, totalSharesBefore);
 
         // ===== EFFECTS =====
         _finalizeWithdrawalState(user, shareAmount, commission0, commission1, principal0, principal1);
 
         // ===== INTERACTIONS — ATOMIC =====
 
-        // Step 1: Burn LP → tokens arrive on vault
-        _executeWithdrawFromRange(principal0, principal1, address(this), vaultSharesPercent);
+        // SÉCURITÉ (audit V1) : snapshot AVANT toute interaction. Le vault détient aussi les dépôts USDC
+        // EN ATTENTE d'autres users (deposit() transfère sur le vault, forwardé au RM seulement au cycle
+        // suivant). On ne doit envoyer au user QUE le delta net généré par CE withdraw (principal retiré
+        // du RM + USDC net rendu par le settle hedge − WETH consommé par le hedge), jamais balanceOf entier.
+        uint256 before0 = token0.balanceOf(address(this));
+        uint256 before1 = token1.balanceOf(address(this));
 
-        // Step 2: Settle AAVE hedge if DN pool
+        // Step 1: Burn LP → tokens arrive on vault
+        _executeWithdrawFromRange(principal0, principal1, address(this), shareAmount, isFullWithdraw);
+
+        // Step 2: Settle AAVE hedge if DN pool. Le WETH à envoyer au hedge = WETH retiré du RM pour CE
+        // withdraw (= delta token0 depuis before0), pas balanceOf entier (le DN bloque les dépôts token0
+        // donc il n'y a normalement pas de WETH en attente, mais on reste strict par cohérence).
         if (hedgeManager != address(0)) {
-            uint256 wethBal = token0.balanceOf(address(this));
+            uint256 cur0 = token0.balanceOf(address(this));
+            uint256 wethBal = cur0 > before0 ? cur0 - before0 : 0;
             if (wethBal > 0) {
                 token0.safeTransfer(hedgeManager, wethBal);
             }
             IAaveHedgeSettlement(hedgeManager).settleProportional(
-                wethBal, vaultSharesPercent, isFullWithdraw, address(this)
+                wethBal, (shareAmount * 1e18) / totalSharesBefore, isFullWithdraw, address(this)
             );
         }
 
-        // Step 3: Send all vault balance to user (no commission to protect)
-        uint256 toSend0 = token0.balanceOf(address(this));
-        uint256 toSend1 = token1.balanceOf(address(this));
+        // Step 3: n'envoyer au user QUE le delta net (after − before), pas balanceOf entier.
+        uint256 after0 = token0.balanceOf(address(this));
+        uint256 after1 = token1.balanceOf(address(this));
+        uint256 toSend0 = after0 > before0 ? after0 - before0 : 0;
+        uint256 toSend1 = after1 > before1 ? after1 - before1 : 0;
 
         if (toSend0 > 0) token0.safeTransfer(msg.sender, toSend0);
         if (toSend1 > 0) token1.safeTransfer(msg.sender, toSend1);
@@ -624,47 +813,47 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit Withdraw(msg.sender, toSend0, toSend1, shareAmount);
     }
 
-    /**
-     * @notice Transfer token from vault to hedge manager for debt repayment
-     * @dev Called by bot between executeWithdrawal and finalizeWithdrawal.
-     *      After LP burn, WETH sits on the vault. This sends it to HedgeManager
-     *      so closeAll/repayAndWithdraw can use it to repay AAVE debt.
-     * @param token Address of the token to send (token0=WETH or token1=USDC)
-     * @param amount Amount to transfer
-     * @param to Destination address (HedgeManager)
-     */
-    function sendTokenForHedgeRepay(address token, uint256 amount, address to) external onlyBot {
-        if (token != address(token0) && token != address(token1)) revert E67();
-        if (amount == 0) revert E68();
-        if (to == address(0)) revert E69();
-
-        IERC20(token).safeTransfer(to, amount);
+    function _requirePause(uint256 selector) private view {
+        address controller = pauseController;
+        assembly ("memory-safe") {
+            mstore(0x00, shl(224, selector))
+            if iszero(staticcall(gas(), controller, 0x00, 0x04, 0x00, 0x00)) {
+                returndatacopy(0x00, 0x00, returndatasize())
+                revert(0x00, returndatasize())
+            }
+        }
     }
+
+    function _requireWithdrawalAllowed(uint256 lastDepositTime) private view {
+        address controller = pauseController;
+        assembly ("memory-safe") {
+            mstore(0x00, shl(224, 0xedde0818)) // requireWithdrawalsActiveAfter(uint256)
+            mstore(0x04, lastDepositTime)
+            if iszero(staticcall(gas(), controller, 0x00, 0x24, 0x00, 0x00)) {
+                returndatacopy(0x00, 0x00, returndatasize())
+                revert(0x00, returndatasize())
+            }
+        }
+    }
+
+    // sendTokenForHedgeRepay RETIRÉ (refonte DN / EIP-170) : résidu de l'ancien withdraw NON-atomique.
+    // Le withdraw DN est désormais atomique (_withdrawInternal transfère lui-même le WETH au HedgeManager
+    // puis settleProportional). Fonction non whitelistée + aucun appelant → code mort.
 
     // ===== FEES MANAGEMENT =====
 
-    /**
-     * @notice Fonction interne pour distribuer les fees aux utilisateurs
-     */
+    /// @notice Distribue des fees nettes : incremente l'accumulateur par-share. O(1), aucune boucle.
+    /// @dev audit V1 (M3-B-fix) — modele accFeePerShare (MasterChef). Taux += fees*1e36/totalShares. MONOTONE.
+    ///      Chaque user regle SES fees a la demande (pending = shares*acc - debt). Comme `shares` est CONSTANT
+    ///      entre deux checkpoints (deposit/withdraw figent la dette), la formule est exacte — contrairement a
+    ///      l'ancien modele time-weighted ou la "share" (TW) croissait, ce qui surcomptait sur >1 distribution.
     function _distributeFees(uint256 fees0, uint256 fees1) private {
         if (totalShares == 0) return;
         if (fees0 == 0 && fees1 == 0) return;
 
-        // Mettre à jour les time-weighted shares globales avant distribution
-        _updateGlobalTimeWeightedShares();
-
-        // Distribuer les fees nettes aux users (commission deja envoyee au Treasury)
-
-        // Mettre à jour les fees cumulatives par time-weighted share
-        // Precision 1e36 pour eviter perte d'arrondi sur tokens a faibles decimales (ex: USDC 6 dec)
-        if (totalTimeWeightedShares > 0) {
-            cumulativeFeePerTimeWeightedShare0 += (fees0 * 1e36) / totalTimeWeightedShares;
-            cumulativeFeePerTimeWeightedShare1 += (fees1 * 1e36) / totalTimeWeightedShares;
-        }
-
-        // Créditer immédiatement les fees dans totalFeesEarnedToken0/1
-        // pour que userInfo() retourne les bonnes valeurs
-        _creditAllPendingFees();
+        // Precision 1e36 anti-perte d'arrondi sur tokens a faibles decimales (ex: USDC 6 dec).
+        accFeePerShare0 += (fees0 * 1e36) / totalShares;
+        accFeePerShare1 += (fees1 * 1e36) / totalShares;
 
         emit FeesDistributed(fees0, fees1);
     }
@@ -691,91 +880,107 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         _distributeFees(netFees0, netFees1);
     }
 
-    /**
-     * @notice Credite les pending fees à tous les utilisateurs
-     * @dev Appelle apres chaque rebalance pour que les fees soient visibles dans le dashboard
-     */
-    function _creditAllPendingFees() private {
-        // Créditer tous les utilisateurs avec leurs fees accumulées
-        for (uint256 i = 0; i < users.length; i++) {
-            address user = users[i];
-            if (userInfo[user].shares > 0) {
-                _updateUserFees(user);
-            }
-        }
+    // audit V1 (M3-B) : _creditAllPendingFees() SUPPRIMEE. Sa double boucle O(n) sur users[] etait la source
+    // du DoS gas et n'existait que pour remettre a zero les accumulateurs apres distribution. Le modele lazy
+    // (accumulateurs monotones + reglement a la demande dans _updateUserFees) la rend inutile.
 
-        for (uint256 i = 0; i < users.length; i++) {
-            address user = users[i];
-            if (userInfo[user].shares > 0) {
-                userInfo[user].timeWeightedShares = 0;
-                userInfo[user].lastTimeUpdate = block.timestamp;
-                userFeeDebtToken0[user] = 0;
-                userFeeDebtToken1[user] = 0;
-            }
-        }
-
-        // Reset les variables globales pour la prochaine période
-        totalTimeWeightedShares = 0;
-        lastGlobalTimeUpdate = block.timestamp;
-        cumulativeFeePerTimeWeightedShare0 = 0;
-        cumulativeFeePerTimeWeightedShare1 = 0;
-    }
-    
+    /// @dev audit V1 (M3-B-fix) — REGLE les fees du user (lazy). pending = shares*acc - debt, credite dans
+    ///      totalFeesEarned, puis dette = shares*acc. Doit etre appele AVANT toute modification de user.shares
+    ///      (deposit/withdraw) pour figer la dette sur l'ancien solde. shares constant entre 2 checkpoints =>
+    ///      formule exacte (pas de surcomptage multi-distribution comme l'ancien modele TW).
     function _updateUserFees(address userAddress) private {
-        _updateTimeWeightedShares(userAddress);
-
         UserInfo storage user = userInfo[userAddress];
-        if (user.timeWeightedShares == 0) return;
-
-        uint256 pending0 = (user.timeWeightedShares * cumulativeFeePerTimeWeightedShare0 - userFeeDebtToken0[userAddress]) / 1e36;
-        uint256 pending1 = (user.timeWeightedShares * cumulativeFeePerTimeWeightedShare1 - userFeeDebtToken1[userAddress]) / 1e36;
-
-        user.totalFeesEarnedToken0 += pending0;
-        user.totalFeesEarnedToken1 += pending1;
-
-        userFeeDebtToken0[userAddress] = user.timeWeightedShares * cumulativeFeePerTimeWeightedShare0;
-        userFeeDebtToken1[userAddress] = user.timeWeightedShares * cumulativeFeePerTimeWeightedShare1;
-    }
-    
-    /**
-     * @notice Met à jour les time-weighted shares d'un utilisateur
-     * @param userAddress L'adresse de l'utilisateur
-     */
-    function _updateTimeWeightedShares(address userAddress) private {
-        UserInfo storage user = userInfo[userAddress];
-        uint256 currentTime = block.timestamp;
-        
-        if (user.lastTimeUpdate > 0 && user.shares > 0) {
-            uint256 timeDelta = currentTime - user.lastTimeUpdate;
-            user.timeWeightedShares += user.shares * timeDelta;
+        uint256 s = user.shares;
+        if (s == 0) {
+            // Rien a regler ; on (re)pose la dette au niveau courant pour un futur depot propre.
+            userFeeDebtToken0[userAddress] = 0;
+            userFeeDebtToken1[userAddress] = 0;
+            return;
         }
-        user.lastTimeUpdate = currentTime;
+
+        uint256 accrued0 = s * accFeePerShare0;
+        uint256 accrued1 = s * accFeePerShare1;
+        user.totalFeesEarnedToken0 += (accrued0 - userFeeDebtToken0[userAddress]) / 1e36;
+        user.totalFeesEarnedToken1 += (accrued1 - userFeeDebtToken1[userAddress]) / 1e36;
+        userFeeDebtToken0[userAddress] = accrued0;
+        userFeeDebtToken1[userAddress] = accrued1;
     }
-    
-    /**
-     * @notice Met à jour les time-weighted shares globales
-     */
-    function _updateGlobalTimeWeightedShares() private {
-        uint256 currentTime = block.timestamp;
-        
-        if (lastGlobalTimeUpdate > 0 && totalShares > 0) {
-            uint256 timeDelta = currentTime - lastGlobalTimeUpdate;
-            totalTimeWeightedShares += totalShares * timeDelta;
+
+    // ===== REGISTRE DES USERS ACTIFS (audit V1 — M3-B, pruning anti-DoS) =====
+
+    /// @dev Ajoute le user au registre s'il n'y est pas deja (index 1-based). O(1).
+    function _registerUser(address u) private {
+        if (userIndexPlusOne[u] == 0) {
+            users.push(u);
+            userIndexPlusOne[u] = users.length; // = index + 1
         }
-        lastGlobalTimeUpdate = currentTime;
     }
-        
+
+    /// @dev Retire le user du registre en swap-and-pop O(1). Appele au retrait TOTAL (shares==0) — apres que
+    ///      _updateUserStateAfterWithdrawal a remis a zero ses fees/TW (donc plus rien a regler). `users` ne
+    ///      grandit plus de facon monotone : la boucle de distribution disparue + ce pruning suppriment le DoS.
+    function _unregisterUser(address u) private {
+        uint256 idx1 = userIndexPlusOne[u];
+        if (idx1 == 0) return; // pas dans le registre
+        uint256 i = idx1 - 1;
+        uint256 lastI = users.length - 1;
+        if (i != lastI) {
+            address last = users[lastI];
+            users[i] = last;
+            userIndexPlusOne[last] = i + 1;
+        }
+        users.pop();
+        userIndexPlusOne[u] = 0;
+    }
+
     // ===== WITHDRAW PROTOCOL FEES =====
     
     
     // ===== HELPERS =====
 
     /**
-     * @notice Calcule le montant de USDC à réserver pour le hedge AAVE
-     * @notice _calculateHedgeReserve supprimée — le bot gère la répartition AAVE/LP via H_opt
+     * @notice _calculateHedgeReserve supprimée — la répartition AAVE/LP est pilotée on-chain
+     *         via hedgeTargetBps + DnDepositLib pendant les dépôts/rebalances DN.
      */
     
     function getCurrentPortfolioValue() public view returns (uint256) {
+        uint256 lpValue = _lpPortfolioValue();
+        if (lpValue == 0) return 0; // RM injoignable / cache invalide -> 0 (geres en amont par E25 au depot).
+
+        // AAVE hedge net value (collat - dette), en USD 8 dec (meme unite que la valeur LP).
+        // Audit V2: sans ce terme, currentTotalValue sous-estime la vraie valeur du protocole (collat AAVE
+        // ignore) -> sharesToMint surevalue -> retrait > juste part via deposit+withdraw atomique.
+        // audit V1 (M3-B-fix, retour Codex) — le bloc hedge est SORTI des try/catch internes : un revert ici
+        // (FAIL-CLOSED) ne doit PAS etre avale par un catch englobant et rendre une valeur LP-seule fausse.
+        if (hedgeManager != address(0)) {
+            try IAaveHedgeSettlement(hedgeManager).getHedgeData() returns (
+                uint256 totalCollateralBase,
+                uint256 totalDebtBase,
+                uint256,
+                uint256
+            ) {
+                // HF saine : collat > dette. Stress extreme (dette > collat) -> cape a 0 (conservateur).
+                if (totalCollateralBase > totalDebtBase) {
+                    lpValue += (totalCollateralBase - totalDebtBase);
+                }
+            } catch {
+                // FAIL-CLOSED : hedgeManager present mais getHedgeData() en echec -> on ne peut pas evaluer
+                // correctement. Retourner la valeur LP seule SOUS-ESTIMERAIT le denominateur du mint de shares
+                // (hedge net positif ignore). On revert ; mint/withdraw retenteront quand AAVE repondra.
+                revert E73();
+            }
+
+            lpValue += DnDepositLib.idleHedgeValueUsd(hedgeManager, address(rangeManager));
+        }
+
+        return lpValue;
+    }
+
+    /// @dev Valeur LP seule (tokens libres + position) en USD 8 dec. try/catch internes : si le RangeManager
+    ///      est injoignable ou le cache invalide, retourne 0 (jamais de revert ici — c'est la garde hedge
+    ///      au-dessus qui porte le fail-closed). Separe de getCurrentPortfolioValue pour que le revert E73
+    ///      (fail-closed hedge) ne soit pas capture par ces catch.
+    function _lpPortfolioValue() private view returns (uint256) {
         try rangeManager.getCurrentBalances() returns (uint256 bal0, uint256 bal1) {
             try rangeManager.priceCache() returns (
                 uint128 price0,
@@ -786,14 +991,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 bool valid
             ) {
                 if (!valid) return 0;
-
-                // Decimales depuis RangeManager pour generaliser a toutes les paires
-                // (anciennement 1e18 / 1e6 hardcodes pour WETH/USDC).
                 RangeOperations.RangeConfig memory config = rangeManager.config();
-
                 uint256 value0 = (bal0 * uint256(price0)) / (10 ** config.token0Decimals);
                 uint256 value1 = (bal1 * uint256(price1)) / (10 ** config.token1Decimals);
-
                 return value0 + value1;
             } catch {
                 return 0;
@@ -829,36 +1029,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // ===== VIEW FONCTIONS =====
 
     function getPendingDepositsCount() external view returns (uint256) {
-        return pendingDeposits.length;
+        return _pendingCount();
     }
     
-    function getUserInfo(address user) external view returns (
-        uint256 shares,
-        uint256 valueUSD,
-        uint256 pendingFees0,
-        uint256 pendingFees1
-    ) {
-        UserInfo memory info = userInfo[user];
-        shares = info.shares;
-        
-        if (shares > 0 && totalShares > 0) {
-            valueUSD = (getCurrentPortfolioValue() * shares) / totalShares;
-            
-            // Calculer les time-weighted shares actuelles (simulation)
-            uint256 currentTimeWeightedShares = info.timeWeightedShares;
-            if (info.lastTimeUpdate > 0 && info.shares > 0) {
-                uint256 timeDelta = block.timestamp - info.lastTimeUpdate;
-                currentTimeWeightedShares += info.shares * timeDelta;
-            }
-            
-            // Calculer les fees basées sur time-weighted shares
-            if (currentTimeWeightedShares > 0) {
-                pendingFees0 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare0 - userFeeDebtToken0[user]) / 1e36;
-                pendingFees1 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare1 - userFeeDebtToken1[user]) / 1e36;
-            }
-        }
-    }
-
     function estimateWithdrawAmounts(address user) external view returns (
         uint256 amount0,
         uint256 amount1,
@@ -867,11 +1040,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     ) {
         UserInfo memory info = userInfo[user];
         if (info.shares == 0 || totalShares == 0) return (0, 0, 0, 0);
-        uint256 userSharePercent = (info.shares * 10000) / totalShares;
         (uint256 totalToken0, uint256 totalToken1) = rangeManager.getCurrentBalances();
         // Auto-compound: part proportionnelle du LP (inclut fees compoundees)
-        amount0 = (totalToken0 * userSharePercent) / 10000;
-        amount1 = (totalToken1 * userSharePercent) / 10000;
+        amount0 = (totalToken0 * info.shares) / totalShares;
+        amount1 = (totalToken1 * info.shares) / totalShares;
         // Fees bruts comptables pour affichage
         fees0 = info.totalFeesEarnedToken0;
         fees1 = info.totalFeesEarnedToken1;
@@ -879,7 +1051,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     /**
      * @notice Retourne les informations utilisateur avec fees comptables
-     * @dev totalFeesEarnedToken0/1 (deja credites) + pendingFees time-weighted (pas encore credites)
+     * @dev totalFeesEarnedToken0/1 (deja credites) + pendingFees (modele accFeePerShare : shares*acc - debt, pas encore credites)
      */
     function getUserInfoWithPendingFees(address user) external view returns (
         uint256 shares,
@@ -903,19 +1075,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             totalFeesToken0 = info.totalFeesEarnedToken0;
             totalFeesToken1 = info.totalFeesEarnedToken1;
 
-            uint256 currentTimeWeightedShares = info.timeWeightedShares;
-            if (info.lastTimeUpdate > 0) {
-                uint256 timeDelta = block.timestamp - info.lastTimeUpdate;
-                currentTimeWeightedShares += info.shares * timeDelta;
-            }
-
-            if (currentTimeWeightedShares > 0 && cumulativeFeePerTimeWeightedShare0 > 0) {
-                uint256 pending0 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare0 - userFeeDebtToken0[user]) / 1e36;
-                uint256 pending1 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare1 - userFeeDebtToken1[user]) / 1e36;
-
-                totalFeesToken0 += pending0;
-                totalFeesToken1 += pending1;
-            }
+            // audit V1 (M3-B-fix) — pending = shares * accFeePerShare - debt (modele accFeePerShare), par token.
+            uint256 accrued0 = info.shares * accFeePerShare0;
+            uint256 accrued1 = info.shares * accFeePerShare1;
+            if (accrued0 > userFeeDebtToken0[user]) totalFeesToken0 += (accrued0 - userFeeDebtToken0[user]) / 1e36;
+            if (accrued1 > userFeeDebtToken1[user]) totalFeesToken1 += (accrued1 - userFeeDebtToken1[user]) / 1e36;
         } else {
             totalFeesToken0 = 0;
             totalFeesToken1 = 0;
@@ -935,10 +1099,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice Fonction de retrait utilisateurs
      */
     function _executeWithdrawFromRange(
-        uint256, // amount0Requested - non utilisé, on utilise les balances réelles
-        uint256, // amount1Requested - non utilisé, on utilise les balances réelles
+        uint256 principal0, // part proportionnelle du user (calculee par _calculateWithdrawAmounts)
+        uint256 principal1, // idem token1 — SÉCURITÉ: on borne l'envoi a ce principal (audit V1)
         address recipient,
-        uint256 vaultSharesPercent
+        uint256 shareAmount,
+        bool isFullWithdraw
     ) private returns (uint256 amount0Sent, uint256 amount1Sent) {
         // Verifier que le recipient est autorise
         if (recipient != address(this) && recipient != msg.sender) revert E40();
@@ -957,28 +1122,53 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             totalLiquidity = uint256(liquidity);
 
             if (totalLiquidity > 0) {
-                if (vaultSharesPercent >= 9999) {
+                if (isFullWithdraw) {
                     liquidityToRemove = totalLiquidity;
                 } else {
                     // Retirer un pourcentage de liquidité proportionnel aux shares
-                    liquidityToRemove = (totalLiquidity * vaultSharesPercent) / 10000;
+                    liquidityToRemove = (totalLiquidity * shareAmount) / (totalShares + shareAmount);
                 }
             }
         }
         
+        // ===== ETAPE 1b : CRISTALLISER LES FEES AVANT DE RETIRER LE PRINCIPAL (audit M-01) =====
+        // removeLiquidityForWithdraw fait decreaseLiquidity + collect(max,max), qui BALAYE aussi les fees
+        // accrues avec le principal SANS passer par recordFeesCollected → fees non commissionnées (Treasury)
+        // ni créditées au ledger user. On collecte/comptabilise d'abord via collectFeesForVault() (qui
+        // cristallise, prélève la commission et met à jour accFeePerShare) ; le collect() suivant ne ramène
+        // alors plus que le principal.
+        if (tokenId > 0) {
+            rangeManager.collectFeesForVault();
+        }
+
         // ===== ETAPE 2 : RETIRER LA LIQUIDITE SI NECESSAIRE =====
         if (liquidityToRemove > 0 && tokenId > 0) {
             rangeManager.removeLiquidityForWithdraw(tokenId, uint128(liquidityToRemove));
         }
 
         // ===== ETAPE 3 : TRANSFERER DEPUIS RANGEMANAGER VERS VAULT =====
+        // SÉCURITÉ (audit V1) : on n'envoie QUE le principal proportionnel du user, borné par
+        // la balance réellement disponible. Avant, on envoyait balanceOf(RM) ENTIER, ce qui
+        // distribuait aussi les tokens libres non déployés (dépôt mono-token en attente, réserve
+        // hedge) au premier qui withdraw. Le principal (= vaultSharesPercent% de getCurrentBalances,
+        // qui inclut LP + tokens libres) est la juste part. Le settle hedge (step 2) ajoute la part
+        // AAVE séparément. Full withdraw => on prend tout le restant.
         uint256 realBalance0 = IERC20(token0).balanceOf(address(rangeManager));
         uint256 realBalance1 = IERC20(token1).balanceOf(address(rangeManager));
+        uint256 toWithdraw0;
+        uint256 toWithdraw1;
+        if (isFullWithdraw) {
+            toWithdraw0 = realBalance0;
+            toWithdraw1 = realBalance1;
+        } else {
+            toWithdraw0 = principal0 < realBalance0 ? principal0 : realBalance0;
+            toWithdraw1 = principal1 < realBalance1 ? principal1 : realBalance1;
+        }
 
-        // Transférer les tokens vers le Vault
+        // Transférer la juste part vers le Vault
         (amount0Sent, amount1Sent) = rangeManager.transferTokensForWithdraw(
-            realBalance0,
-            realBalance1,
+            toWithdraw0,
+            toWithdraw1,
             address(this)
         );
 
@@ -996,43 +1186,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
     
 
-    /**
-     * @notice Estime les fees non collectées d'une position
-     */
-    function _estimateUncollectedFees(
-        uint128 liquidity,
-        int24 tickLower,
-        int24 tickUpper,
-        uint256 feeGrowthInside0LastX128,
-        uint256 feeGrowthInside1LastX128
-    ) private view returns (uint256, uint256) {
-        try rangeManager.pool().slot0() returns (uint160, int24 currentTick, uint16, uint16, uint16, uint8, bool) {
-            if (currentTick >= tickLower && currentTick < tickUpper) {
-                return _calculateFeeGrowth(liquidity, feeGrowthInside0LastX128, feeGrowthInside1LastX128);
-            }
-        } catch {}
-        return (0, 0);
-    }
-
-    /**
-     * @notice Calcule la croissance des fees
-     */
-    function _calculateFeeGrowth(
-        uint128 liquidity,
-        uint256 feeGrowthInside0LastX128,
-        uint256 feeGrowthInside1LastX128
-    ) private view returns (uint256 uncollected0, uint256 uncollected1) {
-        uint256 feeGrowthGlobal0 = rangeManager.pool().feeGrowthGlobal0X128();
-        uint256 feeGrowthGlobal1 = rangeManager.pool().feeGrowthGlobal1X128();
-
-        if (feeGrowthGlobal0 > feeGrowthInside0LastX128) {
-            uncollected0 = (uint256(liquidity) * (feeGrowthGlobal0 - feeGrowthInside0LastX128)) >> 128;
-        }
-
-        if (feeGrowthGlobal1 > feeGrowthInside1LastX128) {
-            uncollected1 = (uint256(liquidity) * (feeGrowthGlobal1 - feeGrowthInside1LastX128)) >> 128;
-        }
-    }
+    // _estimateUncollectedFees + _calculateFeeGrowth RETIRÉS (helpers de estimateTotalFees, code mort).
 
     /**
      * @notice Gère les fees non réclamées lors d'un retrait
@@ -1051,14 +1205,14 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice Calcule les montants pour le retrait
      */
     function _calculateWithdrawAmounts(
-        uint256 shareAmount
+        uint256 shareAmount,
+        uint256 totalSharesBefore
     ) private view returns (uint256 commission0, uint256 commission1, uint256 principal0, uint256 principal1) {
-        uint256 userSharePercent = totalShares > 0 ? (shareAmount * 10000) / totalShares : 0;
         (uint256 totalToken0, uint256 totalToken1) = rangeManager.getCurrentBalances();
         commission0 = 0;
         commission1 = 0;
-        principal0 = (totalToken0 * userSharePercent) / 10000;
-        principal1 = (totalToken1 * userSharePercent) / 10000;
+        principal0 = (totalToken0 * shareAmount) / totalSharesBefore;
+        principal1 = (totalToken1 * shareAmount) / totalSharesBefore;
     }
 
     /**
@@ -1072,63 +1226,46 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256,
         uint256
     ) private {
-        // Mettre à jour les time-weighted shares globales AVANT modification de totalShares
-        _updateGlobalTimeWeightedShares();
-
-        uint256 timeWeightedToReduce = _updateUserStateAfterWithdrawal(user, shareAmount);
-
+        // audit V1 (M3-B-fix) : modele accFeePerShare -> plus de time-weighted global a maintenir.
+        _updateUserStateAfterWithdrawal(user, shareAmount);
         totalShares -= shareAmount;
-        if (timeWeightedToReduce <= totalTimeWeightedShares) {
-            totalTimeWeightedShares -= timeWeightedToReduce;
-        }
     }
 
     /**
-     * @notice Met à jour l'état utilisateur après un retrait
+     * @notice Met à jour l'état utilisateur après un retrait. Les fees ont deja ete reglees par
+     *         _updateUserFees(msg.sender) en amont du withdraw (dette = ancien_solde * acc).
      */
     function _updateUserStateAfterWithdrawal(
         UserInfo storage user,
         uint256 shareAmount
-    ) private returns (uint256 timeWeightedToReduce) {
-        // Calculer la réduction de time-weighted shares AVANT modification
-        if (user.shares == shareAmount) {
-            // Retrait total
-            timeWeightedToReduce = user.timeWeightedShares;
-        } else {
-            // Retrait partiel - proportionnel
-            uint256 percentWithdrawn = (shareAmount * 1e18) / user.shares;
-            timeWeightedToReduce = (user.timeWeightedShares * percentWithdrawn) / 1e18;
-        }
-
+    ) private {
         user.shares -= shareAmount;
 
         if (user.shares == 0) {
-            // Si l'utilisateur retire tout, remettre TOUT à zéro
+            // Retrait total : tout a zero.
             user.depositedToken0 = 0;
             user.depositedToken1 = 0;
             user.depositedValueUSD = 0;
             user.totalFeesEarnedToken0 = 0;
             user.totalFeesEarnedToken1 = 0;
-            user.timeWeightedShares = 0;
-            user.lastTimeUpdate = 0;
             user.firstDepositTime = 0;
+            // audit V1 (M3-B) — dette a zero (shares==0) pour un re-depot propre + pruning O(1) du registre.
+            userFeeDebtToken0[msg.sender] = 0;
+            userFeeDebtToken1[msg.sender] = 0;
+            _unregisterUser(msg.sender);
         } else {
-            // Sinon, réduire proportionnellement
+            // Retrait partiel : reduire proportionnellement les compteurs comptables.
             uint256 percentWithdrawn = (shareAmount * 1e18) / (user.shares + shareAmount);
-
-            user.timeWeightedShares = (user.timeWeightedShares * (1e18 - percentWithdrawn)) / 1e18;
             user.depositedToken0 = (user.depositedToken0 * (1e18 - percentWithdrawn)) / 1e18;
             user.depositedToken1 = (user.depositedToken1 * (1e18 - percentWithdrawn)) / 1e18;
             user.depositedValueUSD = (user.depositedValueUSD * (1e18 - percentWithdrawn)) / 1e18;
             user.totalFeesEarnedToken0 = (user.totalFeesEarnedToken0 * (1e18 - percentWithdrawn)) / 1e18;
             user.totalFeesEarnedToken1 = (user.totalFeesEarnedToken1 * (1e18 - percentWithdrawn)) / 1e18;
 
-            // Mettre à jour la dette de fees basée sur les nouvelles time-weighted shares
-            userFeeDebtToken0[msg.sender] = user.timeWeightedShares * cumulativeFeePerTimeWeightedShare0;
-            userFeeDebtToken1[msg.sender] = user.timeWeightedShares * cumulativeFeePerTimeWeightedShare1;
+            // audit V1 (M3-B-fix) — RE-CHECKPOINT la dette sur le NOUVEAU solde de shares : debt = shares * acc.
+            userFeeDebtToken0[msg.sender] = user.shares * accFeePerShare0;
+            userFeeDebtToken1[msg.sender] = user.shares * accFeePerShare1;
         }
-
-        return timeWeightedToReduce;
     }
 
     // ===== FONCTIONS DE CONFIGURATION =====
@@ -1148,12 +1285,36 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
     
     function setMinDepositUSD(uint256 _newMinimum) external onlyOwner {
-        // _newMinimum is uint256, always >= 0
+        // audit V1 (M3-B-fix4, Slither) : pas de require(_newMinimum >= 0) — tautologie sur un uint256
+        // (toujours >= 0). Coherence std/DN.
         uint256 oldMinimum = minDepositUSD;
         minDepositUSD = _newMinimum;
         emit MinDepositUpdated(oldMinimum, _newMinimum);
     }
-    
+
+    /// @notice Age max du cache prix (s) accepte par processDepositPermissionless. Gouvernance.
+    function setDepositMaxCacheAge(uint256 _maxAge) external onlyOwner {
+        if (_maxAge < 60 || _maxAge > 86400) revert E18();
+        depositMaxCacheAge = _maxAge;
+    }
+
+    /// @notice Gouvernance : paramètres du dépôt DN permissionless hedgé (refonte DN).
+    /// @dev postCheckMaxDriftBps borné 50..1000 (0.5%..10%) ; refundDelay borné 1h..30j ; maxDepositUsd 0=désactivé.
+    function setDnDepositParams(
+        uint16 postCheckMaxDriftBps,
+        uint256 dustFloorUsd,
+        uint256 maxDepositUsd,
+        uint256 refundDelay
+    ) external onlyOwner {
+        if (postCheckMaxDriftBps < 50 || postCheckMaxDriftBps > 1000) revert E18();
+        if (refundDelay < 3600 || refundDelay > 30 days) revert E18();
+        dnPostCheckMaxDriftBps = postCheckMaxDriftBps;
+        dnDustFloorUsd = dustFloorUsd;
+        dnMaxDepositUsd = maxDepositUsd;
+        dnDepositRefundDelay = refundDelay;
+        emit DnDepositParamsConfigured(postCheckMaxDriftBps, dustFloorUsd, maxDepositUsd, refundDelay);
+    }
+
     function setBotModule(address _module) external onlyOwner {
         if (_module == address(0)) revert E19();
         address oldModule = botModule;
@@ -1167,6 +1328,14 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit HedgeManagerSet(_hedgeManager);
     }
 
+    /// @notice Configure la Safe qui conserve les actions de secours en Phase 2.
+    /// @dev Séparé de owner/gouvernance : un transfert futur vers timelock ne doit pas bloquer le dépannage.
+    function setEmergencySafe(address newSafe) external onlyOwner {
+        if (newSafe == address(0)) revert E17();
+        emit EmergencySafeUpdated(emergencySafe, newSafe);
+        emergencySafe = newSafe;
+    }
+
     /// @notice Recover non-protected tokens (airdrops, erroneous transfers, donations)
     /// @dev Blocks token0/token1 (user funds, cannot be moved). Destination is flexible:
     ///      refund the sender, send to Treasury, or keep for protocol use depending on context.
@@ -1174,9 +1343,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     /// @param tokenAddr Token to rescue (must not be token0 or token1)
     /// @param to Recipient address
     /// @param amount Amount to rescue
-    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyOwner {
-        require(tokenAddr != address(token0) && tokenAddr != address(token1), "Protected");
-        require(to != address(0), "Invalid recipient");
+    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyEmergencySafe {
+        if (tokenAddr == address(token0) || tokenAddr == address(token1)) revert E18();
+        if (to == address(0)) revert E17();
         IERC20(tokenAddr).safeTransfer(to, amount);
         emit TokenRescued(tokenAddr, to, amount);
     }
@@ -1184,7 +1353,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // ===== DELTA NEUTRAL HEDGE FUNCTIONS =====
 
     // setHedgeReserveRatio et withdrawReservedCollateral supprimés
-    // Le bot gère la répartition AAVE/LP via H_opt et sendTokenForHedge sur le RangeManager
+    // Répartition AAVE/LP refondue : hedgeTargetBps + DnDepositLib, sans hedge reserve ratio.
 
     /**
      * @notice Retourne le montant de collatéral réservé disponible
@@ -1214,8 +1383,14 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice Recupere les fonds d'un utilisateur depuis RangeManager ou le Vault
      * @notice Precision : Les tokens de pool ne peuvent etre recuperes que par le depositaire
      * @param userAddress L'adresse de l'utilisateur a recuperer
+     * @dev audit V1 (M3-B-fix5, retour Codex — Low gas) : ce chemin Safe-only ITERE sur la file des depots EN
+     *      ATTENTE (pendingDeposits, de _pendingHead a la fin). Cout O(taille file). En pratique la file est
+     *      drainee a chaque cycle bot (~10 min) donc elle reste petite ; mais si elle devait devenir tres
+     *      grande, DRAINER la file (processDepositPermissionless) AVANT d'appeler cette
+     *      fonction d'urgence. Non bloquant (pas le chemin normal), pas optimise on-chain pour ne pas alourdir
+     *      le bytecode du vault (contrainte EIP-170).
      */
-    function EmergencyRecoverUser(address userAddress) external onlyOwner nonReentrant {
+    function EmergencyRecoverUser(address userAddress) external onlyEmergencySafe nonReentrant {
         if (userAddress == address(0)) revert E43();
 
         UserInfo storage user = userInfo[userAddress];
@@ -1226,12 +1401,28 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         uint256 userAmount0;
         uint256 userAmount1;
+        uint256 n0;
+        uint256 n1;
 
         // 1. Shares actives (cas normal)
         //    EmergencyBurnPositions doit etre appele avant pour ramener les tokens sur vault/RM
-        if (totalSharesBefore > 0 && userShares > 0) {
-            uint256 vBal0 = token0.balanceOf(address(this));
-            uint256 vBal1 = token1.balanceOf(address(this));
+        if (userShares > 0) {
+            if (rangeManager.getOwnerPositions().length != 0) revert E46();
+            // SÉCURITÉ (audit V1) : exclure les dépôts EN ATTENTE de TOUS les users du balanceOf(vault)
+            // avant le calcul proportionnel (deposit() transfère sur le vault avant traitement). Sinon un
+            // user récupérerait une part d'un total gonflé par les pending d'autrui. Ses propres pending
+            // sont ajoutés séparément à l'étape 2.
+            uint256 pend0;
+            uint256 pend1;
+            uint256 pendingLen = pendingDeposits.length;
+            for (uint256 i = _pendingHead; i < pendingLen; i++) { // audit V1 DoS gas A
+                pend0 += pendingDeposits[i].amount0;
+                pend1 += pendingDeposits[i].amount1;
+            }
+            uint256 raw0 = token0.balanceOf(address(this));
+            uint256 raw1 = token1.balanceOf(address(this));
+            uint256 vBal0 = raw0 > pend0 ? raw0 - pend0 : 0;
+            uint256 vBal1 = raw1 > pend1 ? raw1 - pend1 : 0;
             uint256 rBal0 = token0.balanceOf(address(rangeManager));
             uint256 rBal1 = token1.balanceOf(address(rangeManager));
             uint256 share0 = ((vBal0 + rBal0) * userShares) / totalSharesBefore;
@@ -1239,70 +1430,91 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
             // Recuperer depuis RangeManager si vault n'a pas assez
             if (share0 > vBal0 || share1 > vBal1) {
-                uint256 n0 = share0 > vBal0 ? share0 - vBal0 : 0;
-                uint256 n1 = share1 > vBal1 ? share1 - vBal1 : 0;
+                n0 = share0 > vBal0 ? share0 - vBal0 : 0;
+                n1 = share1 > vBal1 ? share1 - vBal1 : 0;
                 if (n0 > rBal0) n0 = rBal0;
                 if (n1 > rBal1) n1 = rBal1;
-                IRangeManager(address(rangeManager)).emergencyWithdrawForUser(n0, n1, address(this));
             }
             userAmount0 += share0;
             userAmount1 += share1;
         }
 
-        // 2. Depots en attente
+        // 2. Depots en attente (de _pendingHead à la fin — audit V1 DoS gas A)
         if (hasPendingDeposit[userAddress]) {
-            for (uint256 i = 0; i < pendingDeposits.length; i++) {
+            uint256 len = pendingDeposits.length;
+            for (uint256 i = _pendingHead; i < len; i++) {
                 if (pendingDeposits[i].user == userAddress) {
                     userAmount0 += pendingDeposits[i].amount0;
                     userAmount1 += pendingDeposits[i].amount1;
-                    if (i < pendingDeposits.length - 1) {
-                        pendingDeposits[i] = pendingDeposits[pendingDeposits.length - 1];
+                    if (i < len - 1) {
+                        pendingDeposits[i] = pendingDeposits[len - 1];
                     }
                     pendingDeposits.pop();
                     break;
                 }
             }
             hasPendingDeposit[userAddress] = false;
+            delete userFeeDebtToken0[userAddress];
+            delete userFeeDebtToken1[userAddress];
         }
 
         // 3. Settle hedge proportionnel pour pools DN
-        uint256 vaultSharesPercent = totalSharesBefore > 0 ? (userShares * 10000) / totalSharesBefore : 0;
-        bool isFullWithdraw = vaultSharesPercent >= 9999;
+        uint256 proportionX18 = totalSharesBefore > 0 ? (userShares * 1e18) / totalSharesBefore : 0;
+        bool isFullWithdraw = totalSharesBefore > userShares
+            ? totalSharesBefore - userShares <= DEAD_SHARES
+            : true;
 
-        if (hedgeManager != address(0) && userShares > 0) {
-            uint256 wethForRepay = token0.balanceOf(address(this));
-            if (wethForRepay > 0) {
-                token0.safeTransfer(hedgeManager, wethForRepay);
-            }
-            IAaveHedgeSettlement(hedgeManager).emergencySettleForVault(
-                wethForRepay, vaultSharesPercent, isFullWithdraw, address(this)
-            );
-        }
-
-        // 4. Envoyer les fonds
-        uint256 bal0 = token0.balanceOf(address(this));
-        uint256 bal1 = token1.balanceOf(address(this));
-        uint256 toSend0;
-        uint256 toSend1;
-        if (hedgeManager != address(0)) {
-            // DN: envoyer tout le solde vault (plus de commissions en attente avec auto-compound)
-            toSend0 = bal0;
-            toSend1 = bal1;
-        } else {
-            // Standard: cap par userAmount
-            toSend0 = userAmount0 > bal0 ? bal0 : userAmount0;
-            toSend1 = userAmount1 > bal1 ? bal1 : userAmount1;
-        }
-        if (toSend0 > 0) token0.safeTransfer(userAddress, toSend0);
-        if (toSend1 > 0) token1.safeTransfer(userAddress, toSend1);
-
-        // 5. Mettre a jour les stats
+        // 4. Mettre a jour les stats avant les appels externes.
         if (userShares > 0) {
             totalShares = totalSharesBefore > userShares ? totalSharesBefore - userShares : 0;
             delete userInfo[userAddress];
             delete userFeeDebtToken0[userAddress];
             delete userFeeDebtToken1[userAddress];
+            // audit V1 (M3-B-fix2, retour Codex — Low) : retirer aussi du registre actif (pruning O(1)), sinon
+            // getUserCount/getUserAtIndex restent pollues (incoherence dashboards/indexeurs). Miroir du std.
+            _unregisterUser(userAddress);
         }
+
+        uint256 bal0BeforeWithdraw = token0.balanceOf(address(this));
+        if (n0 > 0 || n1 > 0) {
+            IRangeManager(address(rangeManager)).emergencyWithdrawForUser(n0, n1, address(this));
+        }
+
+        // Emergency DN : le settlement AAVE envoie directement la part hedge au user. Cela evite de sous-compter
+        // le token0 eventuellement renvoye par le HedgeManager et garde le Vault plafonne au reliquat LP/pending.
+        if (hedgeManager != address(0) && userShares > 0) {
+            uint256 bal0AfterWithdraw = token0.balanceOf(address(this));
+            uint256 wethForRepay = bal0AfterWithdraw > bal0BeforeWithdraw ? bal0AfterWithdraw - bal0BeforeWithdraw : 0;
+            if (wethForRepay > 0) {
+                token0.safeTransfer(hedgeManager, wethForRepay);
+            }
+            IAaveHedgeSettlement(hedgeManager).emergencySettleForVault(
+                wethForRepay, proportionX18, isFullWithdraw, userAddress
+            );
+        }
+
+        // 5. Envoyer les fonds.
+        // SÉCURITÉ (audit V1) : ne JAMAIS envoyer balanceOf(vault) entier — il inclut les dépôts EN
+        // ATTENTE des AUTRES users. À ce stade, le pending de CE user a déjà été retiré de la queue
+        // (étape 2) ; il reste donc sur le vault les pending des autres, à exclure. On borne le solde
+        // disponible à (balanceOf − pending des autres) puis on plafonne par le dû du user.
+        uint256 otherPending0;
+        uint256 otherPending1;
+        uint256 otherPendingLen = pendingDeposits.length;
+        for (uint256 i = _pendingHead; i < otherPendingLen; i++) { // audit V1 DoS gas A
+            otherPending0 += pendingDeposits[i].amount0;
+            otherPending1 += pendingDeposits[i].amount1;
+        }
+        uint256 rawBal0 = token0.balanceOf(address(this));
+        uint256 rawBal1 = token1.balanceOf(address(this));
+        uint256 bal0 = rawBal0 > otherPending0 ? rawBal0 - otherPending0 : 0;
+        uint256 bal1 = rawBal1 > otherPending1 ? rawBal1 - otherPending1 : 0;
+        // AUDIT MED-1 : un SEUL chemin de plafonnement pour DN et std — toSend = min(dû user, solde dispo).
+        // Le dû DN inclut déjà le delta hedge (ajouté à userAmount1 ci-dessus). Plus d'envoi de tout le solde.
+        uint256 toSend0 = userAmount0 > bal0 ? bal0 : userAmount0;
+        uint256 toSend1 = userAmount1 > bal1 ? bal1 : userAmount1;
+        if (toSend0 > 0) token0.safeTransfer(userAddress, toSend0);
+        if (toSend1 > 0) token1.safeTransfer(userAddress, toSend1);
 
         emit EmergencyUserRecovered(userAddress, toSend0, toSend1, userShares);
     }
@@ -1311,13 +1523,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice - Burn le NFT en cas de problème sur la position
      * @dev Les fonds restent dans RangeManager apres le burn en attente d'un nouveau MINT
      */
-    function EmergencyBurnPositions() external onlyOwner {
+    function EmergencyBurnPositions() external onlyEmergencySafe {
         // 1. Recuperer toutes les positions NFT
         uint256[] memory positions = rangeManager.getOwnerPositions();
 
-        if (positions.length == 0) {
-            revert("E46");
-        }
+        if (positions.length == 0) revert E46();
 
         // 2. Pour chaque position, retirer la liquidite puis burn le NFT
         for (uint256 i = 0; i < positions.length; i++) {

@@ -2,16 +2,42 @@
 
 ## Overview
 
-Liquid Hub manages Uniswap V3 concentrated liquidity positions for multiple users via a vault system. Users deposit tokens, receive shares proportional to their contribution, and benefit from actively managed LP positions without needing to manage ranges themselves.
+Liquid Hub manages concentrated-liquidity DEX positions for multiple users via a vault system. Users deposit tokens, receive shares proportional to their contribution, and benefit from actively managed LP positions without needing to manage ranges themselves. The architecture is DEX-agnostic; each deployed pool documents the specific DEX it targets in its own folder.
 
 ## Core Flow
 
-1. **Deposit** — Users deposit WETH + USDC into `MultiUserVault` and receive shares representing their proportional ownership.
-2. **Delegation** — The vault delegates LP management to `RangeManager`, which handles all Uniswap V3 position logic.
-3. **Position Creation** — `RangeManager` creates Uniswap V3 concentrated liquidity positions with dynamic ranges, configured on-chain by a Gnosis Safe multisig.
-4. **Rebalance** — When price moves out of range, a keeper triggers a rebalance: burn the old position, swap tokens to rebalance the ratio, then mint a new position at the optimal range.
-5. **Fee Collection** — Protocol fees (LP commissions) are collected during each rebalance and sent to the Treasury contract.
-6. **Withdrawal** — Users withdraw by burning their shares. The vault burns the proportional LP position and returns the underlying tokens to the user.
+1. **Deposit** — Users deposit WETH + USDC into `MultiUserVault` (permissionless) and are queued; they receive shares representing their proportional ownership when the deposit is processed.
+2. **Deposit processing (permissionless)** — Anyone can call `processDepositPermissionless()` to convert a queued deposit into LP liquidity in one atomic transaction (see Deposit Processing). Earns the deposit bounty.
+3. **Delegation** — The vault delegates LP management to `RangeManager`, which handles all concentrated-liquidity position logic.
+4. **Position Creation** — `RangeManager` creates concentrated-liquidity positions with **dynamic ranges computed 100% on-chain** (see Dynamic Range Calculation). The tuning parameters are set by a Gnosis Safe multisig; the math runs in the contract.
+5. **Rebalance** — When price moves out of range, a keeper triggers a rebalance: burn the old position, swap tokens to rebalance the ratio, then mint a new position at the on-chain-computed range.
+6. **Fee Collection** — Protocol fees (LP commissions) are collected during each rebalance and sent to the Treasury contract.
+7. **Withdrawal** — Users withdraw by burning their shares. The vault burns the proportional LP position and returns the underlying tokens to the user.
+
+---
+
+## Deposit Processing (permissionless)
+
+A user's `deposit()` is permissionless and queues the funds. Converting a queued deposit into LP liquidity is also permissionless via `processDepositPermissionless()` on the Vault — so the protocol can accept new capital without any privileged operator. In one atomic transaction it:
+
+1. Refreshes the Chainlink oracle (calls `recordPriceSnapshot()`), then requires the price cache valid and fresh (`depositMaxCacheAge`).
+2. Requires a position NFT to exist — the one-time initial mint stays a protocol-bot action.
+3. Sets the rebalance lock (`_processingRebalance`) so any concurrent withdrawal reverts while funds are in transit.
+4. Computes the deposit's shares on the **Chainlink oracle** (never the pool spot price → no share-inflation), transfers the funds to the RangeManager.
+5. Executes the rebalancing swaps with **on-chain oracle-bounded `minAmountsOut`** (anti-MEV: a keeper-supplied min below the oracle floor reverts), each chunk capped by `initMultiSwapTvl`.
+6. Adds the liquidity to the existing position, releases the lock, and pays the **deposit bounty** (best-effort try/catch).
+
+It reverts if the queue is empty, no NFT exists, or the cache is stale — so the bounty cannot be farmed. On a Delta-Neutral pool it does **not** touch the AAVE hedge; the resulting drift is corrected separately by the permissionless `adjustHedge()`.
+
+---
+
+## Dynamic Range Calculation (100% on-chain)
+
+The range is computed entirely by `RangeManager` — no off-chain bot or database is involved in the math, so any keeper can reproduce it.
+
+- `RangeManager` keeps a ring buffer of price snapshots. `recordPriceSnapshot()` is **permissionless** and stores a Chainlink price; the contract spaces snapshots regularly (`24h / maxSnapshotsPerDay`) and reverts if one is not yet due.
+- On each mint/rebalance, the contract takes the pure high/low amplitude over the last `volatMoyDay` days — `(highest − lowest) / current price`, the real dispersion of the window independent of the instantaneous price — (trimming the `volatTrimDay` most extreme days), scales it by a governance multiplier `RANGE_MULTIPLICATOR`, and produces a symmetric range rounded up to the nearest `RANGE_STEP_BPS` (0.5%). The freshly computed range is applied on every rebalance (the position is recreated regardless), so it always tracks current volatility.
+- When `DYNAMIC_RANGE_ENABLED` is `false` (e.g. stablecoin pools), the range stays fixed at `RANGE_UP_BASE` / `RANGE_DOWN_BASE` (in basis points), configured by the multisig.
 
 ---
 
@@ -20,22 +46,27 @@ Liquid Hub manages Uniswap V3 concentrated liquidity positions for multiple user
 ### Standard Pool
 
 - Directional exposure to both tokens (WETH and USDC).
-- LP earns swap fees from the Uniswap V3 pool.
+- LP earns swap fees from the DEX pool.
 - Simple deposit/withdraw lifecycle with no hedging.
 
 ### Delta Neutral (DN) Pool
 
-- Same LP mechanism as a standard pool — positions are minted in Uniswap V3 and earn swap fees.
+- Same LP mechanism as a standard pool — positions are minted on the DEX and earn swap fees.
 - Additionally uses an **AAVE V3 hedge** to neutralize directional price exposure:
-  - A reserve ratio (62.5%) of USDC is supplied as AAVE collateral.
-  - WETH is borrowed against the collateral (LTV target 60%).
-  - The borrowed WETH offsets the LP's long WETH exposure.
+  - USDC is supplied as AAVE collateral and WETH is borrowed against it.
+  - The borrowed WETH offsets the LP's long WETH exposure. The hedge is piloted on the **net effective short** (`effectiveShort = debt − idle WETH`, idle on the HedgeManager and RangeManager) versus a target of `hedgeTargetBps × wethInLP` (100% = strict delta-neutral by default). The borrowed WETH is integrated into the LP (never left idle), so the AAVE debt is a real short covering the LP's WETH.
+- **Permissionless hedge adjustment** — `adjustHedge()` (see Hedge Adjustment below) is callable by any keeper for a bounty: it corrects an **over-hedge** on-chain (repay) and **reverts on under-hedge** (an under-hedge is corrected by rebuilding the LP composition during a `rebalance()`, with an on-chain post-check).
+- **USDC reserve** — a small USDC reserve is kept on the HedgeManager so adjustments don't have to touch the LP; it is **reconstituted on-chain inside `adjustHedge()`** when the health factor is above target (no separate action).
 - **Net effect**: LP fees are earned without directional price exposure.
 - **Withdrawals are atomic**: burn LP, flash loan settlement (if needed), return tokens to user in a single transaction.
 - **Health Factor** is monitored continuously:
   - Warn threshold: 1.25
   - Deleverage threshold: 1.15
   - Emergency threshold: 1.05
+
+#### Hedge Adjustment (`adjustHedge`, on-chain)
+
+`adjustHedge()` is permissionless. It reads the LP position and the Chainlink price on-chain and pilots on the **net effective short** (`effectiveShort = debt − idle WETH`) versus the target (`hedgeTargetBps × wethInLP`). If **over-hedged** it repays the excess — the repay leg acquires WETH via an on-chain USDC→WETH swap bounded by the oracle (anti-MEV, `SWAP_SLIPPAGE_BPS`). If **under-hedged** it **reverts `UnderHedged`** — borrowing-and-holding would not change the net short, so an under-hedge is corrected by rebuilding the LP composition during a `rebalance()` (with an on-chain post-check), not here. It **reverts unless the drift vs the target exceeds `adjustHedgeBps`** (the anti-drain guard) **and the on-chain cooldown (`hedgeAdjustCooldown`) has elapsed** — the cooldown applies to **all callers** (keepers and the protocol bot alike). After an over-hedge correction, surplus collateral above `RESERVE_HF_TARGET_BPS` is released as USDC on the HedgeManager to replenish the reserve, all in the same call. A successful over-hedge correction pays the **hedge bounty**.
 
 ---
 
@@ -44,7 +75,7 @@ Liquid Hub manages Uniswap V3 concentrated liquidity positions for multiple user
 Large swaps are split into smaller chunks to reduce price impact on the pool:
 
 - Default chunk size: `INIT_MULTI_SWAP_TVL` (~$10k per swap).
-- Each chunk is a separate on-chain transaction via Uniswap V3 `SwapRouter`.
+- Each chunk is a separate on-chain transaction via the DEX swap router.
 - A 2-second delay between swaps allows arbitrageurs to reset the pool price.
 - This mechanism ensures minimal slippage even for large TVL pools.
 
@@ -53,11 +84,12 @@ Large swaps are split into smaller chunks to reduce price impact on the pool:
 ## Rebalance Flow (Detailed)
 
 1. **`startRebalance()`** — Lock the vault (no deposits or withdrawals allowed during rebalance).
-2. **`burnPosition(tokenId)`** — Remove the current LP position from Uniswap V3, collect accrued fees.
-3. **[DN only] Recalibrate AAVE hedge** — Adjust the borrow/supply on AAVE to match the new position parameters.
-4. **N x `executeSwap()`** — Execute one or more swaps to rebalance the token ratio for the new range. Uses the multi-swap system for large amounts.
-5. **`mintInitialPosition()`** — Create a new LP position at the optimal range configured by the Safe multisig.
-6. **`endRebalance()`** — Unlock the vault, pay keeper bounty (if enabled).
+2. **`burnPosition(tokenId)`** — Remove the current LP position from the DEX, collect accrued fees.
+3. **N x `executeSwap()`** — Execute one or more swaps to rebalance the token ratio for the new range. Uses the multi-swap system for large amounts.
+4. **`mintInitialPosition()`** — Create a new LP position at the range computed on-chain (or the fixed base range when dynamic ranges are disabled).
+5. **`endRebalance()`** — Unlock the vault, pay keeper bounty (if enabled).
+
+On DN pools the AAVE hedge is **not** recalibrated inside the rebalance — it is adjusted independently and permissionlessly via `adjustHedge()` (see Hedge Adjustment), which any keeper can call for a separate bounty whenever the drift crosses the threshold.
 
 ---
 

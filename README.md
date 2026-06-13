@@ -4,22 +4,22 @@ Decentralized liquidity management protocol.
 
 ## Overview
 
-Liquid Hub automates range management: dynamic range setting, permissionless rebalancing, multi-user vaults with fair share accounting, and protocol fee collection via an on-chain Treasury.
+Liquid Hub automates range management: **dynamic ranges computed 100% on-chain**, permissionless rebalancing, multi-user vaults with fair share accounting, and protocol fee collection via an on-chain Treasury. It runs on concentrated-liquidity DEXs; the architecture is DEX-agnostic, and each deployed pool documents the specific DEX it targets in its own folder.
 
 Two pool types:
-- **Standard** — Directional LP exposure on Uniswap V3
-- **Delta Neutral (DN)** — LP exposure hedged via AAVE V3 (supply USDC collateral, borrow WETH)
+- **Standard** — Directional LP exposure on a concentrated-liquidity DEX
+- **Delta Neutral (DN)** — LP exposure hedged via AAVE V3 (supply USDC collateral, borrow WETH), with a permissionless on-chain hedge rebalance (`adjustHedge()`)
 
 ## Architecture
 
 | Contract | Description |
 |---|---|
 | **MultiUserVault** | Multi-user vault managing deposits, withdrawals, share accounting, and LP position lifecycle |
-| **RangeManager** | Uniswap V3 price range management, on-chain swaps via SwapRouter, permissionless rebalancing |
-| **RangeOperations** | Library for tick/range calculations |
+| **RangeManager** | DEX price range management, on-chain swaps via the DEX router, 100% on-chain dynamic-range computation, permissionless rebalancing + price snapshots |
+| **RangeOperations** | Library for tick/range calculations and the on-chain dynamic-range formula |
 | **SecureBotModule** | Gnosis Safe module whitelisting specific function selectors for automated operations |
-| **Treasury** | Protocol fee collection, keeper bounties, admin withdrawals with monthly cap |
-| **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: supply/borrow, flash loan settlement, health factor monitoring |
+| **Treasury** | Protocol fee collection, keeper / metrics / hedge bounties (+ Phase 2 bridge bounty), admin withdrawals with monthly cap |
+| **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: supply/borrow, permissionless `adjustHedge()` (H_opt + USDC reserve), flash loan settlement, health factor monitoring |
 
 ## Directory Structure
 

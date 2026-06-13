@@ -9,18 +9,55 @@ const RANGEMANAGER_ABI = [
   "function priceCache() external view returns (uint128 price0, uint128 price1, uint160 poolSqrtPriceX96, int24 poolTick, uint64 timestamp, bool valid)",
   "function isSystemOperational() external view returns (bool)",
   "function config() external view returns (uint24 fee, uint8 token0Decimals, uint8 token1Decimals, uint16 toleranceBps, uint24 maxSlippageBps, uint64 lastRebalanceTime, bool oraclesConfigured, uint16 rangeUpPercent, uint16 rangeDownPercent, uint32 maxPositions)",
-  "function initMultiSwapTvl() external view returns (uint256)"
+  "function initMultiSwapTvl() external view returns (uint256)",
+  // --- Dynamic range (on-chain) ---
+  // recordPriceSnapshot is permissionless: it stores a Chainlink price point in the on-chain
+  // ring buffer used to compute the dynamic range. The contract spaces snapshots regularly
+  // (24h / maxSnapshotsPerDay) and REVERTS if one is not due yet — so callers wrap it in try/catch.
+  // A successful call pays the metrics bounty (USDC) from the Treasury to msg.sender.
+  "function recordPriceSnapshot() external",
+  "function isSnapshotDue() external view returns (bool)",
+  "function dynRangeConfig() external view returns (bool dynamicRangeEnabled, uint8 maxSnapshotsPerDay, uint8 volatMoyDay, uint8 volatTrimDay, uint16 rangeStepBps, uint16 rangeMultiplicatorBps, uint64 lastSnapshotAt)",
+  // getOwnerPositions: confirme qu'un NFT existe (depot permissionless interdit si aucune position)
+  "function getOwnerPositions() external view returns (uint256[] memory)"
 ];
 
 // MultiUserVault ABI (only functions needed by keeper)
 const VAULT_ABI = [
-  "function treasuryAddress() external view returns (address)"
+  "function treasuryAddress() external view returns (address)",
+  // --- depot permissionless ---
+  // processDepositPermissionless traite 1 depot de la file (atomique) : shares (oracle) -> swaps
+  // bornes oracle -> addLiquidity -> deposit bounty. Verrou anti-withdraw concurrent. REVERT si file
+  // vide / pas de NFT / cache prix perime / minOut < plancher oracle. Appeler en try/catch.
+  "function getPendingDepositsCount() external view returns (uint256)",
+  "function getNextDepositValueUSD() external view returns (uint256)",
+  "function processDepositPermissionless(uint256[] swapAmountsIn, uint256[] minAmountsOut, address tokenIn, address tokenOut) external",
+  // AUDIT H-01/H-03 : plan de swap du PROCHAIN dépôt (état post-transfert, ratio NFT existant). À utiliser
+  // pour le dépôt (PAS getOptimalSwapParams du RangeManager, qui reflète l état rebalance/post-burn).
+  "function getDepositSwapParams() external view returns (bool zeroForOne, uint256 amountIn)",
+  "function isRebalancing() external view returns (bool)"
 ];
 
-// Treasury ABI (for bounty info)
+// Treasury ABI (for bounty info + USDC balance check)
 const TREASURY_ABI = [
   "function keeperBountyEnabled() external view returns (bool)",
-  "function keeperBountyAmount() external view returns (uint256)"
+  "function keeperBountyAmount() external view returns (uint256)",
+  "function metricsBountyEnabled() external view returns (bool)",
+  "function metricsBountyAmount() external view returns (uint256)",
+  "function depositBountyEnabled() external view returns (bool)",
+  "function depositBountyAmount() external view returns (uint256)",
+  "function usdc() external view returns (address)"
+];
+
+// Minimal ERC20 ABI (to read the Treasury USDC balance — lets the keeper warn the operator
+// when the Treasury is underfunded and a bounty would be skipped).
+const ERC20_ABI = [
+  "function balanceOf(address account) external view returns (uint256)"
+];
+
+const PAUSE_CONTROLLER_ABI = [
+  "function inflowsPaused() external view returns (bool)",
+  "function withdrawalsPaused() external view returns (bool)"
 ];
 
 function createContracts(provider) {
@@ -34,7 +71,15 @@ function createContracts(provider) {
     VAULT_ABI,
     provider
   );
-  return { rangeManager, vault };
+  let pauseController = null;
+  if (process.env.PAUSE_CONTROLLER_ADDRESS) {
+    pauseController = new ethers.Contract(
+      process.env.PAUSE_CONTROLLER_ADDRESS,
+      PAUSE_CONTROLLER_ABI,
+      provider
+    );
+  }
+  return { rangeManager, vault, pauseController };
 }
 
-module.exports = { RANGEMANAGER_ABI, VAULT_ABI, TREASURY_ABI, createContracts };
+module.exports = { RANGEMANAGER_ABI, VAULT_ABI, TREASURY_ABI, ERC20_ABI, PAUSE_CONTROLLER_ABI, createContracts };
