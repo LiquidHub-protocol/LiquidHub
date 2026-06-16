@@ -9,12 +9,7 @@ interface IAaveV3Pool {
     /// @param amount The amount to supply
     /// @param onBehalfOf The address that will receive the aTokens
     /// @param referralCode Referral code (0 for none)
-    function supply(
-        address asset,
-        uint256 amount,
-        address onBehalfOf,
-        uint16 referralCode
-    ) external;
+    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
 
     /// @notice Borrows an amount of asset with variable rate
     /// @param asset The address of the underlying asset to borrow
@@ -22,13 +17,8 @@ interface IAaveV3Pool {
     /// @param interestRateMode 2 = variable rate
     /// @param referralCode Referral code (0 for none)
     /// @param onBehalfOf The address that will receive the debt tokens
-    function borrow(
-        address asset,
-        uint256 amount,
-        uint256 interestRateMode,
-        uint16 referralCode,
-        address onBehalfOf
-    ) external;
+    function borrow(address asset, uint256 amount, uint256 interestRateMode, uint16 referralCode, address onBehalfOf)
+        external;
 
     /// @notice Repays a borrowed amount
     /// @param asset The address of the borrowed asset
@@ -36,23 +26,16 @@ interface IAaveV3Pool {
     /// @param interestRateMode 2 = variable rate
     /// @param onBehalfOf The address of the user who will get his debt reduced
     /// @return The final amount repaid
-    function repay(
-        address asset,
-        uint256 amount,
-        uint256 interestRateMode,
-        address onBehalfOf
-    ) external returns (uint256);
+    function repay(address asset, uint256 amount, uint256 interestRateMode, address onBehalfOf)
+        external
+        returns (uint256);
 
     /// @notice Withdraws an amount of underlying asset from the protocol
     /// @param asset The address of the underlying asset
     /// @param amount The amount to withdraw (use type(uint256).max for full withdraw)
     /// @param to The address that will receive the underlying asset
     /// @return The final amount withdrawn
-    function withdraw(
-        address asset,
-        uint256 amount,
-        address to
-    ) external returns (uint256);
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
 
     /// @notice Returns the user account data across all the reserves
     /// @param user The address of the user

@@ -10,14 +10,14 @@ import "./RangeOperations.sol";
 
 /// @dev Interfaces minimales (la library reçoit les adresses en paramètre — aucun accès au storage du Vault).
 interface IHedgeDep {
-    function getWethDebt() external view returns (uint256);            // dette WETH EXACTE (audit H-03)
+    function getWethDebt() external view returns (uint256); // dette WETH EXACTE (audit H-03)
     function getWethBalance() external view returns (uint256);
     function getUsdcBalance() external view returns (uint256);
     function getHealthFactor() external view returns (uint256);
     function hedgeTargetBps() external view returns (uint16);
     function reserveHfTargetBps() external view returns (uint16);
     function liqThresholdBps() external view returns (uint16);
-    function donationDustToken0() external view returns (uint256);     // filtre dust cohérent (audit M-02)
+    function donationDustToken0() external view returns (uint256); // filtre dust cohérent (audit M-02)
     function supplyAndBorrow(uint256 collateralAmountUsdc, uint256 borrowAmountWeth) external;
     function sweepWethAmount(uint256 amount, address to) external;
 }
@@ -29,10 +29,28 @@ interface IRmDep {
     function vault() external view returns (address);
     function token0() external view returns (address);
     function token1() external view returns (address);
-    function priceCache() external view returns (uint128 price0, uint128 price1, uint160 sqrtP, int24 tick, uint64 ts, bool valid);
-    function config() external view returns (uint24 fee, uint8 dec0, uint8 dec1, uint16 tol, uint24 slip, uint64 lrt, bool oc, uint16 up, uint16 down, uint32 maxPos);
+    function priceCache()
+        external
+        view
+        returns (uint128 price0, uint128 price1, uint160 sqrtP, int24 tick, uint64 ts, bool valid);
+    function config()
+        external
+        view
+        returns (
+            uint24 fee,
+            uint8 dec0,
+            uint8 dec1,
+            uint16 tol,
+            uint24 slip,
+            uint64 lrt,
+            bool oc,
+            uint16 up,
+            uint16 down,
+            uint32 maxPos
+        );
     function getOwnerPositions() external view returns (uint256[] memory);
     function positionManager() external view returns (INonfungiblePositionManager);
+    function initMultiSwapTvl() external view returns (uint256);
 }
 
 interface IVaultDep {
@@ -56,6 +74,7 @@ library DnDepositLib {
 
     error InsufficientCollateral();
     error PreAdjustRequired();
+    error InvalidSwapPlan();
 
     /// @notice Ouvre le hedge au dépôt (cible GLOBALE : corrige aussi le drift existant). USD 8 déc.
     /// @param a Adresses (hedge, rm, token0, token1)
@@ -63,13 +82,7 @@ library DnDepositLib {
     /// @param price1 prix token1 Chainlink (8 déc)
     /// @param dec0 décimales token0
     /// @param dec1 décimales token1
-    function openDepositHedge(
-        Addrs calldata a,
-        uint128 price0,
-        uint128 price1,
-        uint8 dec0,
-        uint8 dec1
-    ) external {
+    function openDepositHedge(Addrs calldata a, uint128 price0, uint128 price1, uint8 dec0, uint8 dec1) external {
         // Exécution : les fonds du dépôt sont DÉJÀ sur le RM (_processOneDeposit a précédé) → extra0=extra1=0.
         (uint256 collateralUsdc, uint256 borrowWeth) =
             _computeDepositHedge(a.hedgeManager, a.rangeManager, a.token0, a.token1, price0, price1, dec0, dec1, 0, 0);
@@ -104,15 +117,22 @@ library DnDepositLib {
     /// @dev AUDIT H-03 : rBps = ratio du NFT EXISTANT au prix courant (addLiquidityToPosition ajoute à CE range),
     ///      pas le range cible dynamique (getOptimalSwapParams, réservé au (re)mint).
     function _computeDepositHedge(
-        address hedgeManager, address rangeManager, address token0, address token1,
-        uint128 price0, uint128 price1, uint8 dec0, uint8 dec1,
-        uint256 extra0, uint256 extra1
+        address hedgeManager,
+        address rangeManager,
+        address token0,
+        address token1,
+        uint128 price0,
+        uint128 price1,
+        uint8 dec0,
+        uint8 dec1,
+        uint256 extra0,
+        uint256 extra1
     ) private view returns (uint256 collateralUsdc, uint256 borrowWeth) {
         IHedgeDep hm = IHedgeDep(hedgeManager);
         IRmDep rm = IRmDep(rangeManager);
         uint256 dustTok0 = hm.donationDustToken0();
         uint256 debtUsd = _toUsd(hm.getWethDebt(), price0, dec0);
-        uint256 freeRmWeth = IERC20(token0).balanceOf(rangeManager) + extra0;     // + dépôt token0 (post-transfert)
+        uint256 freeRmWeth = IERC20(token0).balanceOf(rangeManager) + extra0; // + dépôt token0 (post-transfert)
         uint256 idleHmUsd = _toUsd(_dust(hm.getWethBalance(), dustTok0), price0, dec0);
         uint256 idleRmUsd = _toUsd(_dust(freeRmWeth, dustTok0), price0, dec0);
         (uint256 totalBal0,) = rm.getCurrentBalances();
@@ -120,7 +140,7 @@ library DnDepositLib {
         uint256 curFreeRmWeth = freeRmWeth - extra0;
         uint256 nftWeth = totalBal0 > curFreeRmWeth ? totalBal0 - curFreeRmWeth : 0;
         uint256 investableUsd = ((IERC20(token1).balanceOf(rangeManager) + extra1) * uint256(price1)) / (10 ** dec1);
-        uint16 rBps = _nftRatio0Bps(rangeManager);   // H-03 : ratio du NFT existant
+        uint16 rBps = _nftRatio0Bps(rangeManager); // H-03 : ratio du NFT existant
 
         (uint256 collateralUsd, uint256 borrowUsd) = RangeOperations.computeHedgeDeposit(
             RangeOperations.HedgeDepositParams({
@@ -155,7 +175,14 @@ library DnDepositLib {
 
     function _pc(IRmDep rm) private view returns (RangeOperations.PriceCache memory pc) {
         (uint128 p0, uint128 p1, uint160 sp, int24 tk, uint64 ts, bool v) = rm.priceCache();
-        pc = RangeOperations.PriceCache({price0: p0, price1: p1, poolSqrtPriceX96: sp, poolTick: tk, timestamp: ts, valid: v});
+        pc = RangeOperations.PriceCache({
+            price0: p0,
+            price1: p1,
+            poolSqrtPriceX96: sp,
+            poolTick: tk,
+            timestamp: ts,
+            valid: v
+        });
     }
 
     /// @notice AUDIT H-01 : plan de swap du PROCHAIN DÉPÔT, calculé sur l'état FUTUR (post-transfert du dépôt +
@@ -166,9 +193,19 @@ library DnDepositLib {
     ///         No-op (false,0) si pool std (hedgeManager==0) → le caller retombe sur getOptimalSwapParams.
     /// @return zeroForOne true si swap token0→token1
     /// @return amountIn montant à swapper (unités natives du token d'entrée), 0 si aucun swap
-    function getDepositSwapParams(
-        address rangeManager, uint256 depositAmount0, uint256 depositAmount1
-    ) external view returns (bool zeroForOne, uint256 amountIn) {
+    function getDepositSwapParams(address rangeManager, uint256 depositAmount0, uint256 depositAmount1)
+        external
+        view
+        returns (bool zeroForOne, uint256 amountIn)
+    {
+        return _depositSwapParams(rangeManager, depositAmount0, depositAmount1);
+    }
+
+    function _depositSwapParams(address rangeManager, uint256 depositAmount0, uint256 depositAmount1)
+        private
+        view
+        returns (bool zeroForOne, uint256 amountIn)
+    {
         IRmDep rmI = IRmDep(rangeManager);
         (uint128 price0, uint128 price1,,,, bool valid) = rmI.priceCache();
         if (!valid) return (false, 0);
@@ -183,8 +220,7 @@ library DnDepositLib {
         uint256 borrowWeth;
         if (hedgeManager != address(0)) {
             (collateralUsdc, borrowWeth) = _computeDepositHedge(
-                hedgeManager, rangeManager, token0, token1, price0, price1, dec0, dec1,
-                depositAmount0, depositAmount1
+                hedgeManager, rangeManager, token0, token1, price0, price1, dec0, dec1, depositAmount0, depositAmount1
             );
         }
 
@@ -215,6 +251,90 @@ library DnDepositLib {
         return (false, 0);
     }
 
+    function validateDepositSwapPlan(
+        address rangeManager,
+        uint256 depositAmount0,
+        uint256 depositAmount1,
+        uint256[] calldata swapAmountsIn,
+        uint256[] calldata minAmountsOut,
+        address tokenIn,
+        address tokenOut,
+        uint256 maxTotalSwapUsd
+    ) external view {
+        if (swapAmountsIn.length != minAmountsOut.length) revert InvalidSwapPlan();
+        IRmDep rm = IRmDep(rangeManager);
+        address token0 = rm.token0();
+        address token1 = rm.token1();
+        bool tokenInIsToken0 = tokenIn == token0;
+        (bool expectedZeroForOne, uint256 expectedAmountIn) =
+            _depositSwapParams(rangeManager, depositAmount0, depositAmount1);
+        uint256 n = swapAmountsIn.length;
+        uint256 totalSwapIn;
+        uint16 toleranceBps;
+        if (n > 0) {
+            if (!((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0))) {
+                revert InvalidSwapPlan();
+            }
+            (uint128 price0, uint128 price1,,, uint64 ts, bool valid) = rm.priceCache();
+            if (!valid || price0 == 0 || price1 == 0) revert InvalidSwapPlan();
+            (, uint8 dec0, uint8 dec1, uint16 tol, uint24 slip,,,,,) = rm.config();
+            toleranceBps = tol;
+            RangeOperations.PriceCache memory pc = RangeOperations.PriceCache(price0, price1, 0, 0, ts, valid);
+            RangeOperations.RangeConfig memory cfg =
+                RangeOperations.RangeConfig(0, dec0, dec1, tol, slip, 0, true, 0, 0, 1);
+            uint256 chunkCapUsd = rm.initMultiSwapTvl() * 1e8;
+            uint256 priceInUsd = tokenInIsToken0 ? uint256(price0) : uint256(price1);
+            uint256 decIn = tokenInIsToken0 ? dec0 : dec1;
+            uint256 totalSwapUsd;
+            for (uint256 i; i < n; ++i) {
+                uint256 amt = swapAmountsIn[i];
+                totalSwapIn += amt;
+                uint256 chunkUsd = (amt * priceInUsd) / (10 ** decIn);
+                if (chunkCapUsd > 0 && chunkUsd > chunkCapUsd) revert InvalidSwapPlan();
+                totalSwapUsd += chunkUsd;
+                if (maxTotalSwapUsd > 0 && totalSwapUsd > maxTotalSwapUsd) revert InvalidSwapPlan();
+                uint256 floor = RangeOperations.oracleMinOut(tokenInIsToken0, amt, pc, cfg, slip);
+                if (minAmountsOut[i] < floor) revert InvalidSwapPlan();
+            }
+        } else {
+            (,,, toleranceBps,,,,,,) = rm.config();
+        }
+        _requireSwapPlan(expectedAmountIn, expectedZeroForOne, tokenInIsToken0, totalSwapIn, toleranceBps);
+    }
+
+    function aaveBaseToStable(uint256 baseAmount, address rangeManager, uint8 stableDecimals)
+        external
+        view
+        returns (uint256)
+    {
+        uint256 price1;
+        try IRmDep(rangeManager).priceCache() returns (uint128, uint128 p1, uint160, int24, uint64, bool valid) {
+            if (!valid || p1 == 0) revert InvalidSwapPlan();
+            price1 = uint256(p1);
+        } catch {
+            revert InvalidSwapPlan();
+        }
+        return (baseAmount * (10 ** stableDecimals)) / price1;
+    }
+
+    function _requireSwapPlan(
+        uint256 expectedAmountIn,
+        bool expectedZeroForOne,
+        bool tokenInIsToken0,
+        uint256 submittedAmountIn,
+        uint16 toleranceBps
+    ) private pure {
+        if (expectedAmountIn == 0) {
+            if (submittedAmountIn != 0) revert InvalidSwapPlan();
+            return;
+        }
+        if (tokenInIsToken0 != expectedZeroForOne) revert InvalidSwapPlan();
+        uint256 tolerance = (expectedAmountIn * uint256(toleranceBps)) / 10000;
+        if (tolerance == 0) tolerance = 1;
+        if (submittedAmountIn + tolerance < expectedAmountIn) revert InvalidSwapPlan();
+        if (submittedAmountIn > expectedAmountIn + tolerance) revert InvalidSwapPlan();
+    }
+
     /// @notice AUDIT M-01 : plan de swap d'un REBALANCE DN compatible avec la dette AAVE FIXE. rebalance() ne
     ///         touche pas AAVE → pour passer le post-check, la LP remintée doit avoir wethInLP ≈ effectiveShort/H
     ///         (le short net est fixé par la dette). On calcule le swap depuis les balances TOTALES post-burn
@@ -222,9 +342,7 @@ library DnDepositLib {
     /// @dev    À utiliser par le keeper quand le rebalance est déclenché par drift DN (sous-hedge in-range) —
     ///         le plan range standard (getOptimalSwapParams) ne viserait pas la compo compatible dette fixe.
     ///         Renvoie (zeroForOne, amountIn natif). No-op si std/HF nul.
-    function getRebalanceSwapParams(address rangeManager)
-        external view returns (bool zeroForOne, uint256 amountIn)
-    {
+    function getRebalanceSwapParams(address rangeManager) external view returns (bool zeroForOne, uint256 amountIn) {
         IRmDep rm = IRmDep(rangeManager);
         address hedgeManager = IVaultDep(rm.vault()).hedgeManager();
         if (hedgeManager == address(0)) return (false, 0);
@@ -238,7 +356,7 @@ library DnDepositLib {
         uint256 dustTok0 = hm.donationDustToken0();
         uint256 debtUsd = _toUsd(hm.getWethDebt(), price0, dec0);
         uint256 idleUsd = _toUsd(_dust(hm.getWethBalance(), dustTok0), price0, dec0)
-                        + _toUsd(_dust(IERC20(token0).balanceOf(rangeManager), dustTok0), price0, dec0);
+            + _toUsd(_dust(IERC20(token0).balanceOf(rangeManager), dustTok0), price0, dec0);
         if (debtUsd <= idleUsd) return (false, 0); // pas de short net positif → rien à viser
         uint256 effShortUsd = debtUsd - idleUsd;
 
@@ -255,10 +373,10 @@ library DnDepositLib {
         uint256 targetV0 = targetWethLpUsd > totUsd ? totUsd : targetWethLpUsd;
 
         if (v0 > targetV0) {
-            amountIn = ((v0 - targetV0) * (10 ** dec0)) / uint256(price0);   // swap token0→token1 (réduit wethInLP)
+            amountIn = ((v0 - targetV0) * (10 ** dec0)) / uint256(price0); // swap token0→token1 (réduit wethInLP)
             return (true, amountIn);
         } else if (targetV0 > v0) {
-            amountIn = ((targetV0 - v0) * (10 ** dec1)) / uint256(price1);   // swap token1→token0
+            amountIn = ((targetV0 - v0) * (10 ** dec1)) / uint256(price1); // swap token1→token0
             return (false, amountIn);
         }
         return (false, 0);
@@ -360,11 +478,11 @@ library DnDepositLib {
 
     /// @notice Composition token0 du NFT LP + ticks, utilisée par AaveHedgeManager.adjustHedge().
     /// @dev Déport bytecode DN-only : évite une troisième library et laisse le settlement critique dans le manager.
-    function aaveLpToken0AndTicks(
-        uint256 tokenId,
-        INonfungiblePositionManager lpPositionManager,
-        IUniswapV3Pool lpPool
-    ) external view returns (uint256 token0InLP, int24 tickLower, int24 tickUpper) {
+    function aaveLpToken0AndTicks(uint256 tokenId, INonfungiblePositionManager lpPositionManager, IUniswapV3Pool lpPool)
+        external
+        view
+        returns (uint256 token0InLP, int24 tickLower, int24 tickUpper)
+    {
         uint128 liquidity;
         (,,,,, tickLower, tickUpper, liquidity,,,,) = lpPositionManager.positions(tokenId);
         if (liquidity == 0) return (0, tickLower, tickUpper);
@@ -398,14 +516,11 @@ library DnDepositLib {
         uint256 sp = uint256(sqrtPriceX96);
         uint256 poolRaw = Math.mulDiv(sp, sp, 1 << 96);
         poolRaw = Math.mulDiv(poolRaw, 1e18, 1 << 96);
-        uint256 poolPrice = Math.mulDiv(
-            poolRaw,
-            (10 ** volatileDecimals) * (10 ** oracleDecimals),
-            (10 ** stableDecimals) * 1e18
-        );
+        uint256 poolPrice =
+            Math.mulDiv(poolRaw, (10 ** volatileDecimals) * (10 ** oracleDecimals), (10 ** stableDecimals) * 1e18);
 
-        (, int256 px, , uint256 updatedAt, ) = volatileUsdFeed.latestRoundData();
-        require(px > 0 && block.timestamp - updatedAt <= oracleMaxAge, "Bad oracle");
+        (uint80 roundId, int256 px,, uint256 updatedAt, uint80 answeredInRound) = volatileUsdFeed.latestRoundData();
+        require(px > 0 && answeredInRound >= roundId && block.timestamp - updatedAt <= oracleMaxAge, "Bad oracle");
         uint256 oraclePrice = uint256(px);
 
         uint256 diff = poolPrice > oraclePrice ? poolPrice - oraclePrice : oraclePrice - poolPrice;
@@ -425,7 +540,9 @@ library DnDepositLib {
 
     /// @dev Montant de token0 pour une liquidite Uniswap V3 entre deux sqrtRatios.
     function _aaveAmount0ForLiquidity(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint128 liquidity)
-        private pure returns (uint256 amount0)
+        private
+        pure
+        returns (uint256 amount0)
     {
         if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
         require(sqrtRatioAX96 > 0, "sqrtA=0");

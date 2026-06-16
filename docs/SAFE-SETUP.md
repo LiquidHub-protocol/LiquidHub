@@ -106,7 +106,7 @@ Set the Chainlink price feed addresses used by the RangeManager for position cal
 **Contract:** RangeManager (`RANGEMANAGER_ADDRESS`)
 
 ```
-RangeManager.configurePriceFeeds(TOKEN0_ORACLE, TOKEN1_ORACLE, ETH_ORACLE)
+RangeManager.configurePriceFeeds(TOKEN0_ORACLE, TOKEN1_ORACLE, NATIVE_ORACLE)
 ```
 
 **ABI:**
@@ -137,5 +137,5 @@ RangeManager.configureRanges(rangeUpPercent, rangeDownPercent)
 
 - **All steps require Safe multisig approval** (2-of-3 signers must sign each transaction).
 - Steps should be executed in order, as later steps may depend on earlier configuration.
-- For **Delta Neutral (DN) pools**, additional AAVE-specific setup may be required, such as calling `supplyAndBorrow()` to establish the initial hedge position.
+- For **Delta Neutral (DN) pools**, the normal initial hedge is opened atomically by `processDepositPermissionless()` through `DnDepositLib`. Direct `supplyAndBorrow()` remains a Safe-only recovery/setup primitive, not a keeper/module action.
 - After completing all steps, run the keeper in check-only mode (`npm run check`) to verify the configuration is correct before enabling automated rebalancing.

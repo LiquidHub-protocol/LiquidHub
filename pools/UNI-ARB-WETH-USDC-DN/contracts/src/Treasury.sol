@@ -11,23 +11,23 @@ import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/Aggrega
 // --- Stargate v2 Interfaces ---
 
 struct SendParam {
-    uint32  dstEid;         // Destination LayerZero v2 endpoint ID
-    bytes32 to;             // Recipient address, left-padded to bytes32
-    uint256 amountLD;       // Amount in local token decimals
-    uint256 minAmountLD;    // Minimum received (slippage guard)
-    bytes   extraOptions;   // LayerZero executor options (empty for default)
-    bytes   composeMsg;     // Composed message for destination (empty if none)
-    bytes   oftCmd;         // "" = Taxi (immediate), hex"00" = Bus (batched)
+    uint32 dstEid; // Destination LayerZero v2 endpoint ID
+    bytes32 to; // Recipient address, left-padded to bytes32
+    uint256 amountLD; // Amount in local token decimals
+    uint256 minAmountLD; // Minimum received (slippage guard)
+    bytes extraOptions; // LayerZero executor options (empty for default)
+    bytes composeMsg; // Composed message for destination (empty if none)
+    bytes oftCmd; // "" = Taxi (immediate), hex"00" = Bus (batched)
 }
 
 struct MessagingFee {
-    uint256 nativeFee;      // Fee in native token (ETH/AVAX/MATIC/BNB)
-    uint256 lzTokenFee;     // Fee in ZRO token (always 0, we pay native)
+    uint256 nativeFee; // Fee in native token (ETH/AVAX/MATIC/BNB)
+    uint256 lzTokenFee; // Fee in ZRO token (always 0, we pay native)
 }
 
 struct MessagingReceipt {
     bytes32 guid;
-    uint64  nonce;
+    uint64 nonce;
     MessagingFee fee;
 }
 
@@ -42,28 +42,35 @@ struct OFTLimit {
 }
 
 struct OFTFeeDetail {
-    int256  feeAmountLD;
-    string  description;
+    int256 feeAmountLD;
+    string description;
 }
 
 struct Ticket {
-    uint56  ticketId;
-    bytes   passengerBytes;
+    uint56 ticketId;
+    bytes passengerBytes;
 }
 
 interface IStargate {
     function quoteSend(SendParam calldata _sendParam, bool _payInLzToken)
-        external view returns (MessagingFee memory fee);
+        external
+        view
+        returns (MessagingFee memory fee);
 
     function quoteOFT(SendParam calldata _sendParam)
-        external view returns (OFTLimit memory, OFTFeeDetail[] memory, OFTReceipt memory);
+        external
+        view
+        returns (OFTLimit memory, OFTFeeDetail[] memory, OFTReceipt memory);
 
     function sendToken(SendParam calldata _sendParam, MessagingFee calldata _fee, address _refundAddress)
-        external payable returns (MessagingReceipt memory, OFTReceipt memory, Ticket memory);
+        external
+        payable
+        returns (MessagingReceipt memory, OFTReceipt memory, Ticket memory);
 }
 
 contract Treasury is Ownable {
     using SafeERC20 for IERC20;
+
     uint256 private constant USD_SCALE = 1e8;
     uint16 private constant DEPOSIT_BOUNTY_MIN_RATIO = 100;
 
@@ -84,7 +91,7 @@ contract Treasury is Ownable {
     // --- Keeper Bounty (rebalance) ---
     bool public keeperBountyEnabled;
     uint256 public keeperBountyAmount;
-    uint256 public keeperBountyDailyCap;     // max rebalance bounties paid per UTC day per RangeManager
+    uint256 public keeperBountyDailyCap; // max rebalance bounties paid per UTC day per RangeManager
     mapping(address => uint64) public keeperBountyDay;
     mapping(address => uint256) public keeperBountyDailySpent;
     mapping(address => bool) public authorizedRangeManagers;
@@ -105,9 +112,9 @@ contract Treasury is Ownable {
     //               (default 50, ie. you must bridge >= 50× the bounty value to earn it)
     bool public bridgeBountyEnabled;
     uint256 public bridgeBountyAmount;
-    uint64 public bridgeBountyCooldown;     // seconds between two bounty payments
-    uint64 public lastBridgeBountyAt;       // unix timestamp of the last paid bounty
-    uint16 public bridgeBountyMinRatio;     // bounty paid only if bridged >= bountyAmount * ratio
+    uint64 public bridgeBountyCooldown; // seconds between two bounty payments
+    uint64 public lastBridgeBountyAt; // unix timestamp of the last paid bounty
+    uint16 public bridgeBountyMinRatio; // bounty paid only if bridged >= bountyAmount * ratio
 
     // --- Metrics Bounty (recordPriceSnapshot) — paye au keeper qui enregistre un snapshot de prix ---
     // Anti-spam assure on-chain par le timing regulier (maxSnapshotsPerDay) cote RangeManager.
@@ -128,9 +135,9 @@ contract Treasury is Ownable {
     // permissionless; si ces limites revert, le Vault catch et saute seulement le paiement du bounty.
     bool public depositBountyEnabled;
     uint256 public depositBountyAmount;
-    uint64 public depositBountyCooldown;      // seconds between two paid deposit bounties per Vault
+    uint64 public depositBountyCooldown; // seconds between two paid deposit bounties per Vault
     uint64 public depositBountyKeeperCooldown; // seconds between two paid deposit bounties for the same keeper per Vault
-    uint256 public depositBountyDailyCap;     // max deposit bounties paid per UTC day per Vault, in reward token units
+    uint256 public depositBountyDailyCap; // max deposit bounties paid per UTC day per Vault, in reward token units
     mapping(address => uint64) public lastDepositBountyAt;
     mapping(address => mapping(address => uint64)) public lastDepositBountyKeeperAt;
     mapping(address => uint64) public depositBountyDay;
@@ -139,7 +146,7 @@ contract Treasury is Ownable {
 
     // --- Bridge (Stargate v2) ---
     bool public bridgeEnabled;
-    uint32 public bridgeDestinationEid;     // LayerZero v2 endpoint ID (e.g. 30184 = Base)
+    uint32 public bridgeDestinationEid; // LayerZero v2 endpoint ID (e.g. 30184 = Base)
     address public bridgeDestinationAddress; // Recipient on destination chain (staking contract)
 
     // --- Events ---
@@ -207,7 +214,11 @@ contract Treasury is Ownable {
     // pouvait déclencher un swap des tokens de la Treasury avec un minAmountOut faible / une route
     // défavorable et sandwicher la conversion des fees. C'est une opération de gestion de trésorerie
     // (rare, déclenchée via la Safe) — pas un point d'entrée permissionless.
-    function swapToUSDC(address tokenIn, uint24 fee, uint256 amountIn, uint256 minAmountOut) external onlyOwner returns (uint256 amountOut) {
+    function swapToUSDC(address tokenIn, uint24 fee, uint256 amountIn, uint256 minAmountOut)
+        external
+        onlyOwner
+        returns (uint256 amountOut)
+    {
         require(tokenIn != address(usdc), "Already USDC");
         require(amountIn > 0, "Zero amount");
         IERC20 token = IERC20(tokenIn);
@@ -239,7 +250,7 @@ contract Treasury is Ownable {
         require(bridgeEnabled, "Bridge disabled");
         require(amount > 0, "Zero amount");
         require(bridgeDestinationAddress != address(0), "Destination not set");
-        require(usdc.balanceOf(address(this)) >= amount, "Insufficient USDC");
+        _requireDistributableUsdc(amount);
 
         // Build SendParam (Taxi mode = empty oftCmd)
         SendParam memory sendParam = SendParam({
@@ -249,11 +260,11 @@ contract Treasury is Ownable {
             minAmountLD: 0, // will be set after quoteOFT
             extraOptions: new bytes(0),
             composeMsg: new bytes(0),
-            oftCmd: ""  // Taxi = immediate delivery
+            oftCmd: "" // Taxi = immediate delivery
         });
 
         // Get actual received amount (after Stargate fee)
-        (, , OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
+        (,, OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
         sendParam.minAmountLD = receipt.amountReceivedLD;
 
         // Get messaging fee in native token
@@ -265,10 +276,12 @@ contract Treasury is Ownable {
         usdc.safeApprove(address(stargatePool), amount);
 
         // Execute cross-chain transfer
-        (MessagingReceipt memory msgReceipt, OFTReceipt memory oftReceipt, ) =
+        (MessagingReceipt memory msgReceipt, OFTReceipt memory oftReceipt,) =
             stargatePool.sendToken{value: fee.nativeFee}(sendParam, fee, msg.sender);
 
-        emit BridgedToStakers(oftReceipt.amountSentLD, oftReceipt.amountReceivedLD, bridgeDestinationEid, msgReceipt.guid);
+        emit BridgedToStakers(
+            oftReceipt.amountSentLD, oftReceipt.amountReceivedLD, bridgeDestinationEid, msgReceipt.guid
+        );
         _payBridgeBounty(msg.sender, oftReceipt.amountSentLD);
     }
 
@@ -279,22 +292,36 @@ contract Treasury is Ownable {
         if (!bridgeBountyEnabled || bridgeBountyAmount == 0) return;
         if (block.timestamp < uint256(lastBridgeBountyAt) + uint256(bridgeBountyCooldown)) return;
         uint256 ratio = uint256(bridgeBountyMinRatio);
-        if (ratio == 0 || bridgeBountyCooldown == 0) return;
-        if (bridgedAmount < bridgeBountyAmount * ratio) return;
+        if (bridgeBountyCooldown == 0) return;
+        if (ratio > 0 && bridgedAmount < bridgeBountyAmount * ratio) return;
         if (usdc.balanceOf(address(this)) < bridgeBountyAmount) return;
         lastBridgeBountyAt = uint64(block.timestamp);
         usdc.safeTransfer(keeper, bridgeBountyAmount);
         emit BridgeBountyPaid(keeper, bridgeBountyAmount);
     }
 
+    /// @dev Phase 2: permissionless bridge/distribution cannot drain bounty float.
+    function _requireDistributableUsdc(uint256 amount) internal view {
+        uint256 balance = usdc.balanceOf(address(this));
+        uint256 reserve = _bountyReserveUsdc();
+        require(balance > reserve && amount <= balance - reserve, "Bounty reserve");
+    }
+
+    function _bountyReserveUsdc() internal view returns (uint256 reserve) {
+        if (keeperBountyEnabled) reserve += keeperBountyDailyCap > 0 ? keeperBountyDailyCap : keeperBountyAmount;
+        if (metricsBountyEnabled) reserve += metricsBountyAmount;
+        if (hedgeBountyEnabled) reserve += hedgeBountyAmount;
+        if (depositBountyEnabled) reserve += depositBountyDailyCap > 0 ? depositBountyDailyCap : depositBountyAmount;
+        if (bridgeBountyEnabled) reserve += bridgeBountyAmount;
+    }
+
     /// @notice Swap token to USDC + bridge to staking in one transaction. Callable by anyone.
     /// @dev Caller pays native gas for Stargate cross-chain fees via msg.value.
-    function collectAndBridge(
-        address tokenIn,
-        uint24 fee,
-        uint256 amountIn,
-        uint256 minSwapOut
-    ) external payable returns (uint256 usdcBridged) {
+    function collectAndBridge(address tokenIn, uint24 fee, uint256 amountIn, uint256 minSwapOut)
+        external
+        payable
+        returns (uint256 usdcBridged)
+    {
         require(bridgeEnabled, "Bridge disabled");
         require(bridgeDestinationAddress != address(0), "Destination not set");
 
@@ -302,7 +329,7 @@ contract Treasury is Ownable {
         uint256 usdcAmount;
         if (tokenIn == address(usdc)) {
             usdcAmount = amountIn;
-            require(usdc.balanceOf(address(this)) >= amountIn, "Insufficient USDC");
+            _requireDistributableUsdc(amountIn);
         } else {
             require(amountIn > 0, "Zero amount");
             IERC20 token = IERC20(tokenIn);
@@ -330,6 +357,7 @@ contract Treasury is Ownable {
 
             usdcAmount = swapRouter.exactInputSingle(swapParams);
             emit SwappedToUSDC(tokenIn, fee, amountIn, usdcAmount);
+            _requireDistributableUsdc(usdcAmount);
         }
 
         // Step 2: Bridge all swapped USDC via Stargate
@@ -343,7 +371,7 @@ contract Treasury is Ownable {
             oftCmd: ""
         });
 
-        (, , OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
+        (,, OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
         sendParam.minAmountLD = receipt.amountReceivedLD;
 
         MessagingFee memory msgFee = stargatePool.quoteSend(sendParam, false);
@@ -352,7 +380,7 @@ contract Treasury is Ownable {
         usdc.safeApprove(address(stargatePool), 0);
         usdc.safeApprove(address(stargatePool), usdcAmount);
 
-        (, OFTReceipt memory oftReceipt, ) =
+        (, OFTReceipt memory oftReceipt,) =
             stargatePool.sendToken{value: msgFee.nativeFee}(sendParam, msgFee, msg.sender);
 
         usdcBridged = oftReceipt.amountReceivedLD;
@@ -372,7 +400,7 @@ contract Treasury is Ownable {
             oftCmd: ""
         });
 
-        (, , OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
+        (,, OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
         amountReceived = receipt.amountReceivedLD;
 
         sendParam.minAmountLD = amountReceived;
@@ -423,6 +451,7 @@ contract Treasury is Ownable {
     function rescueToken(address tokenAddr, address to, uint256 amount) external onlyRescueSafe {
         require(to != address(0), "Invalid recipient");
         require(tokenAddr != address(usdc), "Use adminWithdraw for USDC");
+        require(address(swapFeeds[tokenAddr]) == address(0), "Use bridge flow");
         IERC20(tokenAddr).safeTransfer(to, amount);
         emit TokenRescued(tokenAddr, to, amount);
     }
@@ -431,7 +460,7 @@ contract Treasury is Ownable {
     /// @dev Remains available to the rescue Safe after admin withdrawals are disabled in Phase 2.
     function rescueETH(address payable to, uint256 amount) external onlyRescueSafe {
         require(to != address(0), "Invalid recipient");
-        (bool ok, ) = to.call{value: amount}("");
+        (bool ok,) = to.call{value: amount}("");
         require(ok, "ETH transfer failed");
         emit ETHRescued(to, amount);
     }
@@ -488,6 +517,7 @@ contract Treasury is Ownable {
 
     /// @notice Pay bounty to keeper who recorded a price snapshot. Called by authorized RangeManager.
     /// @dev Appele en try/catch cote RangeManager => ne bloque jamais le snapshot si revert ici.
+    ///      Pas de daily cap Treasury dedie : la cadence est bornee on-chain par RangeManager.maxSnapshotsPerDay.
     function payMetricsBounty(address keeper) external {
         require(keeper != address(0), "Invalid keeper");
         require(authorizedRangeManagers[msg.sender], "Not authorized");
@@ -543,7 +573,9 @@ contract Treasury is Ownable {
         require(authorizedVaults[msg.sender], "Not authorized");
         require(depositBountyEnabled, "Bounty disabled");
         require(depositBountyAmount > 0, "Bounty is zero");
-        require(depositValueUsd >= _rewardAmountUsd8(depositBountyAmount) * DEPOSIT_BOUNTY_MIN_RATIO, "Deposit too small");
+        require(
+            depositValueUsd >= _rewardAmountUsd8(depositBountyAmount) * DEPOSIT_BOUNTY_MIN_RATIO, "Deposit too small"
+        );
         require(usdc.balanceOf(address(this)) >= depositBountyAmount, "Insufficient USDC");
 
         _consumeDepositBountyLimit(msg.sender, keeper);
@@ -561,7 +593,8 @@ contract Treasury is Ownable {
         }
         if (depositBountyKeeperCooldown > 0) {
             require(
-                block.timestamp >= uint256(lastDepositBountyKeeperAt[vault][keeper]) + uint256(depositBountyKeeperCooldown),
+                block.timestamp
+                    >= uint256(lastDepositBountyKeeperAt[vault][keeper]) + uint256(depositBountyKeeperCooldown),
                 "Deposit bounty keeper cooldown"
             );
         }
@@ -595,7 +628,10 @@ contract Treasury is Ownable {
         emit DepositBountyConfigured(_enabled, _amount);
     }
 
-    function setDepositBountyLimits(uint64 _vaultCooldown, uint64 _keeperCooldown, uint256 _dailyCap) external onlyOwner {
+    function setDepositBountyLimits(uint64 _vaultCooldown, uint64 _keeperCooldown, uint256 _dailyCap)
+        external
+        onlyOwner
+    {
         require(_vaultCooldown <= 1 days && _keeperCooldown <= 7 days, "Invalid cooldown");
         if (_dailyCap > 0) {
             require(_dailyCap >= depositBountyAmount, "Cap < bounty");
@@ -661,8 +697,11 @@ contract Treasury is Ownable {
         uint32 maxAge = swapFeedMaxAges[tokenIn];
         require(address(feed) != address(0), "No feed for token");
         require(maxAge != 0, "No max age");
-        (uint80 roundId, int256 px, , uint256 updatedAt, uint80 answeredInRound) = feed.latestRoundData();
-        require(px > 0 && updatedAt != 0 && answeredInRound >= roundId && block.timestamp - updatedAt <= maxAge, "Bad oracle");
+        (uint80 roundId, int256 px,, uint256 updatedAt, uint80 answeredInRound) = feed.latestRoundData();
+        require(
+            px > 0 && updatedAt != 0 && answeredInRound >= roundId && block.timestamp - updatedAt <= maxAge,
+            "Bad oracle"
+        );
         uint8 tokenDec = IERC20Metadata(tokenIn).decimals();
         uint8 feedDec = feed.decimals();
         uint8 usdcDec = IERC20Metadata(address(usdc)).decimals();
@@ -694,6 +733,7 @@ contract Treasury is Ownable {
     /// @notice Distribute USDC to local staking contract (same chain). Callable by anyone.
     function distributeToStakers(uint256 amount) external {
         require(stakingRewardsAddress != address(0), "Staking not configured");
+        _requireDistributableUsdc(amount);
         usdc.safeTransfer(stakingRewardsAddress, amount);
         emit FeesDistributed(amount);
     }

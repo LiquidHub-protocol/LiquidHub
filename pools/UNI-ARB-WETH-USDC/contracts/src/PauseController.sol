@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-/// @notice Safe-only bounded circuit breaker. It never holds or moves funds.
+/// @notice Bounded circuit breaker. It never holds or moves funds.
+/// @dev Phase 1: Safe is both governance and pause guardian.
+///      Phase 2: governance can move to a timelock while the Safe remains the fast pause guardian.
 contract PauseController {
     error E_PAUSED();
     error E_COOLDOWN();
 
     address public immutable safe;
+    address public governance;
+    address public pauseGuardian;
     uint64 public inflowsPausedUntil;
     uint64 public withdrawalsPausedUntil;
     uint64 public depositCooldown;
@@ -21,19 +25,42 @@ contract PauseController {
     event WithdrawalsPaused(uint64 until);
     event WithdrawalsUnpaused();
     event DepositCooldownUpdated(uint64 oldCooldown, uint64 newCooldown);
+    event GovernanceTransferred(address indexed oldGovernance, address indexed newGovernance);
+    event PauseGuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
 
-    modifier onlySafe() {
-        require(msg.sender == safe, "E_SAFE");
+    modifier onlyGovernance() {
+        require(msg.sender == governance, "E_GOV");
+        _;
+    }
+
+    modifier onlyPauseGuardianOrGovernance() {
+        require(msg.sender == pauseGuardian || msg.sender == governance, "E_PAUSE");
         _;
     }
 
     constructor(address _safe, uint64 _depositCooldown) {
         require(_safe != address(0), "E_ZERO");
         safe = _safe;
+        governance = _safe;
+        pauseGuardian = _safe;
         _setDepositCooldown(_depositCooldown);
     }
 
-    function setDepositCooldown(uint64 _depositCooldown) external onlySafe {
+    function transferGovernance(address newGovernance) external onlyGovernance {
+        require(newGovernance != address(0), "E_ZERO");
+        address oldGovernance = governance;
+        governance = newGovernance;
+        emit GovernanceTransferred(oldGovernance, newGovernance);
+    }
+
+    function setPauseGuardian(address newGuardian) external onlyGovernance {
+        require(newGuardian != address(0), "E_ZERO");
+        address oldGuardian = pauseGuardian;
+        pauseGuardian = newGuardian;
+        emit PauseGuardianUpdated(oldGuardian, newGuardian);
+    }
+
+    function setDepositCooldown(uint64 _depositCooldown) external onlyGovernance {
         _setDepositCooldown(_depositCooldown);
     }
 
@@ -44,13 +71,13 @@ contract PauseController {
         emit DepositCooldownUpdated(oldCooldown, _depositCooldown);
     }
 
-    function pauseInflows() external onlySafe {
+    function pauseInflows() external onlyPauseGuardianOrGovernance {
         uint64 until = uint64(block.timestamp) + MAX_INFLOWS_PAUSE;
         inflowsPausedUntil = until;
         emit InflowsPaused(until);
     }
 
-    function pauseWithdrawals() external onlySafe {
+    function pauseWithdrawals() external onlyPauseGuardianOrGovernance {
         uint64 until = uint64(block.timestamp) + MAX_WITHDRAW_PAUSE;
         withdrawalsPausedUntil = until;
         if (inflowsPausedUntil < until) {
@@ -60,13 +87,13 @@ contract PauseController {
         emit WithdrawalsPaused(until);
     }
 
-    function unpauseInflows() external onlySafe {
+    function unpauseInflows() external onlyGovernance {
         require(block.timestamp >= withdrawalsPausedUntil, "E_WITHDRAWALS");
         inflowsPausedUntil = 0;
         emit InflowsUnpaused();
     }
 
-    function unpauseWithdrawals() external onlySafe {
+    function unpauseWithdrawals() external onlyGovernance {
         withdrawalsPausedUntil = 0;
         emit WithdrawalsUnpaused();
     }

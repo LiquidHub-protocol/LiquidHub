@@ -5,8 +5,7 @@ import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/Aggrega
 
 /// @title SequencerCheckedAggregator
 /// @notice Wrapper Chainlink "sequencer-checké" pour les L2 (Arbitrum). Implémente AggregatorV3Interface et se
-///         comporte comme un PASS-THROUGH TRANSPARENT du vrai feed Chainlink (mêmes décimales, même tuple),
-///         SAUF qu'il REVERT si le séquenceur L2 est down ou vient de redémarrer (grace period non écoulée).
+///         normalise le prix en 8 decimales et REVERT si le séquenceur L2 est down ou vient de redémarrer.
 /// @dev audit V1 (M3-B-fix6, retour Codex) — corrige l'absence de check séquenceur L2 (faille L2 classique :
 ///      au redémarrage du séquenceur, Chainlink peut servir un prix périmé pendant la fenêtre de grâce).
 ///
@@ -14,11 +13,11 @@ import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/Aggrega
 ///      - Les prix Chainlink sont lus à PLUSIEURS endroits hors du cache RangeManager : Treasury.collectAndBridge,
 ///        AaveHedgeManager (_oracleMaxUsdcForWeth, _requireLpNotDeviated). Un fix dans RangeOperations.updatePriceCache
 ///        n'aurait couvert QUE le cache. Le wrapper couvre TOUS les consommateurs d'un coup.
-///      - ZÉRO modification (donc zéro bytecode/storage) des contrats critiques RangeManager/Treasury/HedgeManager,
-///        qui continuent d'appeler latestRoundData() sur ce qu'ils croient être un feed Chainlink. Crucial vu la
-///        marge EIP-170 très faible côté DN.
+///      - Les contrats critiques RangeManager/Treasury/HedgeManager continuent d'appeler latestRoundData()
+///        sur ce qu'ils croient être un feed Chainlink. Le wrapper garantit aussi un prix USD en 8 décimales,
+///        y compris si un futur feed Chainlink n'utilise pas 8 décimales.
 ///      DÉPLOIEMENT : déployer 1 wrapper par feed distinct (ETH/USD, USDC/USD), puis pointer TOKEN0_ORACLE_ADDRESS /
-///      TOKEN1_ORACLE_ADDRESS / ETH_ORACLE_ADDRESS sur les wrappers dans le .env (au lieu des feeds bruts).
+///      TOKEN1_ORACLE_ADDRESS / NATIVE_ORACLE_ADDRESS sur les wrappers dans le .env (au lieu des feeds bruts).
 ///
 ///      STALENESS : NON géré ici (pass-through pur). Les contrats conservent leur propre check updatedAt
 ///      (MAX_AGE0/1 cote RangeManager ; max age configurable cote Treasury/HedgeManager). Pas de double comptage.
@@ -27,6 +26,7 @@ contract SequencerCheckedAggregator is AggregatorV3Interface {
     AggregatorV3Interface public immutable underlyingFeed;
     /// @notice Le Sequencer Uptime Feed du L2 (Arbitrum : 0xFdB631F5EE196F0ed6FAa767959853A9F217697D).
     AggregatorV3Interface public immutable sequencerUptimeFeed;
+    uint8 public immutable underlyingDecimals;
     /// @notice Délai (s) après redémarrage du séquenceur avant de refaire confiance aux prix (typ. 3600 = 1h).
     uint256 public immutable gracePeriod;
 
@@ -39,8 +39,12 @@ contract SequencerCheckedAggregator is AggregatorV3Interface {
     constructor(address _underlyingFeed, address _sequencerUptimeFeed, uint256 _gracePeriod) {
         require(_underlyingFeed != address(0) && _sequencerUptimeFeed != address(0), "zero feed");
         require(_gracePeriod > 0 && _gracePeriod <= 86400, "bad grace"); // borne 0<g<=24h
-        underlyingFeed = AggregatorV3Interface(_underlyingFeed);
+        AggregatorV3Interface feed = AggregatorV3Interface(_underlyingFeed);
+        uint8 dec = feed.decimals();
+        require(dec <= 18, "bad dec");
+        underlyingFeed = feed;
         sequencerUptimeFeed = AggregatorV3Interface(_sequencerUptimeFeed);
+        underlyingDecimals = dec;
         gracePeriod = _gracePeriod;
     }
 
@@ -70,6 +74,7 @@ contract SequencerCheckedAggregator is AggregatorV3Interface {
         _checkSequencer();
         (roundId, answer, startedAt, updatedAt, answeredInRound) = underlyingFeed.latestRoundData();
         if (updatedAt == 0 || answeredInRound < roundId) revert SequencerDown();
+        answer = _normalizeAnswer(answer);
     }
 
     function getRoundData(uint80 _roundId)
@@ -79,13 +84,23 @@ contract SequencerCheckedAggregator is AggregatorV3Interface {
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
     {
         _checkSequencer();
-        return underlyingFeed.getRoundData(_roundId);
+        (roundId, answer, startedAt, updatedAt, answeredInRound) = underlyingFeed.getRoundData(_roundId);
+        answer = _normalizeAnswer(answer);
     }
 
-    // ===== AggregatorV3Interface : métadonnées (délégation transparente, pas de check séquenceur) =====
+    function _normalizeAnswer(int256 answer) private view returns (int256) {
+        if (answer <= 0) return answer;
+        uint256 value = uint256(answer);
+        uint8 dec = underlyingDecimals;
+        if (dec > 8) value = value / (10 ** (dec - 8));
+        else if (dec < 8) value = value * (10 ** (8 - dec));
+        return int256(value);
+    }
 
-    function decimals() external view override returns (uint8) {
-        return underlyingFeed.decimals();
+    // ===== AggregatorV3Interface : métadonnées =====
+
+    function decimals() external pure override returns (uint8) {
+        return 8;
     }
 
     function description() external view override returns (string memory) {

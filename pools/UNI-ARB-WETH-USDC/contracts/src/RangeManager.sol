@@ -34,10 +34,10 @@ interface IMultiUserVault {
  * @notice Manages Uniswap V3 liquidity positions for the MultiUserVault
  * @dev OWNERSHIP MODEL: This contract intentionally uses Ownable pattern.
  *      Ownership is NOT a security risk here - it's a requirement:
- *      - Owner (MultiUserVault) and Safe provide administrative control
- *      - Required for: oracle configuration, emergency withdrawals, protocol upgrades
+ *      - Owner (MultiUserVault) relays governance settings; executors perform recurring operations
+ *      - safeAddress is only the emergency rescue address
+ *      - Required for: oracle configuration, emergency recovery, protocol upgrades
  *      - Renouncing ownership would break critical vault operations
- *      - Additional safeguard: safeAddress (Gnosis multisig) has co-admin rights
  *      Security scanners may flag this as a risk, but for DeFi vault contracts
  *      managing user funds, administrative control is essential, not optional.
  */
@@ -53,18 +53,18 @@ contract RangeManager is Ownable, ReentrancyGuard {
     // ===== SYSTEME D'AUTORISATION DOUBLE =====
     address public safeAddress;
     mapping(address => bool) public authorizedExecutors;
-    
+
     event SafeAddressSet(address indexed safe);
     event ExecutorAuthorized(address indexed executor, bool authorized);
 
     // ===== VARIABLES IMMUTABLE =====
-    
+
     INonfungiblePositionManager public immutable positionManager;
     IUniswapV3Factory public immutable factory;
     IUniswapV3Pool public immutable pool;
     address public immutable token0;
     address public immutable token1;
-    
+
     // ===== MULTI-USER VAULT INTEGRATION =====
     address public immutable vault;
     mapping(address => bool) public authorizedRecipients;
@@ -76,7 +76,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     uint256 public initMultiSwapTvl;
 
     // ===== VARIABLES D'ETAT (utilisant les structs de la library) =====
-    
+
     RangeOperations.RangeConfig public config;
     RangeOperations.ProtectionConfig public protectionConfig;
     RangeOperations.PriceCache public priceCache;
@@ -89,17 +89,25 @@ contract RangeManager is Ownable, ReentrancyGuard {
     uint16 private _ringCap;
 
     event PriceSnapshotRecorded(uint128 price, uint64 timestamp, address indexed keeper);
-    event DynamicRangeConfigured(bool enabled, uint8 maxSnapshotsPerDay, uint8 volatMoyDay, uint8 volatTrimDay, uint16 rangeStepBps, uint16 rangeMultiplicatorBps);
+    event DynamicRangeConfigured(
+        bool enabled,
+        uint8 maxSnapshotsPerDay,
+        uint8 volatMoyDay,
+        uint8 volatTrimDay,
+        uint16 rangeStepBps,
+        uint16 rangeMultiplicatorBps
+    );
     event DynamicRangeApplied(uint16 halfRangeBps);
 
     // ===== ORACLES =====
 
     AggregatorV3Interface private token0PriceFeed;
     AggregatorV3Interface private token1PriceFeed;
-    AggregatorV3Interface private ethPriceFeed; // Oracle ETH/USD pour calcul des gas fees
+    // Oracle natif configure pour metadata/off-chain gas valuation. Les maths pool on-chain utilisent token0/token1.
+    AggregatorV3Interface private nativePriceFeed;
 
     // ===== GESTION POSITIONS =====
-    
+
     uint32 private positionCount;
     mapping(uint256 => uint32) private positionIndex;
     mapping(uint32 => uint256) private indexToPosition;
@@ -113,13 +121,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
     // ===== EVENTS =====
 
     event PositionCreated(
-        uint256 indexed tokenId,
-        int24 tickLower,
-        int24 tickUpper,
-        uint128 totalValueUSD,
-        string rangeMode
+        uint256 indexed tokenId, int24 tickLower, int24 tickUpper, uint128 totalValueUSD, string rangeMode
     );
-    
+
     event TokenWithdrawn(address indexed token, uint256 amount, string reason);
     event PriceCacheUpdated(uint128 price0, uint128 price1, int24 poolTick);
     event ToleranceUpdated(uint16 oldToleranceBps, uint16 newToleranceBps);
@@ -127,22 +131,16 @@ contract RangeManager is Ownable, ReentrancyGuard {
     event LiquidityAdded(uint256 indexed tokenId, uint256 amount0, uint256 amount1, uint128 liquidity);
 
     // ===== NOUVEAUX MODIFIERS =====
-    
+
     /**
      * @dev Modifier qui remplace onlyOwner pour les fonctions critiques
-     * Permet l'exEcution par MultiUserVault (owner) OU par la Safe
+     * Permet l'execution par MultiUserVault (owner) OU par un executor autorise
      */
     modifier onlyAuthorized() {
-        require(
-            msg.sender == address(this) ||
-            msg.sender == owner() ||
-            msg.sender == safeAddress ||
-            authorizedExecutors[msg.sender],
-            "E99"
-        );
+        require(msg.sender == address(this) || msg.sender == owner() || authorizedExecutors[msg.sender], "E99");
         _;
     }
-    
+
     /**
      * @dev Modifier strictement pour le owner (MultiUserVault)
      * Utilise pour les fonctions de gestion des autorisations
@@ -154,13 +152,14 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     modifier operationalChecks() {
         if (protectionConfig.failureProtectionEnabled) {
-            require(consecutiveFailures < MAX_CONSECUTIVE_FAILURES ||
-                    block.timestamp >= _lastFailureTimestamp + FAILURE_COOLDOWN,
-                    "E02");
+            require(
+                consecutiveFailures < MAX_CONSECUTIVE_FAILURES
+                    || block.timestamp >= _lastFailureTimestamp + FAILURE_COOLDOWN,
+                "E02"
+            );
         }
         if (protectionConfig.mevProtectionEnabled) {
-            require(block.timestamp - config.lastRebalanceTime >= MIN_REBALANCE_INTERVAL,
-                    "E03");
+            require(block.timestamp - config.lastRebalanceTime >= MIN_REBALANCE_INTERVAL, "E03");
         }
         require(config.oraclesConfigured, "E04");
         _;
@@ -183,11 +182,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     modifier onlyVaultOrAuthorized() {
         require(
-            msg.sender == address(this) ||
-            msg.sender == vault ||
-            msg.sender == owner() ||
-            msg.sender == safeAddress ||
-            authorizedExecutors[msg.sender],
+            msg.sender == address(this) || msg.sender == vault || msg.sender == owner()
+                || authorizedExecutors[msg.sender],
             "E94"
         );
         _;
@@ -212,15 +208,15 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint16 _rangeUpPercent,
         uint16 _rangeDownPercent
     ) {
-
         require(_vault != address(0), "E09");
         require(_pauseController != address(0), "E09");
         vault = _vault;
 
-        require(_positionManager != address(0) &&
-                _factory != address(0) && _token0 != address(0) &&
-                _token1 != address(0) && _token0 != _token1 &&
-                _token0 < _token1, "E10");
+        require(
+            _positionManager != address(0) && _factory != address(0) && _token0 != address(0) && _token1 != address(0)
+                && _token0 != _token1 && _token0 < _token1,
+            "E10"
+        );
 
         // Validation des ranges (mêmes limites que configureRanges)
         require(_rangeUpPercent >= 10 && _rangeUpPercent <= 5000, "E17");
@@ -291,18 +287,15 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /**
      * @notice Autorise ou rEvoque un exEcuteur
-     * @dev Peut etre appele par le vault owner ou la Safe
+     * @dev Appele par le vault owner. Phase 2: le Timelock passe par le Vault relay.
      * @param _executor L'adresse a autoriser/rEvoquer
      * @param _authorized True pour autoriser, false pour revoquer
-     * @dev SECURITY NOTE: This function uses `msg.sender == owner() || msg.sender == safeAddress`
-     *      instead of just `onlyOwner` intentionally. This dual-access pattern allows:
-     *      - owner(): The vault owner for administrative control
-     *      - safeAddress: The Gnosis Safe multisig for operational security
-     *      This provides flexibility while maintaining security through two trusted entities.
+     * @dev SECURITY NOTE: safeAddress n'a pas de droits de configuration ici. Il sert uniquement au rescueToken().
+     *      Les autorisations operationnelles passent par le Vault owner (Safe en Phase 1, Timelock en Phase 2).
      */
     function setAuthorizedExecutor(address _executor, bool _authorized) external {
         require(_executor != address(0), "E15");
-        require(msg.sender == owner() || msg.sender == safeAddress, "E16"); // Dual access - see NatSpec
+        require(msg.sender == owner(), "E16");
         authorizedExecutors[_executor] = _authorized;
         emit ExecutorAuthorized(_executor, _authorized);
     }
@@ -337,7 +330,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
         dynRangeConfig.volatTrimDay = _volatTrimDay;
         dynRangeConfig.rangeStepBps = _rangeStepBps;
         dynRangeConfig.rangeMultiplicatorBps = _rangeMultiplicatorBps;
-        emit DynamicRangeConfigured(_enabled, _maxSnapshotsPerDay, _volatMoyDay, _volatTrimDay, _rangeStepBps, _rangeMultiplicatorBps);
+        emit DynamicRangeConfigured(
+            _enabled, _maxSnapshotsPerDay, _volatMoyDay, _volatTrimDay, _rangeStepBps, _rangeMultiplicatorBps
+        );
     }
 
     function setDynamicRangeEnabled(bool _enabled) external onlyAuthorized {
@@ -366,7 +361,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
             _priceRing,
             _ringHead,
             _ringCap,
-            RangeOperations.PriceSnapshot({ price: priceCache.price0, timestamp: uint64(block.timestamp) })
+            RangeOperations.PriceSnapshot({price: priceCache.price0, timestamp: uint64(block.timestamp)})
         );
         dynRangeConfig.lastSnapshotAt = uint64(block.timestamp);
 
@@ -376,12 +371,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /// @dev Recalcule et applique le range dynamique (calcul + decision delegues a la library).
     function _applyDynamicRangeIfDue() private {
-        (uint16 halfBps, bool shouldApply) = RangeOperations.evaluateDynamicRange(
-            _priceRing,
-            priceCache.price0,
-            dynRangeConfig,
-            uint64(block.timestamp)
-        );
+        (uint16 halfBps, bool shouldApply) =
+            RangeOperations.evaluateDynamicRange(_priceRing, priceCache.price0, dynRangeConfig, uint64(block.timestamp));
         if (!shouldApply) return;
         config.rangeUpPercent = halfBps;
         config.rangeDownPercent = halfBps;
@@ -395,10 +386,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     function configureTolerance(uint16 _toleranceBps) external onlyAuthorized {
         require(_toleranceBps <= 1000, "E20");
-        
+
         uint16 oldTolerance = config.toleranceBps;
         config.toleranceBps = _toleranceBps;
-        
+
         emit ToleranceUpdated(oldTolerance, _toleranceBps);
     }
 
@@ -419,12 +410,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
     /// @notice (audit V1 — V3-M1) Paramètres oracle : seuil de déviation pool/oracle + heartbeats par feed.
     /// @dev onlySafe (gouvernance) — bornes dures : déviation <=10%, heartbeats 1h-48h. _maxOracleDeviationBps=0
     ///      désactive le check (mode dégradé volontaire). Aiguille tous les _updatePriceCache() en aval. DN-coh.
-    function setOracleParams(
-        uint16 _maxOracleDeviationBps,
-        uint32 _maxAge0,
-        uint32 _maxAge1
-    ) external {
-        require(msg.sender == owner() || msg.sender == safeAddress, "E16");
+    function setOracleParams(uint16 _maxOracleDeviationBps, uint32 _maxAge0, uint32 _maxAge1) external {
+        require(msg.sender == owner() || authorizedExecutors[msg.sender], "E16");
         require(_maxOracleDeviationBps <= 1000, "E21"); // déviation <=10%
         require(_maxAge0 >= 3600 && _maxAge0 <= 172800 && _maxAge1 >= 3600 && _maxAge1 <= 172800, "E20"); // 1h-48h
         protectionConfig.maxOracleDeviationBps = _maxOracleDeviationBps;
@@ -439,26 +426,27 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /**
      * @notice Configure les oracles de prix Chainlink
-     * @dev SECURITY: Restricted to owner/safe only (not executors) because oracle addresses
-     *      determine all pricing logic. Allowing executors to change oracles would be a security risk.
-     *      The bot only calls updatePriceCache(), not this function.
+     * @dev SECURITY: gouvernance via owner/executor explicitement autorise. Le bot ne whitelist pas cette fonction.
      */
     // SÉCURITÉ (audit V1) : configurePriceFeeds REPOINTE les oracles Chainlink. C'est une opération de
-    // GOUVERNANCE rare et sensible (un mauvais feed empoisonne tous les prix) → réservée à la Safe et
-    // RETIRÉE du SecureBotModule (une clé bot compromise ne peut plus repointer). Le rafraîchissement
+    // GOUVERNANCE rare et sensible (un mauvais feed empoisonne tous les prix) -> retiree du SecureBotModule
+    // (une clé bot compromise ne peut plus repointer). Le rafraîchissement
     // courant du cache (avant chaque tx) se fait via refreshPriceCache() ci-dessous, qui NE change aucune
-    // adresse. La Safe garde configurePriceFeeds pour le cas (rare) où Chainlink déprécierait un feed.
-    function configurePriceFeeds(address _token0PriceFeed, address _token1PriceFeed, address _ethPriceFeed)
+    // adresse.
+    function configurePriceFeeds(address _token0PriceFeed, address _token1PriceFeed, address _nativePriceFeed)
         external
     {
-        require(msg.sender == owner() || msg.sender == safeAddress, "E16");
-        require(_token0PriceFeed != address(0) && _token1PriceFeed != address(0) && _ethPriceFeed != address(0), "E23");
+        require(msg.sender == owner() || authorizedExecutors[msg.sender], "E16");
+        require(
+            _token0PriceFeed != address(0) && _token1PriceFeed != address(0) && _nativePriceFeed != address(0), "E23"
+        );
 
         token0PriceFeed = AggregatorV3Interface(_token0PriceFeed);
         token1PriceFeed = AggregatorV3Interface(_token1PriceFeed);
-        ethPriceFeed = AggregatorV3Interface(_ethPriceFeed);
+        nativePriceFeed = AggregatorV3Interface(_nativePriceFeed);
 
         _updatePriceCache();
+        require(priceCache.valid, "E38");
 
         config.oraclesConfigured = true;
 
@@ -473,7 +461,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
     function refreshPriceCache() external onlyVaultOrAuthorized {
         _updatePriceCache();
     }
-
 
     // ===== FONCTIONS PRINCIPALES (modifiees avec onlyAuthorized) =====
 
@@ -544,13 +531,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         // Minter la nouvelle position avec les balances actuelles
         (tokenId, liquidity) = RangeOperations.mintNewPosition(
-            token0,
-            token1,
-            config,
-            tickLower,
-            tickUpper,
-            positionManager,
-            address(this)
+            token0, token1, config, tickLower, tickUpper, positionManager, address(this)
         );
 
         _addPosition(tokenId);
@@ -559,7 +540,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         config.lastRebalanceTime = uint64(block.timestamp);
         _updateSystemStats(totalValueUSD);
 
-        emit PositionCreated(tokenId, tickLower, tickUpper, _safeUint128(totalValueUSD), "multi_swap_mint");
+        emit PositionCreated(tokenId, tickLower, tickUpper, _safeUint128(totalValueUSD), "m");
 
         return (tokenId, liquidity);
     }
@@ -569,39 +550,35 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * @dev Pas de commission ici : les fees sont deja commissionnees par collectFeesForVault()
      *      appele dans _handleUnclaimedFeesOnWithdraw() du Vault avant ce call.
      */
-    function removeLiquidityForWithdraw(uint256 tokenId, uint128 liquidityToRemove)
-        external
-        onlyVault
-        nonReentrant
-    {
+    function removeLiquidityForWithdraw(uint256 tokenId, uint128 liquidityToRemove) external onlyVault nonReentrant {
         if (liquidityToRemove > 0) {
             RangeOperations.decreaseLiquidityPartialCore(tokenId, liquidityToRemove, positionManager, address(this));
-            emit TokenWithdrawn(token0, 0, "Liquidity removed for withdrawal");
+            emit TokenWithdrawn(token0, 0, "w");
         }
     }
-    
+
     /**
      * @notice Transfere les tokens pour un withdraw utilisateur
      */
-    function transferTokensForWithdraw(
-          uint256 amount0Requested,
-          uint256 amount1Requested,
-          address recipient
-      ) external onlyVault returns (uint256 amount0Sent, uint256 amount1Sent) {
-          // Calcul des amounts plafonnes par balance dispo deporte en library (alignement std/DN
-          // et gain bytecode). Logique identique sur les 2 pools : un seul endroit a auditer.
-          (amount0Sent, amount1Sent) = RangeOperations.computeWithdrawAmounts(
-              IERC20(token0), IERC20(token1), address(this), amount0Requested, amount1Requested
-          );
-          if (amount0Sent > 0) {
-              IERC20(token0).safeTransfer(recipient, amount0Sent);
-              emit TokenWithdrawn(token0, amount0Sent, "User withdrawal");
-          }
-          if (amount1Sent > 0) {
-              IERC20(token1).safeTransfer(recipient, amount1Sent);
-              emit TokenWithdrawn(token1, amount1Sent, "User withdrawal");
-          }
-      }
+    function transferTokensForWithdraw(uint256 amount0Requested, uint256 amount1Requested, address recipient)
+        external
+        onlyVault
+        returns (uint256 amount0Sent, uint256 amount1Sent)
+    {
+        // Calcul des amounts plafonnes par balance dispo deporte en library (alignement std/DN
+        // et gain bytecode). Logique identique sur les 2 pools : un seul endroit a auditer.
+        (amount0Sent, amount1Sent) = RangeOperations.computeWithdrawAmounts(
+            IERC20(token0), IERC20(token1), address(this), amount0Requested, amount1Requested
+        );
+        if (amount0Sent > 0) {
+            IERC20(token0).safeTransfer(recipient, amount0Sent);
+            emit TokenWithdrawn(token0, amount0Sent, "u");
+        }
+        if (amount1Sent > 0) {
+            IERC20(token1).safeTransfer(recipient, amount1Sent);
+            emit TokenWithdrawn(token1, amount1Sent, "u");
+        }
+    }
 
     /**
      * @notice Collecte les fees accumulées dans la position NFT et les envoie au vault
@@ -614,13 +591,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         if (positions.length == 0) return (0, 0);
 
         (fees0, fees1) = RangeOperations.collectFeesForVaultCore(
-            positions[0],
-            token0,
-            token1,
-            address(this),
-            treasuryAddress,
-            vault,
-            positionManager
+            positions[0], token0, token1, address(this), treasuryAddress, vault, positionManager
         );
         if (fees0 > 0 || fees1 > 0) emit FeesCollectedForVault(fees0, fees1);
     }
@@ -628,46 +599,38 @@ contract RangeManager is Ownable, ReentrancyGuard {
     event FeesCollectedForVault(uint256 fees0, uint256 fees1);
 
     /**
-    * @notice Ajoute de la liquidite a la position existante
-    * @dev Les swaps doivent etre faits AVANT via executeSwap (multi-swap) par le bot
-    *      Cette fonction ajoute simplement la liquidite avec les balances actuelles
-    */
+     * @notice Ajoute de la liquidite a la position existante
+     * @dev Les swaps doivent etre faits AVANT via executeSwap (multi-swap) par le bot
+     *      Cette fonction ajoute simplement la liquidite avec les balances actuelles
+     */
     function addLiquidityToPosition() external onlyVaultOrAuthorized nonReentrant {
-          // audit V1 (V3-H2) : barrière déviation/staleness avant d'ajouter de la liquidité (composition LP
-          // sensible au prix du pool). Cache invalidé si le pool diverge de l'oracle => on refuse. Cohérent DN.
-          uint256 tokenId = _refreshAndFirstPosition();
+        // audit V1 (V3-H2) : barrière déviation/staleness avant d'ajouter de la liquidité (composition LP
+        // sensible au prix du pool). Cache invalidé si le pool diverge de l'oracle => on refuse. Cohérent DN.
+        uint256 tokenId = _refreshAndFirstPosition();
 
-          // Déléguer à la library SANS SWAP (les swaps sont faits avant via executeSwap)
-          (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) =
-              RangeOperations.addLiquidityWithoutSwap(
-                  token0,
-                  token1,
-                  tokenId,
-                  positionManager,
-                  address(this)
-              );
+        // Déléguer à la library SANS SWAP (les swaps sont faits avant via executeSwap)
+        (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) =
+            RangeOperations.addLiquidityWithoutSwap(token0, token1, tokenId, positionManager, address(this));
 
-          emit LiquidityAdded(tokenId, amount0Added, amount1Added, liquidity);
-      }  
+        emit LiquidityAdded(tokenId, amount0Added, amount1Added, liquidity);
+    }
 
     // ===== FONCTIONS DE CONSULTATION =====
-    
+
     function getOwnerPositions() public view returns (uint256[] memory positions) {
         positions = new uint256[](positionCount);
         for (uint256 i = 0; i < positionCount; i++) {
             positions[i] = indexToPosition[uint32(i)];
         }
     }
-    
+
     /// @dev Helper privé mutualisant l'appel (9 args) à RangeOperations.getBotInstructions, factorisé pour
     ///      éviter de dupliquer le marshalling dans getBotInstructions()/needsRebalance()/rebalance(). DN-coh.
-    function _botInstructions() private view returns (
-        bool hasPosition,
-        uint256 tokenId,
-        bool shouldRebalance,
-        string memory action,
-        string memory reason
-    ) {
+    function _botInstructions()
+        private
+        view
+        returns (bool hasPosition, uint256 tokenId, bool shouldRebalance, string memory action, string memory reason)
+    {
         return RangeOperations.getBotInstructions(
             positionCount,
             config.maxPositions,
@@ -681,16 +644,14 @@ contract RangeManager is Ownable, ReentrancyGuard {
         );
     }
 
-    function getBotInstructions() external view returns (
-        bool hasPosition,
-        uint256 tokenId,
-        bool shouldRebalance,
-        string memory action,
-        string memory reason
-    ) {
+    function getBotInstructions()
+        external
+        view
+        returns (bool hasPosition, uint256 tokenId, bool shouldRebalance, string memory action, string memory reason)
+    {
         return _botInstructions();
     }
-    
+
     /**
      * @notice Fonction publique pour calculer les target ticks (appelable par le bot)
      * @dev Utilise le cache prix interne mis a jour
@@ -713,11 +674,11 @@ contract RangeManager is Ownable, ReentrancyGuard {
         if (!priceCache.valid) {
             return false;
         }
-        
+
         // Utiliser la library avec le cache interne
         return RangeOperations.isPositionOutOfRange(tokenId, positionManager, priceCache);
     }
-    
+
     /**
      * @notice Fonction helper pour obtenir les details d'une position
      * @param tokenId L'ID de la position
@@ -727,34 +688,25 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * @return liquidity La liquidite de la position
      * @return currentTick Le tick actuel de la pool
      */
-    function getPositionDetails(uint256 tokenId) external view returns (
-        bool inRange,
-        int24 tickLower,
-        int24 tickUpper,
-        uint128 liquidity,
-        int24 currentTick
-    ) {
+    function getPositionDetails(uint256 tokenId)
+        external
+        view
+        returns (bool inRange, int24 tickLower, int24 tickUpper, uint128 liquidity, int24 currentTick)
+    {
         // Déporté en library (audit V1 — cohérence avec le DN + gain bytecode).
         return RangeOperations.getPositionDetails(positionManager, priceCache, tokenId);
     }
-    
+
     function getCurrentBalances() external view returns (uint256 balance0, uint256 balance1) {
         // Récupérer les balances dans RangeManager + positions NFT
         // Cela inclut : tokens libres + liquidité active + tokensOwed (pending fees)
         (balance0, balance1) = RangeOperations.getCurrentBalances(
-            token0,
-            token1,
-            address(this),
-            getOwnerPositions(),
-            positionManager,
-            pool
+            token0, token1, address(this), getOwnerPositions(), positionManager, pool
         );
     }
 
     function isSystemOperational() external view returns (bool) {
-        return config.oraclesConfigured &&
-               priceCache.valid &&
-               consecutiveFailures < MAX_CONSECUTIVE_FAILURES;
+        return config.oraclesConfigured && priceCache.valid && consecutiveFailures < MAX_CONSECUTIVE_FAILURES;
     }
 
     /**
@@ -769,8 +721,34 @@ contract RangeManager is Ownable, ReentrancyGuard {
         (uint256 bal0, uint256 bal1) = RangeOperations.getCurrentBalances(
             token0, token1, address(this), getOwnerPositions(), positionManager, pool
         );
-        return RangeOperations.calculateOptimalSwapParams(
-            bal0, bal1, priceCache, config, pool
+        return RangeOperations.calculateOptimalSwapParams(bal0, bal1, priceCache, config, pool);
+    }
+
+    function validateDepositSwapPlan(
+        uint256 depositAmount0,
+        uint256 depositAmount1,
+        uint256[] calldata swapAmountsIn,
+        uint256[] calldata minAmountsOut,
+        address tokenIn,
+        address tokenOut
+    ) external view onlyVault {
+        require(swapAmountsIn.length == minAmountsOut.length, "len");
+        (bool expectedZeroForOne, uint256 expectedAmountIn) =
+            RangeOperations.depositSwapParams(address(this), depositAmount0, depositAmount1);
+        uint256 n = swapAmountsIn.length;
+        uint256 totalSwapIn;
+        bool tokenInIsToken0 = tokenIn == token0;
+        if (n > 0) {
+            require((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0), "E43");
+            RangeOperations.validateMinOutsAgainstOracle(
+                tokenInIsToken0, swapAmountsIn, minAmountsOut, priceCache, config, initMultiSwapTvl
+            );
+            for (uint256 i; i < n; ++i) {
+                totalSwapIn += swapAmountsIn[i];
+            }
+        }
+        _requireSubmittedSwapPlan(
+            expectedAmountIn, expectedZeroForOne, tokenInIsToken0, totalSwapIn, config.toleranceBps
         );
     }
 
@@ -849,7 +827,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // Mettre a jour le storage
         priceCache = newCache;
     }
-    
+
     function _addPosition(uint256 tokenId) private {
         if (!isOwnedPosition[tokenId]) {
             uint32 index = positionCount++;
@@ -863,19 +841,19 @@ contract RangeManager is Ownable, ReentrancyGuard {
         if (isOwnedPosition[tokenId]) {
             uint32 index = positionIndex[tokenId];
             uint32 lastIndex = --positionCount;
-            
+
             if (index != lastIndex) {
                 uint256 lastTokenId = indexToPosition[lastIndex];
                 indexToPosition[index] = lastTokenId;
                 positionIndex[lastTokenId] = index;
             }
-            
+
             delete indexToPosition[lastIndex];
             delete positionIndex[tokenId];
             delete isOwnedPosition[tokenId];
         }
     }
-    
+
     function _recordSuccessfulOperation() private {
         systemStats.successfulOperations++;
         consecutiveFailures = 0;
@@ -888,7 +866,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         systemStats.consecutiveFailures = uint32(consecutiveFailures);
         _lastFailureTimestamp = block.timestamp;
     }
-    
+
     function _updateSystemStats(uint256 newValue) private {
         systemStats.totalRebalances++;
         systemStats.totalVolume += _safeUint128(newValue);
@@ -898,7 +876,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     function _getCurrentPortfolioValue() private view returns (uint256) {
         return IMultiUserVault(vault).getCurrentPortfolioValue();
     }
-    
+
     function _safeUint128(uint256 value) private pure returns (uint128) {
         require(value <= MAX_UINT128, "E40");
         return uint128(value);
@@ -913,11 +891,12 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * @return amount0Sent Montant de token0 effectivement envoye
      * @return amount1Sent Montant de token1 effectivement envoye
      */
-    function emergencyWithdrawForUser(
-        uint256 amount0Requested,
-        uint256 amount1Requested,
-        address recipient
-    ) external onlyVault nonReentrant returns (uint256 amount0Sent, uint256 amount1Sent) {
+    function emergencyWithdrawForUser(uint256 amount0Requested, uint256 amount1Requested, address recipient)
+        external
+        onlyVault
+        nonReentrant
+        returns (uint256 amount0Sent, uint256 amount1Sent)
+    {
         require(recipient != address(0), "E41");
         (amount0Sent, amount1Sent) = RangeOperations.emergencyWithdrawCore(
             token0, token1, amount0Requested, amount1Requested, recipient, address(this)
@@ -925,14 +904,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
         emit EmergencyWithdraw(recipient, amount0Sent, amount1Sent, msg.sender);
         return (amount0Sent, amount1Sent);
     }
-    
+
     // Event pour emergencyWithdrawForUser
-    event EmergencyWithdraw(
-        address indexed recipient,
-        uint256 amount0,
-        uint256 amount1,
-        address indexed initiator
-    );
+    event EmergencyWithdraw(address indexed recipient, uint256 amount0, uint256 amount1, address indexed initiator);
 
     event TokenRescued(address indexed token, address indexed to, uint256 amount);
 
@@ -955,11 +929,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
      *      Collecte les fees et les transfère au vault (comme rebalancePosition)
      * @param tokenId L'ID de la position a burn
      */
-    function burnPosition(uint256 tokenId)
-        external
-        onlyVaultOrAuthorized
-        nonReentrant
-    {
+    function burnPosition(uint256 tokenId) external onlyVaultOrAuthorized nonReentrant {
         if (msg.sender != vault) _refreshAndRequireValid();
         _burnTrackedPosition(tokenId);
     }
@@ -967,13 +937,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     function _burnTrackedPosition(uint256 tokenId) private {
         require(isOwnedPosition[tokenId], "E42");
         (uint128 liquidity, uint256 fees0, uint256 fees1) = RangeOperations.burnPositionCore(
-            tokenId,
-            token0,
-            token1,
-            address(this),
-            treasuryAddress,
-            vault,
-            positionManager
+            tokenId, token0, token1, address(this), treasuryAddress, vault, positionManager
         );
 
         _removePosition(tokenId);
@@ -982,10 +946,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     // Event pour burnPosition
     event PositionBurned(
-        uint256 indexed tokenId,
-        uint128 liquidityBurned,
-        uint256 fees0Collected,
-        uint256 fees1Collected
+        uint256 indexed tokenId, uint128 liquidityBurned, uint256 fees0Collected, uint256 fees1Collected
     );
 
     /**
@@ -997,22 +958,13 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * @param minAmountOut Minimum output (slippage protection)
      * @return amountOut Actual amount received
      */
-    function executeSwap(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        uint256 minAmountOut
-    )
+    function executeSwap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut)
         external
         onlyAuthorized
         nonReentrant
         returns (uint256 amountOut)
     {
-        require(
-            (tokenIn == token0 && tokenOut == token1) ||
-            (tokenIn == token1 && tokenOut == token0),
-            "E43"
-        );
+        require((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0), "E43");
         // SÉCURITÉ (audit V1 — High) : executeSwap est appelable par le bot via le module. Sans plancher,
         // une clé bot compromise pourrait burn la position puis swapper avec minAmountOut=0 et capter la
         // perte par sandwich. Check déviation + plancher oracle (déporté en lib pour le bytecode). Cache
@@ -1023,12 +975,19 @@ contract RangeManager is Ownable, ReentrancyGuard {
         if (initMultiSwapTvl > 0) {
             uint256 amountUsd = (amountIn * uint256(tokenInIsToken0 ? priceCache.price0 : priceCache.price1))
                 / (10 ** (tokenInIsToken0 ? config.token0Decimals : config.token1Decimals));
-            require(amountUsd <= initMultiSwapTvl * 1e8, "chunk>cap");
+            require(amountUsd <= initMultiSwapTvl * 1e8, "E91");
         }
 
         amountOut = RangeOperations.executeSwapCore(
-            tokenIn, tokenOut, amountIn, minAmountOut,
-            config.fee, swapFeeBps, treasuryAddress, address(this), swapRouter
+            tokenIn,
+            tokenOut,
+            amountIn,
+            minAmountOut,
+            config.fee,
+            swapFeeBps,
+            treasuryAddress,
+            address(this),
+            swapRouter
         );
         emit SwapExecuted(tokenIn, tokenOut, amountIn, amountOut);
         return amountOut;
@@ -1042,6 +1001,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /// @notice Atomic rebalance: burn → N swaps → mint → pay keeper bounty. Permissionless.
     /// @dev Each swap chunk must be ≤ initMultiSwapTvl in USD. Pass empty arrays if no swap needed.
+    ///      Intentionally keeps the position-maintenance path open when PauseController blocks user flows:
+    ///      live oracle/deviation checks, needsRebalance, oracle minOuts, swap caps and the vault lock guard remain active.
     /// @param swapAmountsIn Amounts to swap per chunk (must match minAmountsOut length)
     /// @param minAmountsOut Minimum swap outputs per chunk (slippage protection)
     /// @param tokenIn Source token for all swaps
@@ -1063,15 +1024,14 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         // Verify rebalance is needed
         (bool hasPosition, uint256 tokenId, bool _needsRebalance,,) = _botInstructions();
-        require(_needsRebalance, "No rebalance needed");
+        require(hasPosition && _needsRebalance, "E90");
+        RangeOperations.OptimalSwapParams memory expectedPlan = this.getOptimalSwapParams();
 
         uint256 n = swapAmountsIn.length;
+        uint256 totalSwapIn;
+        bool tokenInIsToken0 = tokenIn == token0;
         if (n > 0) {
-            require(
-                (tokenIn == token0 && tokenOut == token1) ||
-                (tokenIn == token1 && tokenOut == token0),
-                "E43"
-            );
+            require((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0), "E43");
             // Validation (chunk cap + plancher oracle anti-sandwich V4) deportee en library
             // pour rester sous EIP-170. Reverte sur chunk>cap ou minOut<floor. Sans ce plancher,
             // un appelant permissionless pouvait passer minAmountsOut[i] = 0 et se faire sandwicher.
@@ -1084,10 +1044,18 @@ contract RangeManager is Ownable, ReentrancyGuard {
             uint256 priceInUsd = tokenIn == token0 ? uint256(priceCache.price0) : uint256(priceCache.price1);
             uint256 decIn = tokenIn == token0 ? config.token0Decimals : config.token1Decimals;
             for (uint256 i; i < n; ++i) {
+                totalSwapIn += swapAmountsIn[i];
                 totalSwapUsd += (swapAmountsIn[i] * priceInUsd) / (10 ** decIn);
             }
-            require(totalSwapUsd <= maxTotalSwapUsd, "swap>tvl");
+            require(totalSwapUsd <= maxTotalSwapUsd, "E92");
         }
+        _requireSubmittedSwapPlan(
+            expectedPlan.swapNeeded ? expectedPlan.amountIn : 0,
+            expectedPlan.zeroForOne,
+            tokenInIsToken0,
+            totalSwapIn,
+            config.toleranceBps
+        );
 
         // 1. Lock vault
         IMultiUserVault(vault).startRebalance();
@@ -1101,16 +1069,18 @@ contract RangeManager is Ownable, ReentrancyGuard {
             uint256 amt = swapAmountsIn[i];
             if (amt == 0) continue;
             require(IERC20(tokenIn).balanceOf(address(this)) >= amt, "E46");
-            swapRouter.exactInputSingle(ISwapRouter.ExactInputSingleParams({
-                tokenIn: tokenIn,
-                tokenOut: tokenOut,
-                fee: config.fee,
-                recipient: address(this),
-                deadline: block.timestamp,
-                amountIn: amt,
-                amountOutMinimum: minAmountsOut[i],
-                sqrtPriceLimitX96: 0
-            }));
+            swapRouter.exactInputSingle(
+                ISwapRouter.ExactInputSingleParams({
+                    tokenIn: tokenIn,
+                    tokenOut: tokenOut,
+                    fee: config.fee,
+                    recipient: address(this),
+                    deadline: block.timestamp,
+                    amountIn: amt,
+                    amountOutMinimum: minAmountsOut[i],
+                    sqrtPriceLimitX96: 0
+                })
+            );
         }
 
         // 4. Mint new position
@@ -1122,6 +1092,24 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         // 6. Pay keeper bounty (silent - don't revert if bounty fails)
         _payBounty(false);
+    }
+
+    function _requireSubmittedSwapPlan(
+        uint256 expectedAmountIn,
+        bool expectedZeroForOne,
+        bool tokenInIsToken0,
+        uint256 submittedAmountIn,
+        uint16 toleranceBps
+    ) private pure {
+        if (expectedAmountIn == 0) {
+            require(submittedAmountIn == 0, "E93");
+            return;
+        }
+        require(tokenInIsToken0 == expectedZeroForOne, "E94");
+        uint256 tolerance = (expectedAmountIn * uint256(toleranceBps)) / 10000;
+        if (tolerance == 0) tolerance = 1;
+        require(submittedAmountIn + tolerance >= expectedAmountIn, "E93");
+        require(submittedAmountIn <= expectedAmountIn + tolerance, "E93");
     }
 
     // ===== ADMIN SETTERS =====
@@ -1143,11 +1131,5 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     // ===== EVENTS =====
 
-    event SwapExecuted(
-        address indexed tokenIn,
-        address indexed tokenOut,
-        uint256 amountIn,
-        uint256 amountOut
-    );
-
+    event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
 }

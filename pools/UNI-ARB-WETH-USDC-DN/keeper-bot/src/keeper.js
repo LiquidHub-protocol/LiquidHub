@@ -128,7 +128,7 @@ async function main() {
         try {
           inflowsPaused = await pauseController.inflowsPaused();
           if (inflowsPaused) {
-            console.log('  PauseController: inflows paused — skip deposit processing and rebalance');
+            console.log('  PauseController: inflows paused — skip deposit processing; rebalance and hedge maintenance remain enabled');
           }
         } catch (e) {
           console.log(`  PauseController: unavailable (${(e.message || '').slice(0, 80)})`);
@@ -278,8 +278,6 @@ async function main() {
         console.log('  -> No rebalance needed\n');
       } else if (CHECK_ONLY) {
         console.log(`  -> Rebalance needed (${dnDriftRebalance && !needsRebalance ? 'DN drift in-range' : 'range'}, check-only, skipping)\n`);
-      } else if (inflowsPaused) {
-        console.log(`  -> Rebalance needed (${dnDriftRebalance && !needsRebalance ? 'DN drift in-range' : 'range'}) but inflows are paused; skipping\n`);
       } else {
         const keeperEnabled = treasury ? await treasury.keeperBountyEnabled() : false;
         const keeperAmount = treasury ? await treasury.keeperBountyAmount() : 0n;
