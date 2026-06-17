@@ -148,6 +148,7 @@ contract Treasury is Ownable {
     bool public bridgeEnabled;
     uint32 public bridgeDestinationEid; // LayerZero v2 endpoint ID (e.g. 30184 = Base)
     address public bridgeDestinationAddress; // Recipient on destination chain (staking contract)
+    uint16 public bridgeMinReceivedBps; // 0 = disabled, otherwise min received / sent ratio in bps
 
     // --- Events ---
     event AdminWithdrawal(uint256 amount, address indexed to);
@@ -163,6 +164,7 @@ contract Treasury is Ownable {
     event BridgeBountyPaid(address indexed keeper, uint256 amount);
     event BridgeBountyConfigured(bool enabled, uint256 amount);
     event BridgeBountyCooldownConfigured(uint64 cooldown, uint16 minRatio);
+    event BridgeMinReceivedConfigured(uint16 minReceivedBps);
     event BridgeConfigured(bool enabled, uint32 dstEid, address destination);
     event BridgedToStakers(uint256 amountSent, uint256 amountReceived, uint32 dstEid, bytes32 guid);
     event RangeManagerAuthorized(address indexed rangeManager, bool authorized);
@@ -265,6 +267,7 @@ contract Treasury is Ownable {
 
         // Get actual received amount (after Stargate fee)
         (,, OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
+        _requireBridgeMinReceived(amount, receipt.amountReceivedLD);
         sendParam.minAmountLD = receipt.amountReceivedLD;
 
         // Get messaging fee in native token
@@ -372,6 +375,7 @@ contract Treasury is Ownable {
         });
 
         (,, OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
+        _requireBridgeMinReceived(usdcAmount, receipt.amountReceivedLD);
         sendParam.minAmountLD = receipt.amountReceivedLD;
 
         MessagingFee memory msgFee = stargatePool.quoteSend(sendParam, false);
@@ -664,6 +668,14 @@ contract Treasury is Ownable {
         emit BridgeBountyCooldownConfigured(_cooldown, _minRatio);
     }
 
+    /// @notice Configure the minimum Stargate amount received ratio for bridge operations.
+    /// @dev 0 disables the check. Otherwise the value must stay in [9000, 10000] bps.
+    function setBridgeMinReceivedBps(uint16 _minReceivedBps) external onlyOwner {
+        require(_minReceivedBps == 0 || (_minReceivedBps >= 9000 && _minReceivedBps <= 10000), "Invalid bridge min");
+        bridgeMinReceivedBps = _minReceivedBps;
+        emit BridgeMinReceivedConfigured(_minReceivedBps);
+    }
+
     function authorizeRangeManager(address _rangeManager, bool _authorized) external onlyOwner {
         authorizedRangeManagers[_rangeManager] = _authorized;
         emit RangeManagerAuthorized(_rangeManager, _authorized);
@@ -720,6 +732,12 @@ contract Treasury is Ownable {
         bridgeDestinationEid = _dstEid;
         bridgeDestinationAddress = _destination;
         emit BridgeConfigured(_enabled, _dstEid, _destination);
+    }
+
+    function _requireBridgeMinReceived(uint256 sentAmount, uint256 receivedAmount) internal view {
+        uint16 minBps = bridgeMinReceivedBps;
+        if (minBps == 0) return;
+        require(receivedAmount * 10000 >= sentAmount * uint256(minBps), "Bridge slippage");
     }
 
     // --- Local Staking (same chain, Phase 2) ---

@@ -1163,8 +1163,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function setMinDepositUSD(uint256 _newMinimum) external onlyOwner {
-        // audit V1 (M3-B-fix4, Slither) : require(_newMinimum >= 0) RETIRE — tautologie sur un uint256
-        // (toujours >= 0). Aligne sur la pool DN (coherence std/DN).
+        require(_newMinimum > 0, "E23");
         uint256 oldMinimum = minDepositUSD;
         minDepositUSD = _newMinimum;
         emit MinDepositUpdated(oldMinimum, _newMinimum);
