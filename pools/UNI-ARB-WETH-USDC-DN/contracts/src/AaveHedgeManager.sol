@@ -117,8 +117,8 @@ contract AaveHedgeManager is ReentrancyGuard {
     event RepayAndWithdraw(uint256 wethRepaid, uint256 usdcWithdrawn);
     event RepayDebt(uint256 wethRepaid);
     event WithdrawCollateral(uint256 usdcWithdrawn, address to);
-    // CloseAll est émis par _closePosition pour les DEUX chemins (closeAll ET emergencyClose). L'event
-    // EmergencyClose (jamais émis) RETIRÉ (audit LOW : event mort). Le monitoring suit CloseAll.
+    // CloseAll est émis par _closePosition. L'ancien alias de fermeture d'urgence a ete retire: closeAll est deja
+    // onlySafe/nonReentrant et sert de fermeture d'urgence unique.
     event CloseAll(address recipient, uint256 usdcSent);
     event SweepWeth(address to, uint256 amount);
     event SweepUsdc(address to, uint256 amount);
@@ -204,10 +204,15 @@ contract AaveHedgeManager is ReentrancyGuard {
         swapPoolFee = _swapPoolFee;
         oracleMaxAge = _oracleMaxAge;
         reserveHfTargetBps = 11000;
+        hedgeTargetBps = 10000;
 
-        // Lire les decimales directement des tokens (generique : WETH/USDC, WBTC/USDT, etc.)
-        volatileDecimals = IDecimals(_weth).decimals();
-        stableDecimals = IDecimals(_usdc).decimals();
+        // Lire les decimales directement des tokens (generique : WETH/USDC, WBTC/USDT, etc.).
+        // Les bornes evitent les exponentiations non realistes dans les conversions oracle.
+        uint8 volatileDec = IDecimals(_weth).decimals();
+        uint8 stableDec = IDecimals(_usdc).decimals();
+        require(volatileDec <= 18 && stableDec <= 18, "E51");
+        volatileDecimals = volatileDec;
+        stableDecimals = stableDec;
 
         // Approve max USDC and WETH to AAVE Pool for supply/repay
         IERC20(_usdc).safeApprove(_pool, type(uint256).max);
@@ -228,7 +233,6 @@ contract AaveHedgeManager is ReentrancyGuard {
     function settleProportional(uint256 wethReceived, uint256 proportionBps, bool isFullWithdraw, address recipient)
         external
         onlyVault
-        whenNotPaused
         nonReentrant
     {
         require(recipient != address(0), "bad");
@@ -297,8 +301,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     }
 
     /// @notice Emergency settle called by vault during EmergencyRecoverUser
-    /// @dev Same as settleProportional but works even when paused.
-    ///      Uses the same flash loan + swap logic as executeOperation.
+    /// @dev Uses the same flash loan + swap logic as executeOperation, with the emergency vault flow.
     function emergencySettleForVault(
         uint256 wethReceived,
         uint256 proportionBps,
@@ -465,7 +468,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     /// @notice Borrow additional WETH (after new collateral has been supplied)
     /// @dev Used when ETH exposure increases after rebalance or new deposit
     /// @param borrowAmountWeth Amount of WETH to borrow additionally
-    function borrowMore(uint256 borrowAmountWeth) external onlyBotModule whenNotPaused nonReentrant {
+    function borrowMore(uint256 borrowAmountWeth) external onlyBotModule nonReentrant {
         _doBorrowMore(borrowAmountWeth);
     }
 
@@ -502,7 +505,6 @@ contract AaveHedgeManager is ReentrancyGuard {
     function repayAndWithdraw(uint256 repayAmountWeth, uint256 withdrawAmountUsdc)
         external
         onlySafeOrVault
-        whenNotPaused
         nonReentrant
     {
         require(repayAmountWeth > 0 || withdrawAmountUsdc > 0, "E26");
@@ -524,7 +526,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     /// @notice Repay WETH debt only (no collateral withdrawal)
     /// @dev Used during rebalance when ETH exposure decreases
     /// @param repayAmountWeth Amount of WETH to repay
-    function repayDebt(uint256 repayAmountWeth) external onlySafeOrVault whenNotPaused nonReentrant {
+    function repayDebt(uint256 repayAmountWeth) external onlySafeOrVault nonReentrant {
         _doRepayDebt(repayAmountWeth);
     }
 
@@ -544,7 +546,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     /// @dev Used to send recovered collateral to users
     /// @param amountUsdc Amount of USDC to withdraw from AAVE
     /// @param to Destination address
-    function withdrawCollateral(uint256 amountUsdc, address to) external onlySafeOrVault whenNotPaused nonReentrant {
+    function withdrawCollateral(uint256 amountUsdc, address to) external onlySafeOrVault nonReentrant {
         require(amountUsdc > 0, "E28");
         // SÉCURITÉ (audit V1) : destination FIGÉE au rangeManager (cf. sweepWeth/sweepUsdc). Le bot retire
         // du collatéral AAVE uniquement vers le RM (reconstitution réserve). Anti-exfiltration clé bot.
@@ -577,11 +579,12 @@ contract AaveHedgeManager is ReentrancyGuard {
         lpPool = IUniswapV3Pool(addrs[3]);
         ethUsdFeed = AggregatorV3Interface(addrs[4]);
         oracleDecimals = IDecimals(addrs[4]).decimals(); // lu du feed (Chainlink = 8), generique
+        require(oracleDecimals <= 18, "E52");
         adjustHedgeBps = params[0];
         swapSlippageBps = params[1];
         reserveHfTargetBps = params[2];
         liqThresholdBps = params[3];
-        if (hedgeTargetBps == 0) hedgeTargetBps = 10000; // defaut DN strict si jamais configure
+        if (hedgeTargetBps == 0) hedgeTargetBps = 10000; // retrocompat : defaut DN strict
         // SECURITE (retour audit) : ne JAMAIS laisser ces deux protections desactivees par defaut.
         // adjustHedge() permissionless est dangereux sans cooldown (drain bounty/churn) ni garde de
         // deviation slot0 (manipulation de targetShort). On pose des defauts surs si non encore configures
@@ -589,12 +592,6 @@ contract AaveHedgeManager is ReentrancyGuard {
         if (hedgeAdjustCooldown == 0) hedgeAdjustCooldown = 1200; // 20 min par defaut
         if (maxHedgeDeviationBps == 0) maxHedgeDeviationBps = 500; // 5% par defaut
         emit AdjustHedgeConfigured(addrs[0], addrs[1], params[0]);
-    }
-
-    /// @notice Ajuste le seuil de drift en bps (gouvernance). Doit accepter le defaut 300 (3%).
-    function setAdjustHedgeBps(uint16 _adjustHedgeBps) external onlyGovernance {
-        require(_adjustHedgeBps >= 100 && _adjustHedgeBps <= 2000, "E31");
-        adjustHedgeBps = _adjustHedgeBps;
     }
 
     /// @notice Cible de hedge en bps du WETH LP (10000 = 100% = DN strict). Gouvernance.
@@ -641,12 +638,6 @@ contract AaveHedgeManager is ReentrancyGuard {
         botModule = newModule;
     }
 
-    /// @notice Ajuste le slippage max du swap repay (gouvernance).
-    function setSwapSlippageBps(uint16 _swapSlippageBps) external onlyGovernance {
-        require(_swapSlippageBps >= 10 && _swapSlippageBps <= 500, "E32");
-        swapSlippageBps = _swapSlippageBps;
-    }
-
     /// @notice Reajuste le hedge AAVE de facon PERMISSIONLESS — UNIQUEMENT pour resorber un OVER-HEDGE.
     /// @dev Pilotage sur le SHORT NET EFFECTIF (effectiveShort = dette - WETH libre HM - WETH libre RM),
     ///      pas la dette brute. Cible = hedgeTargetBps/10000 * wethInLP (gouvernee, defaut 100% = DN strict ;
@@ -659,7 +650,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     ///      Garde-fous : require(drift>=adjustHedgeBps) ET cooldown ecoule. Verifie le HF apres action.
     ///      Le canal botModule/direct (borrowMore/repayDebt) du bot n'est PAS soumis au cooldown (voie surge) ;
     ///      la correction du SOUS-HEDGE se fait via rebalance-solveur permissionless, pas via adjustHedge().
-    function adjustHedge() external whenNotPaused nonReentrant {
+    function adjustHedge() external nonReentrant {
         require(rangeManager != address(0) && adjustHedgeBps > 0, "E40");
 
         // 0. Cooldown on-chain (keepers + bot via ce chemin): limite la frequence des reajustements
@@ -856,11 +847,20 @@ contract AaveHedgeManager is ReentrancyGuard {
         // Cout theorique majore du slippage (plafond anti-sandwich via oracle Chainlink).
         uint256 amountInMaximum = _oracleMaxUsdcForWeth(wethNeeded);
 
-        // S'assurer d'avoir assez d'USDC sur le contrat ; sinon retirer du collateral AAVE
-        uint256 usdcBal = usdc.balanceOf(address(this));
-        if (usdcBal < amountInMaximum) {
-            pool.withdraw(address(usdc), amountInMaximum - usdcBal, address(this));
+        // Compléter le budget depuis AAVE uniquement dans la limite compatible avec le HF cible.
+        // En stress HF, adjustHedge doit fail-closed plutôt que retirer du collatéral qui aggrave le risque.
+        uint256 budget = usdc.balanceOf(address(this));
+        if (budget < amountInMaximum) {
+            _refreshRangePriceCache();
+            uint256 toWithdraw;
+            (amountInMaximum, toWithdraw) = DnDepositLib.aaveHfSafeSwapBudget(
+                budget, amountInMaximum, address(pool), liqThresholdBps, reserveHfTargetBps, rangeManager, stableDecimals
+            );
+            if (toWithdraw > 0) {
+                pool.withdraw(address(usdc), toWithdraw, address(this));
+            }
         }
+        require(amountInMaximum > 0, "E46");
 
         // exactOutputSingle: obtenir exactement wethNeeded WETH, en depensant au plus amountInMaximum USDC
         // (revert si le marche est plus defavorable que oracle + slippage => protection anti-sandwich)
@@ -882,15 +882,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     /// @dev Used for full teardown. Sends all recovered USDC to recipient.
     ///      Requires enough WETH on this contract to repay full debt.
     /// @param recipient Address to receive all recovered USDC
-    function closeAll(address recipient) external onlySafe whenNotPaused nonReentrant {
-        require(recipient != address(0), "bad");
-
-        _closePosition(recipient);
-    }
-
-    /// @notice Emergency close: same as closeAll but works even when paused
-    /// @param recipient Address to receive all recovered USDC
-    function emergencyClose(address recipient) external onlySafe nonReentrant {
+    function closeAll(address recipient) external onlySafe nonReentrant {
         require(recipient != address(0), "bad");
 
         _closePosition(recipient);
@@ -900,7 +892,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     /// @dev Conservé en onlyBotModule + selector inchangé (whitelist module). Destination FIGÉE au RM.
     ///      Pour le dépôt hedgé permissionless, utiliser sweepWethAmount (montant EXACT) — sweeper TOUT
     ///      le solde injecterait un buffer/donation préexistant dans la LP et fausserait le post-check.
-    function sweepWeth(address to) external onlyBotModule whenNotPaused nonReentrant {
+    function sweepWeth(address to) external onlyBotModule nonReentrant {
         require(to == rangeManager && rangeManager != address(0), "E29");
         uint256 balance = weth.balanceOf(address(this));
         require(balance > 0, "E47");
@@ -913,7 +905,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     ///      Évite d'injecter un buffer/donation préexistant dans la LP (post-check faussé / DoS donation).
     /// @param amount Montant EXACT de WETH à envoyer (wei)
     /// @param to Destination — DOIT valoir rangeManager
-    function sweepWethAmount(uint256 amount, address to) external onlySafeOrVault whenNotPaused nonReentrant {
+    function sweepWethAmount(uint256 amount, address to) external onlySafeOrVault nonReentrant {
         require(to == rangeManager && rangeManager != address(0), "E29");
         require(amount > 0, "E48");
         require(weth.balanceOf(address(this)) >= amount, "E49");
@@ -924,7 +916,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     /// @notice Send all USDC held on this contract to an address
     /// @dev Used to recover USDC after collateral withdrawal
     /// @param to Destination address
-    function sweepUsdc(address to) external onlyBotModule whenNotPaused nonReentrant {
+    function sweepUsdc(address to) external onlyBotModule nonReentrant {
         // SÉCURITÉ (audit V1) : destination FIGÉE au rangeManager (cf. sweepWeth). Anti-exfiltration
         // par clé bot compromise. Le param `to` est conservé (selector inchangé) mais DOIT = rangeManager.
         require(to == rangeManager && rangeManager != address(0), "E29");
@@ -939,19 +931,16 @@ contract AaveHedgeManager is ReentrancyGuard {
 
     // ===== ADMIN =====
 
+    /// @notice Emergency-only pause for new AAVE hedge openings.
+    /// @dev This is NOT the protocol PauseController. When enabled, it blocks supplyAndBorrow()
+    ///      only. Settlement, adjustHedge, repay/withdraw, close and sweeps remain available so the
+    ///      active position can be maintained or de-risked.
     function setPaused(bool _paused) external onlySafe {
         paused = _paused;
         emit Paused(_paused);
     }
 
     // ===== VIEW FUNCTIONS =====
-
-    /// @notice Get the health factor of this contract's AAVE position
-    /// @return healthFactor in 1e18 scale (1e18 = 1.0, < 1e18 = liquidatable)
-    function getHealthFactor() external view returns (uint256) {
-        (,,,,, uint256 healthFactor) = pool.getUserAccountData(address(this));
-        return healthFactor;
-    }
 
     /// @notice Get full hedge data for dashboard
     /// @return totalCollateralBase Total collateral in base currency (USD, 8 decimals)
@@ -1018,7 +1007,7 @@ contract AaveHedgeManager is ReentrancyGuard {
         }
     }
 
-    /// @dev Internal close position logic shared by closeAll and emergencyClose.
+    /// @dev Internal close position logic used by closeAll.
     ///      If idle token0 is insufficient, use the same AAVE flash-loan settlement path as withdrawals.
     function _closePosition(address recipient) internal {
         uint256 totalDebt = variableDebtWeth.balanceOf(address(this));

@@ -13,7 +13,10 @@ interface IHedgeDep {
     function getWethDebt() external view returns (uint256); // dette WETH EXACTE (audit H-03)
     function getWethBalance() external view returns (uint256);
     function getUsdcBalance() external view returns (uint256);
-    function getHealthFactor() external view returns (uint256);
+    function getHedgeData()
+        external
+        view
+        returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase);
     function hedgeTargetBps() external view returns (uint16);
     function reserveHfTargetBps() external view returns (uint16);
     function liqThresholdBps() external view returns (uint16);
@@ -55,6 +58,20 @@ interface IRmDep {
 
 interface IVaultDep {
     function hedgeManager() external view returns (address);
+}
+
+interface IAavePoolDep {
+    function getUserAccountData(address user)
+        external
+        view
+        returns (
+            uint256 totalCollateralBase,
+            uint256 totalDebtBase,
+            uint256 availableBorrowsBase,
+            uint256 currentLiquidationThreshold,
+            uint256 ltv,
+            uint256 healthFactor
+        );
 }
 
 /// @title DnDepositLib
@@ -307,6 +324,14 @@ library DnDepositLib {
         view
         returns (uint256)
     {
+        return _aaveBaseToStable(baseAmount, rangeManager, stableDecimals);
+    }
+
+    function _aaveBaseToStable(uint256 baseAmount, address rangeManager, uint8 stableDecimals)
+        private
+        view
+        returns (uint256)
+    {
         uint256 price1;
         try IRmDep(rangeManager).priceCache() returns (uint128, uint128 p1, uint160, int24, uint64, bool valid) {
             if (!valid || p1 == 0) revert InvalidSwapPlan();
@@ -315,6 +340,35 @@ library DnDepositLib {
             revert InvalidSwapPlan();
         }
         return (baseAmount * (10 ** stableDecimals)) / price1;
+    }
+
+    function aaveHfSafeSwapBudget(
+        uint256 currentBudget,
+        uint256 amountInMaximum,
+        address aavePool,
+        uint256 fallbackLiqThresholdBps,
+        uint256 targetHfBps,
+        address rangeManager,
+        uint8 stableDecimals
+    ) external view returns (uint256 cappedAmountInMaximum, uint256 toWithdraw) {
+        cappedAmountInMaximum = amountInMaximum;
+        if (currentBudget >= amountInMaximum) return (cappedAmountInMaximum, 0);
+
+        (uint256 collateralBase, uint256 debtBase,, uint256 liveThreshold,,) =
+            IAavePoolDep(aavePool).getUserAccountData(address(this));
+        uint256 liquidationThresholdBps = liveThreshold > 0 ? liveThreshold : fallbackLiqThresholdBps;
+        if (collateralBase == 0 || debtBase == 0 || liquidationThresholdBps == 0) {
+            cappedAmountInMaximum = currentBudget < amountInMaximum ? currentBudget : amountInMaximum;
+            return (cappedAmountInMaximum, 0);
+        }
+        uint256 minCollateralBase = (debtBase * targetHfBps + liquidationThresholdBps - 1) / liquidationThresholdBps;
+        if (collateralBase > minCollateralBase) {
+            uint256 maxWithdraw = _aaveBaseToStable(collateralBase - minCollateralBase, rangeManager, stableDecimals);
+            toWithdraw = amountInMaximum - currentBudget;
+            if (toWithdraw > maxWithdraw) toWithdraw = maxWithdraw;
+        }
+        uint256 budget = currentBudget + toWithdraw;
+        if (cappedAmountInMaximum > budget) cappedAmountInMaximum = budget;
     }
 
     function _requireSwapPlan(
@@ -426,7 +480,7 @@ library DnDepositLib {
         if (!ok) revert PreAdjustRequired();
 
         if (_toUsd(hm.getWethDebt(), price0, dec0) > 0) {
-            uint256 hf = hm.getHealthFactor();
+            (,, uint256 hf,) = hm.getHedgeData();
             uint256 hfMin = (uint256(hm.reserveHfTargetBps()) * 1e18) / 10000;
             if (hf < hfMin) revert PreAdjustRequired();
         }

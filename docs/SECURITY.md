@@ -124,7 +124,8 @@ forcing failing actions.
 
 - **Module kill-switch**: `SecureBotModule.setPaused(true)` (Safe-only) freezes **all** permissionless bot
   actions (mint / rebalance / swap / snapshot / permissionless deposit processing).
-- **Hedge pause** (DN): `AaveHedgeManager.setPaused(true)` (Safe-only) freezes hedge operations.
+- **Hedge pause** (DN): `AaveHedgeManager.setPaused(true)` (Safe-only) blocks new hedge openings
+  (`supplyAndBorrow`) but deliberately leaves risk-reduction and position-maintenance paths available.
 - **ReentrancyGuard** on all state-changing entry points of the vault, RangeManager and hedge manager.
 
 ---

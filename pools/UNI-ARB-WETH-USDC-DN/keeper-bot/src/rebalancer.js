@@ -79,7 +79,16 @@ class Rebalancer {
         console.log('  No swap needed (already balanced)');
       }
 
-      // 2. Single atomic call — contract does burn → swap(s) → mint → bounty
+      // 2. Simulate first: DN drift plans can be non-zero even when the on-chain rebalance gate
+      // (needsRebalance || dnDriftCritical) refuses the call. Skip instead of sending a doomed tx.
+      try {
+        await this.rmConnected.rebalance.staticCall(swapAmounts, minOuts, tokenIn, tokenOut);
+      } catch (simError) {
+        console.log(`  Rebalance skipped by on-chain gate: ${(simError.reason || simError.shortMessage || simError.message || '').slice(0, 120)}`);
+        return { success: false, error: 'rebalance simulation rejected by on-chain gate', txHashes: [] };
+      }
+
+      // 3. Single atomic call — contract does burn → swap(s) → mint → bounty
       console.log('  Executing rebalance() on-chain...');
       const tx = await this.rmConnected.rebalance(swapAmounts, minOuts, tokenIn, tokenOut);
       const receipt = await tx.wait();

@@ -36,10 +36,10 @@ const VAULT_ABI = [
   // AUDIT H-01 : plan de swap du PROCHAIN dépôt (état post-transfert + post-hedge), à utiliser pour le dépôt
   // (PAS getOptimalSwapParams du RangeManager, qui reflète l état rebalance/post-burn).
   "function getDepositSwapParams() external view returns (bool zeroForOne, uint256 amountIn)",
-  // AUDIT M-01 : plan de swap rebalance compatible dette AAVE fixe (wethInLP ≈ effectiveShort/H). Utilisé par
-  // executeRebalance — passe le post-check DN que le rebalance soit déclenché par range ou par drift DN in-range.
-  "function getRebalanceSwapParams() external view returns (bool zeroForOne, uint256 amountIn)",
-  "function isRebalancing() external view returns (bool)"
+    // AUDIT M-01 : plan de swap rebalance compatible dette AAVE fixe (wethInLP ≈ effectiveShort/H). Utilisé par
+    // executeRebalance — passe le post-check DN que le rebalance soit déclenché par range ou par drift DN in-range.
+    "function getRebalanceSwapParams() external view returns (bool zeroForOne, uint256 amountIn)",
+    "function isRebalancing() external view returns (bool)"
 ];
 
 // Treasury ABI (for bounty info + USDC balance check)
@@ -79,7 +79,6 @@ const PAUSE_CONTROLLER_ABI = [
   // corrected by the permissionless rebalance() path, which rebuilds the LP composition and post-checks.
 const AAVE_HEDGE_ABI = [
   "function getHedgeData() external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase)",
-  "function getHealthFactor() external view returns (uint256)",
   "function adjustHedge() external",
   "function adjustHedgeBps() external view returns (uint16)",   // drift threshold in bps (DN refactor)
   "function hedgeTargetBps() external view returns (uint16)",   // hedge target in bps (10000 = 100%)

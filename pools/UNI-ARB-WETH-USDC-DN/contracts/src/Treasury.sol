@@ -71,6 +71,9 @@ interface IStargate {
 contract Treasury is Ownable {
     using SafeERC20 for IERC20;
 
+    error BridgeBountyCooldownZero();
+    error BridgeBountyMinRatioZero();
+
     uint256 private constant USD_SCALE = 1e8;
     uint16 private constant DEPOSIT_BOUNTY_MIN_RATIO = 100;
 
@@ -295,8 +298,8 @@ contract Treasury is Ownable {
         if (!bridgeBountyEnabled || bridgeBountyAmount == 0) return;
         if (block.timestamp < uint256(lastBridgeBountyAt) + uint256(bridgeBountyCooldown)) return;
         uint256 ratio = uint256(bridgeBountyMinRatio);
-        if (bridgeBountyCooldown == 0) return;
-        if (ratio > 0 && bridgedAmount < bridgeBountyAmount * ratio) return;
+        if (bridgeBountyCooldown == 0 || ratio == 0) return;
+        if (bridgedAmount < bridgeBountyAmount * ratio) return;
         if (usdc.balanceOf(address(this)) < bridgeBountyAmount) return;
         lastBridgeBountyAt = uint64(block.timestamp);
         usdc.safeTransfer(keeper, bridgeBountyAmount);
@@ -653,6 +656,8 @@ contract Treasury is Ownable {
 
     /// @notice Configure the bridge bounty (paid to whoever calls bridgeToStakers / collectAndBridge).
     function setBridgeBounty(bool _enabled, uint256 _amount) external onlyOwner {
+        if (_enabled && _amount > 0 && bridgeBountyCooldown == 0) revert BridgeBountyCooldownZero();
+        if (_enabled && _amount > 0 && bridgeBountyMinRatio == 0) revert BridgeBountyMinRatioZero();
         bridgeBountyEnabled = _enabled;
         bridgeBountyAmount = _amount;
         emit BridgeBountyConfigured(_enabled, _amount);
@@ -661,8 +666,10 @@ contract Treasury is Ownable {
     /// @notice Configure the anti-drain protections for the bridge bounty.
     /// @param _cooldown Minimum seconds between two paid bounties (e.g. 21600 = 6h).
     /// @param _minRatio Minimum ratio of bridged amount over bounty amount (e.g. 50 means
-    ///        you must bridge at least 50× the bounty value to earn it). 0 disables the check.
+    ///        you must bridge at least 50× the bounty value to earn it). 0 disables bounty payment.
     function setBridgeBountyCooldown(uint64 _cooldown, uint16 _minRatio) external onlyOwner {
+        if (bridgeBountyEnabled && bridgeBountyAmount > 0 && _cooldown == 0) revert BridgeBountyCooldownZero();
+        if (bridgeBountyEnabled && bridgeBountyAmount > 0 && _minRatio == 0) revert BridgeBountyMinRatioZero();
         bridgeBountyCooldown = _cooldown;
         bridgeBountyMinRatio = _minRatio;
         emit BridgeBountyCooldownConfigured(_cooldown, _minRatio);
@@ -695,6 +702,10 @@ contract Treasury is Ownable {
             return;
         }
         require(_maxAge >= 3600 && _maxAge <= 172800, "Invalid max age");
+        require(
+            IERC20Metadata(token).decimals() <= 18 && usdcDecimals <= 18 && AggregatorV3Interface(feed).decimals() <= 18,
+            "Invalid decimals"
+        );
         swapFeeds[token] = AggregatorV3Interface(feed);
         swapFeedMaxAges[token] = _maxAge;
         swapSlippageBps = _swapSlippageBps;

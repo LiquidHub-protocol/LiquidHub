@@ -47,8 +47,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     uint256 private constant MAX_UINT128 = type(uint128).max;
     uint256 private constant MIN_REBALANCE_INTERVAL = 300;
-    uint256 private constant MAX_CONSECUTIVE_FAILURES = 5;
-    uint256 private constant FAILURE_COOLDOWN = 30 minutes;
 
     // ===== SYSTEME D'AUTORISATION DOUBLE =====
     address public safeAddress;
@@ -113,11 +111,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
     mapping(uint32 => uint256) private indexToPosition;
     mapping(uint256 => bool) private isOwnedPosition;
 
-    // ===== PROTECTION ECHECS =====
-
-    uint256 private consecutiveFailures;
-    uint256 private _lastFailureTimestamp;
-
     // ===== EVENTS =====
 
     event PositionCreated(
@@ -151,13 +144,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     modifier operationalChecks() {
-        if (protectionConfig.failureProtectionEnabled) {
-            require(
-                consecutiveFailures < MAX_CONSECUTIVE_FAILURES
-                    || block.timestamp >= _lastFailureTimestamp + FAILURE_COOLDOWN,
-                "E02"
-            );
-        }
+        // Failure counters are informational only: state changes made before a revert are rolled back by the EVM.
+        // Liveness must rely on the bot/module watchdog, oracle/deviation checks and Safe intervention.
         if (protectionConfig.mevProtectionEnabled) {
             require(block.timestamp - config.lastRebalanceTime >= MIN_REBALANCE_INTERVAL, "E03");
         }
@@ -478,8 +466,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
             _recordSuccessfulOperation();
             return (_tokenId, _liquidity);
         } catch (bytes memory reason) {
-            _recordFailedOperation();
-
             if (reason.length > 0) {
                 assembly {
                     revert(add(32, reason), mload(reason))
@@ -552,7 +538,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
      */
     function removeLiquidityForWithdraw(uint256 tokenId, uint128 liquidityToRemove) external onlyVault nonReentrant {
         if (liquidityToRemove > 0) {
-            RangeOperations.decreaseLiquidityPartialCore(tokenId, liquidityToRemove, positionManager, address(this));
+            _refreshAndRequireValid();
+            RangeOperations.decreaseLiquidityPartialCore(
+                tokenId, liquidityToRemove, positionManager, pool, config.maxSlippageBps, address(this)
+            );
             emit TokenWithdrawn(token0, 0, "w");
         }
     }
@@ -610,7 +599,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         // Déléguer à la library SANS SWAP (les swaps sont faits avant via executeSwap)
         (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) =
-            RangeOperations.addLiquidityWithoutSwap(token0, token1, tokenId, positionManager, address(this));
+            RangeOperations.addLiquidityWithoutSwap(
+                token0, token1, tokenId, positionManager, config.maxSlippageBps, address(this)
+            );
 
         emit LiquidityAdded(tokenId, amount0Added, amount1Added, liquidity);
     }
@@ -634,10 +625,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         return RangeOperations.getBotInstructions(
             positionCount,
             config.maxPositions,
-            consecutiveFailures,
-            MAX_CONSECUTIVE_FAILURES,
-            _lastFailureTimestamp,
-            FAILURE_COOLDOWN,
             getOwnerPositions(),
             positionManager,
             priceCache
@@ -706,7 +693,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     function isSystemOperational() external view returns (bool) {
-        return config.oraclesConfigured && priceCache.valid && consecutiveFailures < MAX_CONSECUTIVE_FAILURES;
+        return config.oraclesConfigured && priceCache.valid;
     }
 
     /**
@@ -856,15 +843,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     function _recordSuccessfulOperation() private {
         systemStats.successfulOperations++;
-        consecutiveFailures = 0;
-        systemStats.consecutiveFailures = 0;
-    }
-
-    function _recordFailedOperation() private {
-        systemStats.failedOperations++;
-        consecutiveFailures++;
-        systemStats.consecutiveFailures = uint32(consecutiveFailures);
-        _lastFailureTimestamp = block.timestamp;
     }
 
     function _updateSystemStats(uint256 newValue) private {
@@ -930,14 +908,14 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * @param tokenId L'ID de la position a burn
      */
     function burnPosition(uint256 tokenId) external onlyVaultOrAuthorized nonReentrant {
-        if (msg.sender != vault) _refreshAndRequireValid();
+        _refreshAndRequireValid();
         _burnTrackedPosition(tokenId);
     }
 
     function _burnTrackedPosition(uint256 tokenId) private {
         require(isOwnedPosition[tokenId], "E42");
         (uint128 liquidity, uint256 fees0, uint256 fees1) = RangeOperations.burnPositionCore(
-            tokenId, token0, token1, address(this), treasuryAddress, vault, positionManager
+            tokenId, token0, token1, address(this), treasuryAddress, vault, positionManager, pool, config.maxSlippageBps
         );
 
         _removePosition(tokenId);

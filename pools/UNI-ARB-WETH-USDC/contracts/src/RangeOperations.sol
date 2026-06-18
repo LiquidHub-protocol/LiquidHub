@@ -74,8 +74,10 @@ library RangeOperations {
         uint128 totalRebalances;
         uint128 totalVolume;
         uint64 lastRebalanceBlock;
+        // Deprecated: failed tx state is reverted by the EVM, so these counters are intentionally kept at zero.
         uint32 failedOperations;
         uint32 successfulOperations;
+        // Deprecated: kept only for systemStats() ABI compatibility with bot/frontend readers.
         uint32 consecutiveFailures;
         bool initialized;
     }
@@ -293,6 +295,7 @@ library RangeOperations {
         address token1,
         uint256 tokenId,
         INonfungiblePositionManager positionManager,
+        uint24 maxSlippageBps,
         address contractAddress
     ) external returns (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) {
         // Récupérer et valider les balances
@@ -303,17 +306,13 @@ library RangeOperations {
         (uint256 newBalance0, uint256 newBalance1) =
             _approveAndGetBalances(token0, token1, positionManager, contractAddress);
 
-        return _increaseLiquidity(tokenId, newBalance0, newBalance1, positionManager);
+        return _increaseLiquidity(tokenId, newBalance0, newBalance1, positionManager, maxSlippageBps);
     }
 
     /**
      * @notice Fournit les instructions pour le bot
      * @param positionCount Nombre de positions actives
      * @param maxPositions Limite max de positions
-     * @param consecutiveFailures Nombre d'echecs consecutifs
-     * @param maxConsecutiveFailures Limite d'echecs autorises
-     * @param lastFailureTimestamp Timestamp du dernier echec
-     * @param failureCooldown Duree du cooldown apres echecs
      * @param positions Array des positions existantes
      * @param positionManager Le gestionnaire de positions
      * @param priceCache Cache des prix actuels
@@ -385,10 +384,6 @@ library RangeOperations {
     function getBotInstructions(
         uint32 positionCount,
         uint32 maxPositions,
-        uint256 consecutiveFailures,
-        uint256 maxConsecutiveFailures,
-        uint256 lastFailureTimestamp,
-        uint256 failureCooldown,
         uint256[] memory positions,
         INonfungiblePositionManager positionManager,
         PriceCache memory priceCache
@@ -397,11 +392,6 @@ library RangeOperations {
         view
         returns (bool hasPosition, uint256 tokenId, bool needsRebalance, string memory action, string memory reason)
     {
-        // Verifier le cooldown
-        if (consecutiveFailures >= maxConsecutiveFailures && block.timestamp < lastFailureTimestamp + failureCooldown) {
-            return (false, 0, false, "WAIT_COOLDOWN", "Cooldown active");
-        }
-
         hasPosition = positions.length > 0;
 
         if (!hasPosition) {
@@ -487,8 +477,8 @@ library RangeOperations {
             tickUpper: tickUpper,
             amount0Desired: balance0,
             amount1Desired: balance1,
-            amount0Min: 0,
-            amount1Min: 0,
+            amount0Min: _minWithSlippage(balance0, config.maxSlippageBps),
+            amount1Min: _minWithSlippage(balance1, config.maxSlippageBps),
             recipient: contractAddress,
             deadline: block.timestamp + 300
         });
@@ -516,7 +506,9 @@ library RangeOperations {
         address contractAddress,
         address treasuryAddress,
         address vault,
-        INonfungiblePositionManager positionManager
+        INonfungiblePositionManager positionManager,
+        IUniswapV3Pool pool,
+        uint24 maxSlippageBps
     ) external returns (uint128 liquidity, uint256 fees0, uint256 fees1) {
         (,,,,,,, liquidity,,,,) = positionManager.positions(tokenId);
 
@@ -532,12 +524,14 @@ library RangeOperations {
 
         // 2-3. Retirer la liquidite + collecter le principal
         if (liquidity > 0) {
+            (uint256 amount0Min, uint256 amount1Min) =
+                _burnMinAmounts(tokenId, liquidity, positionManager, pool, maxSlippageBps);
             positionManager.decreaseLiquidity(
                 INonfungiblePositionManager.DecreaseLiquidityParams({
                     tokenId: tokenId,
                     liquidity: liquidity,
-                    amount0Min: 0,
-                    amount1Min: 0,
+                    amount0Min: amount0Min,
+                    amount1Min: amount1Min,
                     deadline: block.timestamp + 300
                 })
             );
@@ -663,18 +657,22 @@ library RangeOperations {
         uint256 tokenId,
         uint128 liquidityToRemove,
         INonfungiblePositionManager positionManager,
+        IUniswapV3Pool pool,
+        uint24 maxSlippageBps,
         address contractAddress
     ) external {
         require(liquidityToRemove > 0, "E45");
         (,,,,,,, uint128 currentLiquidity,,,,) = positionManager.positions(tokenId);
         require(liquidityToRemove <= currentLiquidity, "E46");
 
+        (uint256 amount0Min, uint256 amount1Min) =
+            _burnMinAmounts(tokenId, liquidityToRemove, positionManager, pool, maxSlippageBps);
         positionManager.decreaseLiquidity(
             INonfungiblePositionManager.DecreaseLiquidityParams({
                 tokenId: tokenId,
                 liquidity: liquidityToRemove,
-                amount0Min: 0,
-                amount1Min: 0,
+                amount0Min: amount0Min,
+                amount1Min: amount1Min,
                 deadline: block.timestamp
             })
         );
@@ -686,29 +684,6 @@ library RangeOperations {
                 amount1Max: type(uint128).max
             })
         );
-    }
-
-    /**
-     * @notice Calcule la valeur actuelle du portfolio
-     */
-    function getCurrentPortfolioValue(
-        address token0,
-        address token1,
-        RangeConfig memory config,
-        PriceCache memory priceCache,
-        address contractAddress
-    ) external view returns (uint256) {
-        if (!config.oraclesConfigured || !priceCache.valid) return 0;
-
-        uint256 balance0 = IERC20(token0).balanceOf(contractAddress);
-        uint256 balance1 = IERC20(token1).balanceOf(contractAddress);
-
-        if (priceCache.price0 == 0 || priceCache.price1 == 0) return 0;
-
-        uint256 value0 = (balance0 * priceCache.price0) / (10 ** config.token0Decimals);
-        uint256 value1 = (balance1 * priceCache.price1) / (10 ** config.token1Decimals);
-
-        return value0 + value1;
     }
 
     /**
@@ -977,18 +952,38 @@ library RangeOperations {
         uint256 tokenId,
         uint256 amount0Desired,
         uint256 amount1Desired,
-        INonfungiblePositionManager positionManager
+        INonfungiblePositionManager positionManager,
+        uint24 maxSlippageBps
     ) private returns (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) {
         return positionManager.increaseLiquidity(
             INonfungiblePositionManager.IncreaseLiquidityParams({
                 tokenId: tokenId,
                 amount0Desired: amount0Desired,
                 amount1Desired: amount1Desired,
-                amount0Min: 0,
-                amount1Min: 0,
+                amount0Min: _minWithSlippage(amount0Desired, maxSlippageBps),
+                amount1Min: _minWithSlippage(amount1Desired, maxSlippageBps),
                 deadline: block.timestamp + 300
             })
         );
+    }
+
+    function _minWithSlippage(uint256 amount, uint24 slippageBps) private pure returns (uint256) {
+        if (amount == 0) return 0;
+        uint256 slip = slippageBps >= 10000 ? 9999 : uint256(slippageBps);
+        return (amount * (10000 - slip)) / 10000;
+    }
+
+    function _burnMinAmounts(
+        uint256 tokenId,
+        uint128 liquidity,
+        INonfungiblePositionManager positionManager,
+        IUniswapV3Pool pool,
+        uint24 maxSlippageBps
+    ) private view returns (uint256 amount0Min, uint256 amount1Min) {
+        (,,,,, int24 tickLower, int24 tickUpper,,,,,) = positionManager.positions(tokenId);
+        (uint256 amount0, uint256 amount1) = _calculateLiquidityAmounts(tickLower, tickUpper, liquidity, pool);
+        amount0Min = _minWithSlippage(amount0, maxSlippageBps);
+        amount1Min = _minWithSlippage(amount1, maxSlippageBps);
     }
 
     /**
@@ -1300,15 +1295,6 @@ library RangeOperations {
      * @return halfRangeBps Demi-range symetrique en bps (rangeUp == rangeDown).
      * @return enoughData False si pas assez de snapshots dans la fenetre (cold start).
      */
-    function computeDynamicRangeBps(
-        PriceSnapshot[] memory snapshots,
-        uint128 currentPrice,
-        DynamicRangeConfig memory drc,
-        uint64 nowTs
-    ) external pure returns (uint16 halfRangeBps, bool enoughData) {
-        return _computeDynamicRangeBps(snapshots, currentPrice, drc, nowTs);
-    }
-
     /// @notice Valide les parametres dynamic range et retourne la capacite du ring buffer.
     /// @dev Deportee depuis RangeManager.setDynamicRangeConfig pour alleger le bytecode.
     function validateDynamicRangeConfig(
@@ -1351,20 +1337,7 @@ library RangeOperations {
     /// @param amountIn Montant d'entree (decimales du tokenIn).
     /// @param pc Cache prix (price0/price1 en 8 decimales).
     /// @param cfg Config (decimales des tokens).
-    /// @param slippageBps Tolerance de slippage en bps (ex: config.maxSlippageBps, 100 = 1%).
-    /// @return minOut Plancher de sortie (decimales du tokenOut).
-    function oracleMinOut(
-        bool tokenInIsToken0,
-        uint256 amountIn,
-        PriceCache memory pc,
-        RangeConfig memory cfg,
-        uint24 slippageBps
-    ) external pure returns (uint256 minOut) {
-        return _oracleMinOut(tokenInIsToken0, amountIn, pc, cfg, slippageBps);
-    }
-
-    /// @dev Helper interne reutilisable depuis d'autres fonctions de la library (oracleMinOut
-    ///      external ne peut pas etre appelee directement par une autre fonction de la meme lib).
+    /// @dev Helper interne reutilisable depuis les validateurs swap/rebalance.
     function _oracleMinOut(
         bool tokenInIsToken0,
         uint256 amountIn,

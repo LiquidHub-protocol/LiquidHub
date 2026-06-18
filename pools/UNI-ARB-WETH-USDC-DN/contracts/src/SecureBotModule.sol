@@ -55,6 +55,7 @@ contract SecureBotModule {
     bytes4 private constant ADD_LIQUIDITY_SELECTOR = 0x2a7cf2fe; // addLiquidityToPosition()
     bytes4 private constant BURN_SELECTOR = 0x38ca63bc; // burnPosition(uint256)
     bytes4 private constant SWAP_SELECTOR = 0xb07391c0; // executeSwap(address,address,uint256,uint256)
+    bytes4 private constant BORROW_MORE_SELECTOR = 0x9d0bf2e9; // borrowMore(uint256)
     uint16 private constant DN_REBAL_MAX_DRIFT_BPS = 300;
     uint16 private constant DN_REBAL_CRIT_DRIFT_BPS = 900;
     uint256 private constant DN_REBAL_DUST_FLOOR_USD = 50e8;
@@ -118,8 +119,8 @@ contract SecureBotModule {
 
         // Fonctions MultiUserVault
         // processPendingDeposits (0x99dd7ead) RETIRÉ (audit V1) : fonction batch supprimée du Vault.
-        // processSingleDeposit (0xac1df9bd) RETIRÉ en DN : le mint initial passe désormais par
-        // processDepositPermissionless() pour créer le hedge AAVE atomiquement puis post-check.
+        // processSingleDeposit (0xac1df9bd) RETIRÉ en DN : le mint initial passe désormais par le bot
+        // via processDepositPermissionless() pour créer le hedge AAVE atomiquement puis post-check.
         // AUDIT H-02 : le relais bot des dépôts de CROISSANCE passe par le chemin ATOMIQUE
         // processDepositPermissionless (hedge on-chain via DnDepositLib + post-check). Sélecteur à whitelister
         // sinon le fallback bot revert avant d'atteindre le Vault. Le Vault re-valide tout (paused, plafond, oracle).
@@ -141,17 +142,14 @@ contract SecureBotModule {
         // (sur-hedge critique). NB : le cooldown on-chain s'applique aussi au bot (pas de bypass) — garde-fou
         // anti-spam légitime. Le sur-hedge non corrigé immédiatement le sera au cycle suivant ou par un keeper.
         allowedFunctions[0x1e694f32] = true; // adjustHedge()
-        // AUDIT MED-1 : borrowMore n'a PAS de garde drift/post-check on-chain, MAIS c'est volontaire et sûr :
-        // (1) il est onlySafe côté contrat → appelable UNIQUEMENT par le bot fondateur via ce module (JAMAIS
-        // par un keeper anonyme) ; (2) il est borné par le HF AAVE (impossible d'emprunter au-delà du LTV) ;
-        // (3) il sert le rebalance-solveur DN (_recalibrateHedgeAfterBurn) qui est désormais fail-closed. Le
-        // retirer casserait la correction de sous-hedge. La "garde" est donc l'accès onlySafe + le HF AAVE.
-        allowedFunctions[0x9d0bf2e9] = true; // borrowMore(uint256) — onlySafe, borné par HF AAVE (cf. ci-dessus)
+        // borrowMore(uint256) reste necessaire au solveur DN, mais il est borne au cycle rebalance post-burn
+        // par _beforeHedgeCall() : une cle bot compromise ne peut pas augmenter la dette hors maintenance LP.
+        allowedFunctions[0x9d0bf2e9] = true;
         allowedFunctions[0xebc9b94d] = true; // repayAndWithdraw(uint256,uint256)
         allowedFunctions[0x6b09de45] = true; // repayDebt(uint256)
         allowedFunctions[0x0af504cc] = true; // withdrawCollateral(uint256,address) — destination figée on-chain (audit V1)
-        // closeAll (0xf6b32008) et emergencyClose (0xb575e123) RETIRÉS (audit V1) : fonctions d'URGENCE
-        // rares qui envoient TOUT le hedge à un recipient → réservées à la Safe directe (jamais via le bot).
+        // closeAll (0xf6b32008) RETIRÉE (audit V1) : fonction d'URGENCE rare qui envoie TOUT
+        // le hedge à un recipient → réservée à la Safe directe (jamais via le bot).
         allowedFunctions[0xacf31cb1] = true; // sweepWeth(address) — destination figée on-chain (audit V1)
         allowedFunctions[0x58ea510a] = true; // sweepUsdc(address) — destination figée on-chain (audit V1)
 
@@ -236,9 +234,10 @@ contract SecureBotModule {
 
     // Fonctions pour AaveHedgeManager (Delta Neutral)
     function executeHedgeFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) withinDailyLimit {
+        bytes4 selector = bytes4(data[:4]);
+        _beforeHedgeCall(selector);
         _execute(hedgeManager, 0, data);
 
-        bytes4 selector = bytes4(data[:4]);
         emit FunctionExecuted(selector, dailySpent);
     }
 
@@ -440,6 +439,13 @@ contract SecureBotModule {
                 rangeManager, rm.token0(), price0, cfg.token0Decimals, DN_REBAL_CRIT_DRIFT_BPS, DN_REBAL_DUST_FLOOR_USD
             );
         require(criticalDrift, "No rebalance");
+    }
+
+    function _beforeHedgeCall(bytes4 selector) private view {
+        if (selector == BORROW_MORE_SELECTOR) {
+            uint8 state = botCycleState;
+            require(state == CYCLE_REBALANCE_BURNED || state == CYCLE_LOCKED_MAINTENANCE, "Bad cycle");
+        }
     }
 
     // Fonctions de lecture

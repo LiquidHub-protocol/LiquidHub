@@ -259,10 +259,9 @@ async function main() {
       // on the RangeManager. Other actions (MINT_INITIAL, etc.) are gated on-chain
       // by `onlyAuthorized` and reserved for the protocol bot / Safe, so we just
       // wait silently for the next cycle.
-      // AUDIT M-01/H-06 : on rebalance si le RANGE l'exige, OU si un DRIFT DN critique in-range le requiert.
-      // Le 2e cas n'est pas signalé par getBotInstructions (range only) → on le détecte via la vue DN dédiée :
-      // getRebalanceSwapParams renvoie un swap non nul quand la compo LP doit être refaite pour la dette fixe.
-      // rebalance() on-chain gate de toute façon sur (needsRebalance || dnDriftCritical) et reverte E96 sinon.
+      // AUDIT M-01/H-06 : on rebalance si le RANGE l'exige, OU si un DRIFT DN peut nécessiter une recomposition.
+      // Le rebalancer simule ensuite RangeManager.rebalance() en eth_call avec les paramètres calculés et skippe
+      // proprement si la gate on-chain (needsRebalance || dnDriftCritical) refuserait la tx.
       let dnDriftRebalance = false;
       if (hasPosition && (!needsRebalance || action !== 'REBALANCE')) {
         try {

@@ -346,7 +346,8 @@ contract SecureBotModule {
             );
         } else if (selector == MINT_INITIAL_SELECTOR) {
             require(
-                state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE || state == CYCLE_REBALANCE_BURNED,
+                state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE || state == CYCLE_REBALANCE_BURNED
+                    || state == CYCLE_DEPOSIT_PENDING,
                 "Bad cycle"
             );
         } else if (selector == ADD_LIQUIDITY_SELECTOR) {

@@ -55,7 +55,6 @@ interface IAaveHedgeSettlement {
     function hedgeTargetBps() external view returns (uint16);
     function reserveHfTargetBps() external view returns (uint16);
     function liqThresholdBps() external view returns (uint16);
-    function getHealthFactor() external view returns (uint256);
 }
 
 interface IRangeManager {
@@ -269,7 +268,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         address indexed user, uint256 amount0Recovered, uint256 amount1Recovered, uint256 sharesRemoved
     );
     event PositionBurned(uint256 indexed tokenId, address indexed executor);
-    event BurnFailed(uint256 indexed tokenId, string reason);
     event AllPositionsBurned(uint256 positionCount, address indexed executor);
     event MinDepositUpdated(uint256 oldMinimum, uint256 newMinimum);
     event BotModuleSet(address indexed module);
@@ -508,6 +506,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         return DnDepositLib.getDepositSwapParams(address(rangeManager), pd.amount0, pd.amount1);
     }
 
+    /// @notice Plan de swap DN pour rebalance permissionless compatible avec la dette AAVE fixe.
+    /// @dev Vue utilisée par les keepers avant d'appeler RangeManager.rebalance().
+    function getRebalanceSwapParams() external view returns (bool zeroForOne, uint256 amountIn) {
+        return DnDepositLib.getRebalanceSwapParams(address(rangeManager));
+    }
+
     /**
      * @notice Logique partagee de traitement d'UN depot de la file (premier element).
      * @dev Calcule les shares, met a jour l'accounting utilisateur, transfere les fonds du depot au
@@ -630,8 +634,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      *      en liquidite LP, sans le bot du fondateur. En UNE tx : refresh oracle -> calcul shares
      *      (oracle) -> transfert fonds au RM -> swaps bornes oracle (anti-MEV) -> addLiquidity ->
      *      deposit bounty. Verrou _processingRebalance pose pendant toute la fonction (un withdraw
-     *      concurrent revert E32). En DN, couvre aussi le mint initial : hedge AAVE atomique via
-     *      DnDepositLib, mint/addLiquidity puis post-check strict.
+     *      concurrent revert E32). En DN, le mint initial reste reserve au botModule/owner ; les keepers
+     *      permissionless ne peuvent traiter que les depots de croissance apres creation du NFT.
      */
     function processDepositPermissionless(
         uint256[] calldata swapAmountsIn,
@@ -644,8 +648,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (swapAmountsIn.length > DN_MAX_SWAP_CHUNKS) revert E_DEPOSIT_TOO_LARGE();
         // 1. File non vide (anti-drain bounty)
         if (_pendingCount() == 0) revert E24();
-        // 2. Etat LP : si aucun NFT n'existe, cette tx mintera la position initiale hedgée.
+        // 2. Etat LP : si aucun NFT n'existe, seule l'execution botModule/owner peut minter la position
+        // initiale hedgee. Les keepers anonymes gardent le traitement permissionless des depots de croissance.
         bool hasPosition = rangeManager.getOwnerPositions().length > 0;
+        if (!hasPosition && msg.sender != botModule && msg.sender != owner()) revert E03();
         // 3. Refresh oracle atomique. audit V1 (V3-R4 Point 3, retour Codex) : on REFRESH d'abord le cache
         // (slot0+oracle LIVE) de façon INCONDITIONNELLE — avant ne se faisait que via recordPriceSnapshot()
         // qui revert si le snapshot n'est pas dû (catché), laissant le check depositMaxCacheAge buter sur un
@@ -783,8 +789,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (block.number <= user.lastDepositBlock) revert E_SAME_BLOCK();
         _requireWithdrawalAllowed(user.lastDepositTime);
 
-        // SÉCURITÉ (audit V1 — High/Medium) : refuser le retrait si le prix POOL diverge de l'ORACLE
-        // au-delà du seuil (le burn de liquidité utilise amount0Min/1Min=0 → sandwichable sur slot0 manipulé).
+        // SÉCURITÉ (audit V1 — High/Medium) : le burn de liquidité utilise désormais des amountMin
+        // dérivés du slot0 live et bornés par maxSlippageBps. On garde en plus le check pool/oracle
+        // live pour refuser un withdraw sur un slot0 manipulé ou divergent.
         // V3-H1 : REFRESH d'abord (slot0+oracle LIVE), updatePriceCache invalide le cache si déviation.
         {
             rangeManager.refreshPriceCache();

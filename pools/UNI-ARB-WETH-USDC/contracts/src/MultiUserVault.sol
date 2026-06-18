@@ -188,7 +188,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         address indexed user, uint256 amount0Recovered, uint256 amount1Recovered, uint256 sharesRemoved
     );
     event PositionBurned(uint256 indexed tokenId, address indexed executor);
-    event BurnFailed(uint256 indexed tokenId, string reason);
     event AllPositionsBurned(uint256 positionCount, address indexed executor);
     event MinDepositUpdated(uint256 oldMinimum, uint256 newMinimum);
     event BotModuleSet(address indexed module);
@@ -645,9 +644,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         require(block.number > user.lastDepositBlock, "E_SAME_BLOCK");
         _requireWithdrawalAllowed(user.lastDepositTime);
 
-        // SÉCURITÉ (audit V1 — High/Medium) : le burn de liquidité au withdraw passe amount0Min/1Min=0.
-        // Un withdraw visible en mempool pourrait être exécuté sur un slot0 manipulé (sandwich). On refuse
-        // donc le retrait si le prix POOL diverge de l'ORACLE au-delà du seuil gouvernance.
+        // SÉCURITÉ (audit V1 — High/Medium) : le burn de liquidité utilise désormais des amountMin
+        // dérivés du slot0 live et bornés par maxSlippageBps. On garde en plus le check pool/oracle
+        // live pour refuser un withdraw sur un slot0 manipulé ou divergent.
         // V3-H1 : REFRESH d'abord (slot0+oracle LIVE), updatePriceCache invalide le cache si déviation. Coh. DN.
         {
             rangeManager.refreshPriceCache();
@@ -1307,7 +1306,16 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             }
         }
 
-        // 3. GeRER LES DePoTS EN ATTENTE (de _pendingHead à la fin — audit V1 DoS gas A)
+        // 3. Recuperer depuis RangeManager AVANT toute suppression d'accounting utilisateur.
+        //    Fail-closed : si RangeManager revert, toute la transaction revert et userInfo reste intact.
+        if (neededFromRange0 > 0 || neededFromRange1 > 0) {
+            (uint256 received0, uint256 received1) = IRangeManager(address(rangeManager)).emergencyWithdrawForUser(
+                neededFromRange0, neededFromRange1, address(this)
+            );
+            require(received0 == neededFromRange0 && received1 == neededFromRange1, "E47");
+        }
+
+        // 4. GeRER LES DePoTS EN ATTENTE (de _pendingHead à la fin — audit V1 DoS gas A)
         if (hasPendingDeposit[userAddress]) {
             uint256 len = pendingDeposits.length;
             for (uint256 i = _pendingHead; i < len; i++) {
@@ -1328,7 +1336,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             delete userFeeDebtToken1[userAddress];
         }
 
-        // 4. METTRE a JOUR LES STATS AVANT LES APPELS EXTERNES
+        // 5. METTRE a JOUR LES STATS APRES RECUPERATION EFFECTIVE DES FONDS
         if (userShares > 0) {
             totalShares = totalSharesBefore > userShares ? totalSharesBefore - userShares : 0;
 
@@ -1338,26 +1346,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             delete userFeeDebtToken1[userAddress];
             // audit V1 (M3-B) : retirer aussi du registre actif (pruning O(1)) — coherence avec le retrait total.
             _unregisterUser(userAddress);
-        }
-
-        // 5. Recuperer depuis RangeManager si necessaire
-        if (neededFromRange0 > 0 || neededFromRange1 > 0) {
-            // Appeler la fonction emergencyWithdrawForUser dans RangeManager
-            try IRangeManager(address(rangeManager)).emergencyWithdrawForUser(
-                neededFromRange0, neededFromRange1, address(this)
-            ) returns (uint256 received0, uint256 received1) {
-                // Ajuster les montants si on n'a pas tout reçu
-                if (received0 < neededFromRange0) {
-                    userAmount0 = vaultBalance0 + received0;
-                }
-                if (received1 < neededFromRange1) {
-                    userAmount1 = vaultBalance1 + received1;
-                }
-            } catch {
-                // Si l'appel echoue, utiliser seulement ce qui est dans le vault
-                userAmount0 = userAmount0 > vaultBalance0 ? vaultBalance0 : userAmount0;
-                userAmount1 = userAmount1 > vaultBalance1 ? vaultBalance1 : userAmount1;
-            }
         }
 
         // 6. ENVOYER LES FONDS a L'UTILISATEUR
@@ -1389,19 +1377,14 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             revert("No positions to burn");
         }
 
-        // 2. Pour chaque position, retirer la liquidite puis burn le NFT
+        // 2. Pour chaque position, retirer la liquidite puis burn le NFT.
+        //    Fail-closed : si un burn echoue, toute la transaction revert et aucun succes global trompeur
+        //    n'est emis. Avec maxPositions=1 en production, ce chemin reste simple et lisible.
         for (uint256 i = 0; i < positions.length; i++) {
             uint256 tokenId = positions[i];
 
-            // Appeler la fonction burnPosition dans RangeManager
-            // Cette fonction doit retirer la liquidite et burn le NFT
-            try IRangeManager(address(rangeManager)).burnPosition(tokenId) {
-                emit PositionBurned(tokenId, msg.sender);
-            } catch Error(string memory reason) {
-                emit BurnFailed(tokenId, reason);
-            } catch {
-                emit BurnFailed(tokenId, "Unknown error");
-            }
+            IRangeManager(address(rangeManager)).burnPosition(tokenId);
+            emit PositionBurned(tokenId, msg.sender);
         }
 
         // 3. Les fonds restent dans RangeManager
