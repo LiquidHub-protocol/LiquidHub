@@ -40,10 +40,10 @@ interface IAaveHedgeSettlement {
         external
         view
         returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase);
-    /// @dev WETH (token0) libre detenu par le HedgeManager (en wei). Ce WETH est l'actif emprunte
-    ///      sur AAVE, garde idle comme BUFFER DE REPAY zero-slippage (eviter un swap USDC->WETH au
-    ///      moment de rembourser). Le hedge delta-neutral lui-meme est la DETTE WETH sur AAVE (jambe
-    ///      short), pas ce WETH idle. Mais cet actif est bien detenu par le protocole : il doit etre
+    /// @dev Token0 libre detenu par le HedgeManager (en unites natives). Ce token0 est l'actif emprunte
+    ///      sur AAVE, garde idle comme BUFFER DE REPAY zero-slippage (eviter un swap token1->token0 au
+    ///      moment de rembourser). Le hedge delta-neutral lui-meme est la DETTE token0 sur AAVE (jambe
+    ///      short), pas ce token0 idle. Mais cet actif est bien detenu par le protocole : il doit etre
     ///      compte dans le NAV, sinon (en ne comptant que collat-dette) le denominateur de mint de
     ///      shares sous-estime la valeur reelle.
     function getWethDebt() external view returns (uint256);
@@ -526,19 +526,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // slot0 lu par getCurrentBalances ; updatePriceCache invalide le cache si déviation > seuil.
         {
             rangeManager.refreshPriceCache();
-            (uint128 _p0, uint128 _p1, uint160 _sqrtP,,, bool _valid) = rangeManager.priceCache();
+            (,,,,, bool _valid) = rangeManager.priceCache();
             if (!_valid) revert E72(); // cache invalide (deviation pool/oracle ou feed stale) -> bloque le mint
-            (,,,, uint16 _maxDevBps,,) = rangeManager.protectionConfig();
-            RangeOperations.RangeConfig memory _cfg = rangeManager.config();
-            RangeOperations.PriceCache memory _pc = RangeOperations.PriceCache({
-                price0: _p0,
-                price1: _p1,
-                poolSqrtPriceX96: _sqrtP,
-                poolTick: 0,
-                timestamp: 0,
-                valid: _valid
-            });
-            RangeOperations.checkOracleDeviation(_pc, _maxDevBps, _cfg.token0Decimals, _cfg.token1Decimals);
         }
 
         // Récupérer le premier dépôt EN ATTENTE (tête = _pendingHead)
@@ -795,19 +784,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // V3-H1 : REFRESH d'abord (slot0+oracle LIVE), updatePriceCache invalide le cache si déviation.
         {
             rangeManager.refreshPriceCache();
-            (uint128 _p0, uint128 _p1, uint160 _sqrtP,,, bool _valid) = rangeManager.priceCache();
+            (,,,,, bool _valid) = rangeManager.priceCache();
             if (!_valid) revert E72(); // cache invalide (deviation pool/oracle ou feed stale) -> bloque le retrait
-            (,,,, uint16 _maxDevBps,,) = rangeManager.protectionConfig();
-            RangeOperations.RangeConfig memory _cfg = rangeManager.config();
-            RangeOperations.PriceCache memory _pc = RangeOperations.PriceCache({
-                price0: _p0,
-                price1: _p1,
-                poolSqrtPriceX96: _sqrtP,
-                poolTick: 0,
-                timestamp: 0,
-                valid: _valid
-            });
-            RangeOperations.checkOracleDeviation(_pc, _maxDevBps, _cfg.token0Decimals, _cfg.token1Decimals);
         }
 
         uint256 totalSharesBefore = totalShares;

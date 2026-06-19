@@ -21,7 +21,7 @@ Liquid Hub manages concentrated-liquidity DEX positions for multiple users via a
 A user's `deposit()` is permissionless and queues the funds. Converting a queued deposit into LP liquidity is also permissionless via `processDepositPermissionless()` on the Vault — so the protocol can accept new capital without any privileged operator. In one atomic transaction it:
 
 1. Refreshes the live Chainlink price cache, then requires the cache valid and fresh (`depositMaxCacheAge`).
-2. Requires a position NFT to exist on standard pools; on Delta-Neutral pools, the first queued deposit can also be processed through this atomic path.
+2. Requires a position NFT to exist for community keepers; the first queued deposit can be processed through this atomic path only by the protocol bot/Safe path so the initial mint is created under the same oracle/TWAP/minOut guards.
 3. Sets the rebalance lock (`_processingRebalance`) so any concurrent withdrawal reverts while funds are in transit.
 4. Computes the deposit's shares on the **Chainlink oracle** (never the pool spot price → no share-inflation), transfers the funds to the RangeManager.
 5. Executes the rebalancing swaps with **on-chain oracle-bounded `minAmountsOut`** (anti-MEV: a keeper-supplied min below the oracle floor reverts), each chunk capped by `initMultiSwapTvl`.

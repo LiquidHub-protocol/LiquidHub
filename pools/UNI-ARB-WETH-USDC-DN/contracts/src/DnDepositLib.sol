@@ -10,7 +10,7 @@ import "./RangeOperations.sol";
 
 /// @dev Interfaces minimales (la library reçoit les adresses en paramètre — aucun accès au storage du Vault).
 interface IHedgeDep {
-    function getWethDebt() external view returns (uint256); // dette WETH EXACTE (audit H-03)
+    function getWethDebt() external view returns (uint256); // dette token0 exacte; nom ABI historique
     function getWethBalance() external view returns (uint256);
     function getUsdcBalance() external view returns (uint256);
     function getHedgeData()
@@ -36,6 +36,7 @@ interface IRmDep {
         external
         view
         returns (uint128 price0, uint128 price1, uint160 sqrtP, int24 tick, uint64 ts, bool valid);
+    function protectionConfig() external view returns (bool, bool, bool, uint16, uint16, uint32, uint32);
     function config()
         external
         view
@@ -153,7 +154,7 @@ library DnDepositLib {
         uint256 idleHmUsd = _toUsd(_dust(hm.getWethBalance(), dustTok0), price0, dec0);
         uint256 idleRmUsd = _toUsd(_dust(freeRmWeth, dustTok0), price0, dec0);
         (uint256 totalBal0,) = rm.getCurrentBalances();
-        // totalBal0 inclut le NFT + le WETH libre ACTUEL (hors extra0) → NFT = totalBal0 − libre actuel.
+        // totalBal0 inclut le NFT + le token0 libre ACTUEL (hors extra0) -> NFT = totalBal0 - libre actuel.
         uint256 curFreeRmWeth = freeRmWeth - extra0;
         uint256 nftWeth = totalBal0 > curFreeRmWeth ? totalBal0 - curFreeRmWeth : 0;
         uint256 investableUsd = ((IERC20(token1).balanceOf(rangeManager) + extra1) * uint256(price1)) / (10 ** dec1);
@@ -204,8 +205,8 @@ library DnDepositLib {
 
     /// @notice AUDIT H-01 : plan de swap du PROCHAIN DÉPÔT, calculé sur l'état FUTUR (post-transfert du dépôt +
     ///         post-ouverture du hedge), PAS sur l'état rebalance/post-burn de getOptimalSwapParams (qui inclut
-    ///         le NFT et ignore le dépôt + le WETH emprunté → 0 swap erroné ou swap sur fonds bloqués).
-    /// @dev    Simule : freeT0 = RM_t0 + dépôt_t0 + borrowWeth ; freeT1 = RM_t1 + dépôt_t1 − collateralUsdc.
+    ///         le NFT et ignore le dépôt + le token0 emprunté -> 0 swap erroné ou swap sur fonds bloqués).
+    /// @dev    Simule : freeT0 = RM_t0 + dépôt_t0 + borrowToken0 ; freeT1 = RM_t1 + dépôt_t1 - collateralToken1.
     ///         Puis dimensionne le swap vers le ratio du range. Renvoie (zeroForOne, amountIn) en unités natives.
     ///         No-op (false,0) si pool std (hedgeManager==0) → le caller retombe sur getOptimalSwapParams.
     /// @return zeroForOne true si swap token0→token1
@@ -390,7 +391,7 @@ library DnDepositLib {
     }
 
     /// @notice AUDIT M-01 : plan de swap d'un REBALANCE DN compatible avec la dette AAVE FIXE. rebalance() ne
-    ///         touche pas AAVE → pour passer le post-check, la LP remintée doit avoir wethInLP ≈ effectiveShort/H
+    ///         touche pas AAVE -> pour passer le post-check, la LP remintée doit avoir token0InLP ~= effectiveShort/H
     ///         (le short net est fixé par la dette). On calcule le swap depuis les balances TOTALES post-burn
     ///         (libres + NFT, via getCurrentBalances qui reflète l'état post-burn) vers cette cible token0.
     /// @dev    À utiliser par le keeper quand le rebalance est déclenché par drift DN (sous-hedge in-range) —
@@ -406,7 +407,7 @@ library DnDepositLib {
         (, uint8 dec0, uint8 dec1,,,,,,,) = rm.config();
         address token0 = rm.token0();
 
-        // effectiveShort = dette − WETH idle (HM + RM, filtré dust), en USD 8 déc. C'est le short FIXE à couvrir.
+        // effectiveShort = dette - token0 idle (HM + RM, filtre dust), en USD 8 dec. C'est le short FIXE a couvrir.
         uint256 dustTok0 = hm.donationDustToken0();
         uint256 debtUsd = _toUsd(hm.getWethDebt(), price0, dec0);
         uint256 idleUsd = _toUsd(_dust(hm.getWethBalance(), dustTok0), price0, dec0)
@@ -416,7 +417,7 @@ library DnDepositLib {
 
         uint256 H = hm.hedgeTargetBps();
         if (H == 0) return (false, 0);
-        // Cible : wethInLP_usd tel que H × wethInLP = effectiveShort ⇒ wethInLP_usd = effectiveShort × 10000 / H.
+        // Cible : token0InLP_usd tel que H * token0InLP = effectiveShort => token0InLP_usd = effectiveShort * 10000 / H.
         uint256 targetWethLpUsd = (effShortUsd * 10000) / H;
 
         // Balances TOTALES post-burn (libres + NFT) = capital disponible pour reconstruire la LP.
@@ -427,7 +428,7 @@ library DnDepositLib {
         uint256 targetV0 = targetWethLpUsd > totUsd ? totUsd : targetWethLpUsd;
 
         if (v0 > targetV0) {
-            amountIn = ((v0 - targetV0) * (10 ** dec0)) / uint256(price0); // swap token0→token1 (réduit wethInLP)
+            amountIn = ((v0 - targetV0) * (10 ** dec0)) / uint256(price0); // swap token0->token1 (reduit token0InLP)
             return (true, amountIn);
         } else if (targetV0 > v0) {
             amountIn = ((targetV0 - v0) * (10 ** dec1)) / uint256(price1); // swap token1→token0
@@ -555,30 +556,61 @@ library DnDepositLib {
     }
 
     /// @notice Garde anti-manipulation LP/oracle pour AaveHedgeManager.adjustHedge().
-    /// @dev Compare le prix pool token1/token0 au prix oracle du token0 en USD, en supposant token1 stable.
+    /// @dev Compare le prix pool token1/token0 au ratio oracle price0/price1 du RangeManager.
+    ///      Aucune hypothese "token1 stable" : fonctionne aussi si token1 est un actif non stable.
     function aaveRequireLpNotDeviated(
+        address rangeManager,
+        IUniswapV3Pool lpPool,
         uint160 sqrtPriceX96,
+        int24 currentTick,
         uint16 maxHedgeDeviationBps,
         uint8 volatileDecimals,
-        uint8 stableDecimals,
-        uint8 oracleDecimals,
-        uint32 oracleMaxAge,
-        AggregatorV3Interface volatileUsdFeed
+        uint8 stableDecimals
     ) external view {
         if (maxHedgeDeviationBps == 0 || sqrtPriceX96 == 0) return;
 
         uint256 sp = uint256(sqrtPriceX96);
         uint256 poolRaw = Math.mulDiv(sp, sp, 1 << 96);
         poolRaw = Math.mulDiv(poolRaw, 1e18, 1 << 96);
-        uint256 poolPrice =
-            Math.mulDiv(poolRaw, (10 ** volatileDecimals) * (10 ** oracleDecimals), (10 ** stableDecimals) * 1e18);
+        uint256 poolPrice = Math.mulDiv(poolRaw, 10 ** volatileDecimals, 10 ** stableDecimals);
 
-        (uint80 roundId, int256 px,, uint256 updatedAt, uint80 answeredInRound) = volatileUsdFeed.latestRoundData();
-        require(px > 0 && answeredInRound >= roundId && block.timestamp - updatedAt <= oracleMaxAge, "Bad oracle");
-        uint256 oraclePrice = uint256(px);
+        (uint128 price0, uint128 price1,,,, bool valid) = IRmDep(rangeManager).priceCache();
+        require(valid && price0 > 0 && price1 > 0, "Bad oracle");
+        uint256 oraclePrice = Math.mulDiv(uint256(price0), 1e18, uint256(price1));
 
         uint256 diff = poolPrice > oraclePrice ? poolPrice - oraclePrice : oraclePrice - poolPrice;
         require((diff * 10000) / oraclePrice <= maxHedgeDeviationBps, "LP price deviation");
+
+        (bool twapEnabled,,, uint16 twapBps,,,) = IRmDep(rangeManager).protectionConfig();
+        if (twapEnabled) _requireTwapNotDeviated(lpPool, currentTick, twapBps);
+    }
+
+    /// @notice Plafond token1 pour acheter `amount0Out` token0 via exactOutput, base sur price0/price1.
+    /// @dev priceCache doit avoir ete rafraichi fail-closed par le caller juste avant.
+    function aaveOracleMaxToken1ForToken0(
+        uint256 amount0Out,
+        address rangeManager,
+        uint8 dec0,
+        uint8 dec1,
+        uint16 slippageBps
+    ) external view returns (uint256 amountInMaximum) {
+        (uint128 price0, uint128 price1,,,, bool valid) = IRmDep(rangeManager).priceCache();
+        require(valid && price0 > 0 && price1 > 0, "Bad oracle");
+        uint256 theoretical = Math.mulDiv(amount0Out, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0));
+        amountInMaximum = Math.mulDiv(theoretical, 10000 + uint256(slippageBps), 10000);
+        require(amountInMaximum > 0, "Bad oracle");
+    }
+
+    function _requireTwapNotDeviated(IUniswapV3Pool pool, int24 spotTick, uint16 maxTwapDeviationBps) private view {
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = 300;
+        try pool.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
+            int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
+            int24 twapTick = int24(tickDelta / int56(uint56(300)));
+            if (tickDelta < 0 && tickDelta % int56(uint56(300)) != 0) twapTick--;
+            int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
+            require(uint24(diff) <= uint24(maxTwapDeviationBps), "LP TWAP");
+        } catch {}
     }
 
     // ===== helpers internes (inlinés dans la library) =====

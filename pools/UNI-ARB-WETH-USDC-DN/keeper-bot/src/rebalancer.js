@@ -104,10 +104,9 @@ class Rebalancer {
   /**
    * Processes ONE queued user deposit permissionlessly (earns the deposit bounty).
    *
-   * CRITICAL anti-MEV difference vs rebalance: the rebalance keeper can pass minOut=0 (the contract
-   * uses pool defaults), but for DEPOSITS the contract requires minAmountsOut[i] >= an on-chain
-   * oracle floor. So we MUST compute minOuts from the Chainlink price here (not 0), otherwise the
-   * tx reverts with the deposit error. The contract re-validates everything on-chain.
+   * Anti-MEV: deposits AND rebalances require minAmountsOut[i] >= the on-chain oracle floor.
+   * So we MUST compute minOuts from the Chainlink price here (not 0), otherwise the tx reverts
+   * with "minOut<floor". The contract re-validates everything on-chain.
    *
    * DN note (audit L-01) : the deposit path DOES open the AAVE hedge ATOMICALLY on-chain, inside
    * processDepositPermissionless (via DnDepositLib.openDepositHedge) + a strict post-check. The keeper

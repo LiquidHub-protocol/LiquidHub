@@ -47,6 +47,7 @@ interface IRangeManager {
     // audit V1 (V3-H1) : le vault rafraîchit le cache (slot0+oracle LIVE) avant chaque mint/withdraw de shares.
     function refreshPriceCache() external;
     function addLiquidityToPosition() external;
+    function mintInitialPosition() external returns (uint256 tokenId, uint128 liquidity);
     function collectFeesForVault() external returns (uint256 fees0, uint256 fees1);
     // --- depot permissionless ---
     function executeSwap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut)
@@ -357,8 +358,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // currentTotalValue avant la boucle tout en incrémentant totalShares à chaque itération, ce qui
     // sur-mintait des shares aux dépôts tardifs d'un même lot (dilution des holders existants). Elle
     // était `onlyBot` mais le selector restait whitelisté dans le module → atteignable par une clé bot
-    // compromise. Le traitement des dépôts se fait désormais UNIQUEMENT un par un via processSingleDeposit()
-    // / processDepositPermissionless(), qui recalculent la valeur du vault à CHAQUE dépôt (accounting juste).
+    // compromise. Le traitement des dépôts se fait désormais UNIQUEMENT un par un via des chemins atomiques :
+    // processDepositPermissionless() en production bot/keepers, processSingleDeposit() comme chemin onlyBot
+    // historique. Tous recalculent la valeur du vault à CHAQUE dépôt (accounting juste).
 
     // ===== TRAITEMENT INDIVIDUEL DES DEPOTS =====
 
@@ -397,7 +399,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     /**
      * @notice Traite UN SEUL dépôt (le premier de la queue)
-     * @dev Le bot doit ensuite faire les multi-swaps et appeler addLiquidityToPosition
+     * @dev Chemin onlyBot historique. Le flux de production utilise processDepositPermissionless(),
+     *      qui fait swaps + mint/add en une transaction atomique.
      *      Chaque utilisateur paie ses propres frais de swap proportionnels à son dépôt
      */
     function processSingleDeposit() external onlyBot {
@@ -424,19 +427,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // lu par getCurrentBalances ; updatePriceCache invalide le cache si déviation > seuil. Cohérent DN.
         {
             rangeManager.refreshPriceCache();
-            (uint128 _p0, uint128 _p1, uint160 _sqrtP,,, bool _valid) = rangeManager.priceCache();
+            (,,,,, bool _valid) = rangeManager.priceCache();
             require(_valid, "E38"); // cache invalidé (déviation pool/oracle ou feed stale) -> on bloque le mint
-            (,,,, uint16 _maxDevBps,,) = rangeManager.protectionConfig();
-            RangeOperations.RangeConfig memory _cfg = rangeManager.config();
-            RangeOperations.PriceCache memory _pc = RangeOperations.PriceCache({
-                price0: _p0,
-                price1: _p1,
-                poolSqrtPriceX96: _sqrtP,
-                poolTick: 0,
-                timestamp: 0,
-                valid: _valid
-            });
-            RangeOperations.checkOracleDeviation(_pc, _maxDevBps, _cfg.token0Decimals, _cfg.token1Decimals);
         }
 
         // Récupérer le premier dépôt EN ATTENTE (tête de file = _pendingHead)
@@ -531,7 +523,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      *      en liquidite LP, sans le bot du fondateur. En UNE tx : refresh oracle -> calcul shares
      *      (oracle) -> transfert fonds au RM -> swaps bornes oracle (anti-MEV) -> addLiquidity ->
      *      deposit bounty. Verrou _processingRebalance pose pendant toute la fonction (un withdraw
-     *      concurrent revert E32). Le mint initial reste reserve au bot (revert si aucune position).
+     *      concurrent revert E32). Si aucune position n'existe encore, seul le botModule/owner peut
+     *      traiter le depot initial et minter la premiere position dans cette meme transaction.
      *      Le hedge DN n'est PAS touche ici : il est corrige separement par adjustHedge() permissionless.
      * @param swapAmountsIn Montants d'entree des swaps de reequilibrage (chunks), fournis par le keeper.
      * @param minAmountsOut Sorties minimales par chunk. Bornees on-chain : require(>= oracleMinOut).
@@ -546,9 +539,13 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         require(swapAmountsIn.length == minAmountsOut.length, "len");
         // 1. File non vide (anti-drain bounty : on ne paie que sur depot reel)
         require(_pendingCount() > 0, "E24");
-        // 2. NFT existant (le mint initial reste au bot)
+        // 2. Etat LP : si aucun NFT n'existe, seule l'execution botModule/owner peut minter la position initiale.
+        //    Les keepers anonymes gardent le traitement permissionless des depots de croissance apres creation du NFT.
         uint256[] memory positions = rangeManager.getOwnerPositions();
-        require(positions.length > 0, "E71");
+        bool hasPosition = positions.length > 0;
+        if (!hasPosition) {
+            require(msg.sender == botModule || msg.sender == owner(), "E71");
+        }
         // 3. Refresh oracle atomique. audit V1 (V3-R4 Point 3, retour Codex) : on REFRESH d'abord le cache
         // (slot0+oracle LIVE) de façon INCONDITIONNELLE — avant ne se faisait que via recordPriceSnapshot()
         // qui revert si le snapshot n'est pas dû (catché), laissant le check depositMaxCacheAge buter sur un
@@ -568,7 +565,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // 4. VERROU (un withdraw concurrent revert E32 ; pose pendant toute la modification de position)
         _processingRebalance = true;
 
-        // 5. Shares + transfert des fonds au RangeManager (logique identique a processSingleDeposit)
+        // 5. Shares + transfert des fonds au RangeManager (meme logique comptable que processSingleDeposit)
         (,, uint256 depositValue) = _processOneDeposit();
 
         // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk
@@ -579,8 +576,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             }
         }
 
-        // 7. Ajouter la liquidite a la position existante
-        rangeManager.addLiquidityToPosition();
+        // 7. Ajouter a la position existante, ou minter la position initiale en atomique bot-only.
+        if (hasPosition) rangeManager.addLiquidityToPosition();
+        else rangeManager.mintInitialPosition();
 
         // 8. DEVERROU
         _processingRebalance = false;
@@ -650,19 +648,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // V3-H1 : REFRESH d'abord (slot0+oracle LIVE), updatePriceCache invalide le cache si déviation. Coh. DN.
         {
             rangeManager.refreshPriceCache();
-            (uint128 _p0, uint128 _p1, uint160 _sqrtP,,, bool _valid) = rangeManager.priceCache();
+            (,,,,, bool _valid) = rangeManager.priceCache();
             require(_valid, "E38"); // cache invalidé (déviation pool/oracle ou feed stale) -> on bloque le retrait
-            (,,,, uint16 _maxDevBps,,) = rangeManager.protectionConfig();
-            RangeOperations.RangeConfig memory _cfg = rangeManager.config();
-            RangeOperations.PriceCache memory _pc = RangeOperations.PriceCache({
-                price0: _p0,
-                price1: _p1,
-                poolSqrtPriceX96: _sqrtP,
-                poolTick: 0,
-                timestamp: 0,
-                valid: _valid
-            });
-            RangeOperations.checkOracleDeviation(_pc, _maxDevBps, _cfg.token0Decimals, _cfg.token1Decimals);
         }
 
         uint256 totalSharesBefore = totalShares;

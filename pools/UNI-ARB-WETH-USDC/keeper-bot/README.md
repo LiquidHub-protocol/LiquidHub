@@ -43,7 +43,7 @@ When `DYNAMIC_RANGE_ENABLED` is `false` (e.g. a stablecoin pool), the range stay
 
 A user's `deposit()` is permissionless and queues the funds. Converting a queued deposit into LP liquidity is also permissionless: `processDepositPermissionless()` on the Vault processes **one** queued deposit per call, atomically — it refreshes the oracle, computes shares on the Chainlink oracle, executes the rebalancing swaps, and adds the liquidity. A successful call pays the **deposit bounty**.
 
-**Anti-MEV — keeper must supply oracle-floored `minAmountsOut`**: unlike `rebalance()` (where the keeper may pass `minOut = 0`), the deposit function **rejects any `minAmountsOut[i]` below an on-chain oracle floor**. The reference `processDeposit()` in `rebalancer.js` computes the floor from the Chainlink price (same formula the contract uses). It reverts if the queue is empty, no position NFT exists (the one-time initial mint is the protocol bot's job), or the oracle cache is stale — so the keeper just calls it when a deposit is pending and treats a revert as "skip".
+**Anti-MEV — keeper must supply oracle-floored `minAmountsOut`**: both `rebalance()` and `processDepositPermissionless()` reject any `minAmountsOut[i]` below an on-chain oracle floor. The reference keeper computes the floor from the Chainlink price (same formula the contract uses). Deposit processing reverts if the queue is empty, no position NFT exists for a community keeper (the one-time initial mint is the protocol bot's job), or the oracle cache is stale — so the keeper just calls it when a deposit is pending and treats a revert as "skip".
 
 ### Permissionless
 

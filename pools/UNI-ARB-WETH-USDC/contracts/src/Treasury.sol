@@ -125,11 +125,14 @@ contract Treasury is Ownable {
     uint256 public metricsBountyAmount;
 
     // --- Hedge Bounty (adjustHedge, pools DN) — paye au keeper qui reajuste le hedge ---
-    // PAS de cooldown PROPRE au bounty: il est paye a chaque adjustHedge() reussi. L'anti-drain est
-    // assure cote AaveHedgeManager par le require(drift >= seuil) ET le cooldown on-chain (hedgeAdjustCooldown) :
-    // un keeper ne peut donc reajuster (et toucher le bounty) que quand c'est necessaire et apres le delai.
+    // Anti-drain: adjustHedge() est deja borne cote AaveHedgeManager par drift+cooldown, et le Treasury ajoute
+    // un cap quotidien par HedgeManager. Si le cap est atteint, le caller AaveHedgeManager catch le revert et le
+    // reajustement continue sans bounty.
     bool public hedgeBountyEnabled;
     uint256 public hedgeBountyAmount;
+    uint256 public hedgeBountyDailyCap; // max hedge bounties paid per UTC day per HedgeManager
+    mapping(address => uint64) public hedgeBountyDay;
+    mapping(address => uint256) public hedgeBountyDailySpent;
     mapping(address => bool) public authorizedHedgeManagers;
 
     // --- Deposit Bounty (processDepositPermissionless) — paye au keeper qui traite un depot en file ---
@@ -164,6 +167,7 @@ contract Treasury is Ownable {
     event KeeperBountyPaid(address indexed keeper, uint256 amount);
     event KeeperBountyConfigured(bool enabled, uint256 amount);
     event KeeperBountyDailyCapConfigured(uint256 dailyCap);
+    event HedgeBountyDailyCapConfigured(uint256 dailyCap);
     event BridgeBountyPaid(address indexed keeper, uint256 amount);
     event BridgeBountyConfigured(bool enabled, uint256 amount);
     event BridgeBountyCooldownConfigured(uint64 cooldown, uint16 minRatio);
@@ -316,7 +320,7 @@ contract Treasury is Ownable {
     function _bountyReserveUsdc() internal view returns (uint256 reserve) {
         if (keeperBountyEnabled) reserve += keeperBountyDailyCap > 0 ? keeperBountyDailyCap : keeperBountyAmount;
         if (metricsBountyEnabled) reserve += metricsBountyAmount;
-        if (hedgeBountyEnabled) reserve += hedgeBountyAmount;
+        if (hedgeBountyEnabled) reserve += hedgeBountyDailyCap > 0 ? hedgeBountyDailyCap : hedgeBountyAmount;
         if (depositBountyEnabled) reserve += depositBountyDailyCap > 0 ? depositBountyDailyCap : depositBountyAmount;
         if (bridgeBountyEnabled) reserve += bridgeBountyAmount;
     }
@@ -545,24 +549,47 @@ contract Treasury is Ownable {
     // --- Hedge Bounty Functions (adjustHedge, pools DN) ---
 
     /// @notice Pay bounty to keeper who adjusted the hedge. Called by authorized AaveHedgeManager.
-    /// @dev PAS de cooldown propre au bounty: le reajustement n'a lieu que si drift >= seuil ET cooldown
-    ///      on-chain ecoule (garde-fous anti-drain cote AaveHedgeManager). Appele en try/catch => ne bloque
-    ///      jamais le reajustement.
+    /// @dev Appele en try/catch par AaveHedgeManager => le cap quotidien ne bloque jamais le reajustement.
     function payHedgeBounty(address keeper) external {
         require(keeper != address(0), "Invalid keeper");
         require(authorizedHedgeManagers[msg.sender], "Not authorized");
         require(hedgeBountyEnabled, "Bounty disabled");
         require(hedgeBountyAmount > 0, "Bounty is zero");
         require(usdc.balanceOf(address(this)) >= hedgeBountyAmount, "Insufficient USDC");
+        _consumeHedgeBountyLimit(msg.sender);
 
         usdc.safeTransfer(keeper, hedgeBountyAmount);
         emit HedgeBountyPaid(keeper, hedgeBountyAmount);
     }
 
     function setHedgeBounty(bool _enabled, uint256 _amount) external onlyOwner {
+        if (_enabled && hedgeBountyDailyCap > 0) {
+            require(_amount <= hedgeBountyDailyCap, "Bounty > daily cap");
+        }
         hedgeBountyEnabled = _enabled;
         hedgeBountyAmount = _amount;
         emit HedgeBountyConfigured(_enabled, _amount);
+    }
+
+    function _consumeHedgeBountyLimit(address hedgeManager) internal {
+        uint64 day = uint64(block.timestamp / 1 days);
+        if (hedgeBountyDay[hedgeManager] != day) {
+            hedgeBountyDay[hedgeManager] = day;
+            hedgeBountyDailySpent[hedgeManager] = 0;
+        }
+        uint256 newSpent = hedgeBountyDailySpent[hedgeManager] + hedgeBountyAmount;
+        if (hedgeBountyDailyCap > 0) {
+            require(newSpent <= hedgeBountyDailyCap, "Hedge bounty daily cap");
+        }
+        hedgeBountyDailySpent[hedgeManager] = newSpent;
+    }
+
+    function setHedgeBountyDailyCap(uint256 _dailyCap) external onlyOwner {
+        if (_dailyCap > 0) {
+            require(_dailyCap >= hedgeBountyAmount, "Cap < bounty");
+        }
+        hedgeBountyDailyCap = _dailyCap;
+        emit HedgeBountyDailyCapConfigured(_dailyCap);
     }
 
     function authorizeHedgeManager(address _hedgeManager, bool _authorized) external onlyOwner {

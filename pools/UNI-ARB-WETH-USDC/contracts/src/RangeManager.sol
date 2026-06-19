@@ -101,8 +101,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     AggregatorV3Interface private token0PriceFeed;
     AggregatorV3Interface private token1PriceFeed;
-    // Oracle natif configure pour metadata/off-chain gas valuation. Les maths pool on-chain utilisent token0/token1.
-    AggregatorV3Interface private nativePriceFeed;
 
     // ===== GESTION POSITIONS =====
 
@@ -234,11 +232,11 @@ contract RangeManager is Ownable, ReentrancyGuard {
         });
 
         protectionConfig = RangeOperations.ProtectionConfig({
-            sandwichDetectionEnabled: true,
+            sandwichDetectionEnabled: false,
             mevProtectionEnabled: true,
             failureProtectionEnabled: true,
-            sandwichThresholdBps: 500,
-            maxOracleDeviationBps: 500,
+            sandwichThresholdBps: 50,
+            maxOracleDeviationBps: 100,
             maxAge0: 90000, // heartbeat par défaut (25h) — cohérent avec la pool DN
             maxAge1: 90000
         });
@@ -382,17 +380,20 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     function configureProtections(
-        bool _sandwichDetection,
+        bool _twapGuardEnabled,
         bool _mevProtection,
         bool _failureProtection,
-        uint16 _sandwichThresholdBps
+        uint16 _maxTwapDeviationBps
     ) external onlyAuthorized {
-        require(_sandwichThresholdBps <= 1000, "E21");
+        // Historical field names kept for ABI/storage compatibility:
+        // sandwichDetectionEnabled = spot/TWAP guard enabled, sandwichThresholdBps = max TWAP tick drift.
+        require(_maxTwapDeviationBps <= 1000, "E21");
+        require(!_twapGuardEnabled || _maxTwapDeviationBps > 0, "E21");
 
-        protectionConfig.sandwichDetectionEnabled = _sandwichDetection;
+        protectionConfig.sandwichDetectionEnabled = _twapGuardEnabled;
         protectionConfig.mevProtectionEnabled = _mevProtection;
         protectionConfig.failureProtectionEnabled = _failureProtection;
-        protectionConfig.sandwichThresholdBps = _sandwichThresholdBps;
+        protectionConfig.sandwichThresholdBps = _maxTwapDeviationBps;
     }
 
     /// @notice (audit V1 — V3-M1) Paramètres oracle : seuil de déviation pool/oracle + heartbeats par feed.
@@ -431,7 +432,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         token0PriceFeed = AggregatorV3Interface(_token0PriceFeed);
         token1PriceFeed = AggregatorV3Interface(_token1PriceFeed);
-        nativePriceFeed = AggregatorV3Interface(_nativePriceFeed);
 
         _updatePriceCache();
         require(priceCache.valid, "E38");
@@ -807,6 +807,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
             token1PriceFeed,
             pool,
             config,
+            protectionConfig.sandwichDetectionEnabled,
+            protectionConfig.sandwichThresholdBps,
             protectionConfig.maxOracleDeviationBps,
             protectionConfig.maxAge0,
             protectionConfig.maxAge1
@@ -992,6 +994,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
         address tokenOut
     ) external nonReentrant {
         require(swapAmountsIn.length == minAmountsOut.length, "len");
+        if (protectionConfig.mevProtectionEnabled) {
+            require(block.timestamp - config.lastRebalanceTime >= MIN_REBALANCE_INTERVAL, "E03");
+        }
 
         // SÉCURITÉ (audit V1 — High 2 / V3-H2) : rafraîchir le cache AVANT de valider les minOuts. La barrière
         // de déviation pool/oracle est INTÉGRÉE au refresh (updatePriceCache invalide le cache si divergence) :

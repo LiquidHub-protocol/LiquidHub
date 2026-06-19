@@ -13,10 +13,42 @@ interface IERC20Sweep {
 }
 
 interface IRangeManagerBotState {
+    function token0() external view returns (address);
+
+    function config()
+        external
+        view
+        returns (
+            uint24 fee,
+            uint8 token0Decimals,
+            uint8 token1Decimals,
+            uint16 toleranceBps,
+            uint24 maxSlippageBps,
+            uint64 lastRebalanceTime,
+            bool oraclesConfigured,
+            uint16 rangeUpPercent,
+            uint16 rangeDownPercent,
+            uint32 maxPositions
+        );
+
     function getBotInstructions()
         external
         view
         returns (bool hasPosition, uint256 tokenId, bool shouldRebalance, string memory action, string memory reason);
+
+    function getOptimalSwapParams()
+        external
+        view
+        returns (
+            bool swapNeeded,
+            bool zeroForOne,
+            uint256 amountIn,
+            uint256 currentBalance0,
+            uint256 currentBalance1,
+            uint256 targetRatio0Bps,
+            int24 tickLower,
+            int24 tickUpper
+        );
 }
 
 contract SecureBotModule {
@@ -37,6 +69,10 @@ contract SecureBotModule {
     bool public directExecution;
     uint8 public botCycleState;
     uint64 public botCycleUpdatedAt;
+    bool private cycleSwapPlanSet;
+    bool private cycleSwapZeroForOne;
+    uint256 private cycleSwapExpectedIn;
+    uint256 private cycleSwapSpentIn;
 
     // Audit V3 (Point 2) : endRebalance() est EXEMPTE de la limite quotidienne dans executeVaultFunction.
     // C'est un DEVERROUILLAGE (il ne deplace aucun fonds, il libere depots/retraits) : si la limite est
@@ -47,12 +83,10 @@ contract SecureBotModule {
     bytes4 private constant MINT_INITIAL_SELECTOR = 0x63ccfd0b; // mintInitialPosition()
     bytes4 private constant BURN_SELECTOR = 0x38ca63bc; // burnPosition(uint256)
     bytes4 private constant SWAP_SELECTOR = 0xb07391c0; // executeSwap(address,address,uint256,uint256)
-    bytes4 private constant PROCESS_SINGLE_SELECTOR = 0xac1df9bd; // processSingleDeposit()
     bytes4 private constant ADD_LIQUIDITY_SELECTOR = 0x2a7cf2fe; // addLiquidityToPosition()
     uint8 private constant CYCLE_IDLE = 0;
     uint8 private constant CYCLE_LOCKED = 1;
     uint8 private constant CYCLE_REBALANCE_BURNED = 2;
-    uint8 private constant CYCLE_DEPOSIT_PENDING = 3;
     uint8 private constant CYCLE_LOCKED_MAINTENANCE = 5;
     uint32 public constant BOT_CYCLE_TIMEOUT = 1 hours;
 
@@ -105,9 +139,9 @@ contract SecureBotModule {
         // configureSlippage, setMaxPositions, configureProtections, configureTolerance.
 
         // Fonctions MultiUserVault
-        // processPendingDeposits (0x99dd7ead) RETIRÉ (audit V1) : fonction batch supprimée du Vault
-        // (sur-mint des dépôts tardifs). Le traitement se fait via processSingleDeposit ci-dessous.
-        allowedFunctions[0xac1df9bd] = true; // processSingleDeposit (traitement individuel)
+        // processPendingDeposits (0x99dd7ead) RETIRÉ (audit V1) : fonction batch supprimée du Vault.
+        // processSingleDeposit (0xac1df9bd) RETIRÉ de la whitelist : le bot traite désormais aussi le
+        // mint initial standard via processDepositPermissionless(), en une transaction atomique bot-only.
         allowedFunctions[0x76919a59] = true; // processDepositPermissionless(uint256[],uint256[],address,address)
         allowedFunctions[0x4dce7057] = true; // startRebalance()
         allowedFunctions[0x0040718e] = true; // endRebalance()
@@ -165,7 +199,7 @@ contract SecureBotModule {
     {
         bytes4 selector = bytes4(data[:4]);
         _requireInflowsForSelector(selector);
-        _beforeRangeManagerCall(selector);
+        _beforeRangeManagerCall(selector, data);
 
         _execute(rangeManager, 0, data);
         _afterRangeManagerCall(selector);
@@ -315,24 +349,18 @@ contract SecureBotModule {
         if (selector == START_REBALANCE_SELECTOR) {
             require(botCycleState == CYCLE_IDLE, "Bad cycle");
             _requireVaultUnlocked();
-        } else if (selector == PROCESS_SINGLE_SELECTOR) {
-            // processSingleDeposit est le flux bot standard encadre par startRebalance/endRebalance.
-            // Le chemin permissionless atomique reste disponible sans cycle via processDepositPermissionless().
-            require(botCycleState == CYCLE_LOCKED, "Bad cycle");
         }
     }
 
     function _afterVaultCall(bytes4 selector) private {
         if (selector == START_REBALANCE_SELECTOR) {
             _setCycle(CYCLE_LOCKED, selector);
-        } else if (selector == PROCESS_SINGLE_SELECTOR) {
-            _setCycle(CYCLE_DEPOSIT_PENDING, selector);
         } else if (selector == END_REBALANCE_SELECTOR) {
             _setCycle(CYCLE_IDLE, selector);
         }
     }
 
-    function _beforeRangeManagerCall(bytes4 selector) private {
+    function _beforeRangeManagerCall(bytes4 selector, bytes calldata data) private {
         _autoResetStaleCycle();
         uint8 state = botCycleState;
         if (selector == BURN_SELECTOR) {
@@ -340,21 +368,19 @@ contract SecureBotModule {
             _requireRebalanceTrigger();
         } else if (selector == SWAP_SELECTOR) {
             require(
-                state == CYCLE_LOCKED || state == CYCLE_REBALANCE_BURNED || state == CYCLE_DEPOSIT_PENDING
-                    || state == CYCLE_LOCKED_MAINTENANCE,
+                state == CYCLE_LOCKED || state == CYCLE_REBALANCE_BURNED || state == CYCLE_LOCKED_MAINTENANCE,
                 "Bad cycle"
             );
+            _requireCycleSwapPlan(data);
         } else if (selector == MINT_INITIAL_SELECTOR) {
             require(
-                state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE || state == CYCLE_REBALANCE_BURNED
-                    || state == CYCLE_DEPOSIT_PENDING,
+                state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE || state == CYCLE_REBALANCE_BURNED,
                 "Bad cycle"
             );
+            _requireSwapPlanCompleteOrNone();
         } else if (selector == ADD_LIQUIDITY_SELECTOR) {
-            require(
-                state == CYCLE_LOCKED || state == CYCLE_DEPOSIT_PENDING || state == CYCLE_LOCKED_MAINTENANCE,
-                "Bad cycle"
-            );
+            require(state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE, "Bad cycle");
+            _requireSwapPlanCompleteOrNone();
         }
     }
 
@@ -374,6 +400,9 @@ contract SecureBotModule {
     function _setCycle(uint8 state, bytes4 selector) private {
         botCycleState = state;
         botCycleUpdatedAt = uint64(block.timestamp);
+        if (state == CYCLE_IDLE || state == CYCLE_LOCKED || state == CYCLE_REBALANCE_BURNED) {
+            _clearCycleSwapPlan();
+        }
         emit BotCycleStateUpdated(state, selector);
     }
 
@@ -382,9 +411,51 @@ contract SecureBotModule {
             uint8 previousState = botCycleState;
             botCycleState = CYCLE_IDLE;
             botCycleUpdatedAt = uint64(block.timestamp);
+            _clearCycleSwapPlan();
             emit BotCycleAutoReset(previousState);
             emit BotCycleStateUpdated(CYCLE_IDLE, 0x00000000);
         }
+    }
+
+    function _clearCycleSwapPlan() private {
+        cycleSwapPlanSet = false;
+        cycleSwapZeroForOne = false;
+        cycleSwapExpectedIn = 0;
+        cycleSwapSpentIn = 0;
+    }
+
+    function _requireCycleSwapPlan(bytes calldata data) private {
+        (address tokenIn,, uint256 amountIn,) = abi.decode(data[4:], (address, address, uint256, uint256));
+        IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
+        bool tokenInIsToken0 = tokenIn == rm.token0();
+        if (!cycleSwapPlanSet) {
+            (bool swapNeeded, bool zeroForOne, uint256 expectedAmountIn,,,,,) = rm.getOptimalSwapParams();
+            require(swapNeeded && expectedAmountIn > 0, "No swap plan");
+            cycleSwapPlanSet = true;
+            cycleSwapZeroForOne = zeroForOne;
+            cycleSwapExpectedIn = expectedAmountIn;
+            cycleSwapSpentIn = 0;
+        }
+        require(tokenInIsToken0 == cycleSwapZeroForOne, "Bad swap dir");
+        uint256 tolerance = _cycleSwapTolerance(cycleSwapExpectedIn);
+        require(cycleSwapSpentIn + amountIn <= cycleSwapExpectedIn + tolerance, "Swap too high");
+        cycleSwapSpentIn += amountIn;
+    }
+
+    function _requireSwapPlanCompleteOrNone() private view {
+        if (cycleSwapPlanSet) {
+            uint256 tolerance = _cycleSwapTolerance(cycleSwapExpectedIn);
+            require(cycleSwapSpentIn + tolerance >= cycleSwapExpectedIn, "Swap too low");
+            return;
+        }
+        (bool swapNeeded,, uint256 expectedAmountIn,,,,,) = IRangeManagerBotState(rangeManager).getOptimalSwapParams();
+        require(!swapNeeded || expectedAmountIn == 0, "Swap missing");
+    }
+
+    function _cycleSwapTolerance(uint256 expectedAmountIn) private view returns (uint256 tolerance) {
+        (,,, uint16 toleranceBps,,,,,,) = IRangeManagerBotState(rangeManager).config();
+        tolerance = (expectedAmountIn * uint256(toleranceBps)) / 10000;
+        if (tolerance == 0) tolerance = 1;
     }
 
     function _requireRebalanceTrigger() private view {
@@ -422,8 +493,7 @@ contract SecureBotModule {
 
     function _requireInflowsForSelector(bytes4 selector) private view {
         if (
-            selector == 0xac1df9bd // processSingleDeposit()
-                || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
+            selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
         ) {
             address controller = pauseController;
             // Yul shl order is shl(shift, value): left-align requireInflowsActive().
@@ -448,7 +518,6 @@ contract SecureBotModule {
             || selector == 0x38ca63bc // burnPosition(uint256)
             || selector == 0xb07391c0 // executeSwap(address,address,uint256,uint256)
             || selector == 0x6ecfe0f8 // recordPriceSnapshot()
-            || selector == 0xac1df9bd // processSingleDeposit()
             || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
             || selector == 0x4dce7057 // startRebalance()
             || selector == 0x0040718e // endRebalance()

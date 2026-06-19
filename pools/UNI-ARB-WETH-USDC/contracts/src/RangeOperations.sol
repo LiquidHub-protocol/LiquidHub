@@ -60,9 +60,12 @@ library RangeOperations {
     }
 
     struct ProtectionConfig {
+        // Legacy field names kept for ABI/storage compatibility:
+        // sandwichDetectionEnabled = spot/TWAP guard enabled.
         bool sandwichDetectionEnabled;
         bool mevProtectionEnabled;
         bool failureProtectionEnabled;
+        // sandwichThresholdBps = max spot/TWAP tick drift in bps-like ticks.
         uint16 sandwichThresholdBps;
         uint16 maxOracleDeviationBps;
         // audit V1 (V3) : heartbeats Chainlink PAR FEED (cohérence std/DN). 0 => défaut 90000s (25h) fallback.
@@ -125,6 +128,8 @@ library RangeOperations {
         AggregatorV3Interface token1PriceFeed,
         IUniswapV3Pool pool,
         RangeConfig memory cfg,
+        bool twapGuardEnabled,
+        uint16 maxTwapDeviationBps,
         uint16 maxDeviationBps,
         uint32 maxAge0In,
         uint32 maxAge1In
@@ -167,6 +172,27 @@ library RangeOperations {
         {
             return PriceCache(0, 0, 0, 0, 0, false);
         }
+        if (twapGuardEnabled && _twapDeviationExceeds(pool, tick, maxTwapDeviationBps)) {
+            return PriceCache(0, 0, 0, 0, 0, false);
+        }
+    }
+
+    function _twapDeviationExceeds(IUniswapV3Pool pool, int24 spotTick, uint16 maxTwapDeviationBps)
+        private
+        view
+        returns (bool)
+    {
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = 300;
+        try pool.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
+            int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
+            int24 twapTick = int24(tickDelta / int56(uint56(300)));
+            if (tickDelta < 0 && tickDelta % int56(uint56(300)) != 0) twapTick--;
+            int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
+            return uint24(diff) > uint24(maxTwapDeviationBps);
+        } catch {
+            return false;
+        }
     }
 
     /**
@@ -198,8 +224,8 @@ library RangeOperations {
         // Calculer le nombre de ticks pour chaque cote (ASYMETRIQUE)
         // rangeUpPercent et rangeDownPercent sont en basis points (100 = 1%)
         // 1% de prix ≈ 100 ticks (formule exacte: log(1.01) / log(1.0001) ≈ 99.5)
-        int24 ticksUp = int24(uint24(config.rangeUpPercent)) * 100 / 100;
-        int24 ticksDown = int24(uint24(config.rangeDownPercent)) * 100 / 100;
+        int24 ticksUp = int24(uint24(config.rangeUpPercent));
+        int24 ticksDown = int24(uint24(config.rangeDownPercent));
 
         // Arrondir chaque cote au tickSpacing
         int24 spacingsUp = ticksUp / tickSpacing;
@@ -317,21 +343,8 @@ library RangeOperations {
      * @param positionManager Le gestionnaire de positions
      * @param priceCache Cache des prix actuels
      */
-    /// @notice Vérifie que le prix du POOL (slot0, via poolSqrtPriceX96 du cache) ne diverge pas du prix
-    ///         ORACLE Chainlink (price0/price1) au-delà de maxOracleDeviationBps. Revert sinon (audit V1 — High 1).
-    /// @dev maxDeviationBps=0 => check désactivé (rétrocompat). Cohérent avec le DN.
-    function checkOracleDeviation(
-        PriceCache memory pc,
-        uint16 maxDeviationBps,
-        uint8 token0Decimals,
-        uint8 token1Decimals
-    ) internal pure {
-        require(!_deviationExceeds(pc, maxDeviationBps, token0Decimals, token1Decimals), "Oracle deviation");
-    }
-
     /// @notice Cœur partagé du check de déviation : retourne true si l'écart pool/oracle dépasse le seuil.
-    /// @dev Utilisé par checkOracleDeviation (qui revert) ET par updatePriceCache (qui invalide le cache).
-    ///      Mutualise le calcul pour économiser du bytecode. Miroir exact de la pool DN.
+    /// @dev Utilisé par updatePriceCache, qui invalide le cache pour tous les chemins sensibles.
     function _deviationExceeds(PriceCache memory pc, uint16 maxDeviationBps, uint8 token0Decimals, uint8 token1Decimals)
         internal
         pure
@@ -721,7 +734,7 @@ library RangeOperations {
         //
         // Le ratio de VALEUR (pas de quantite) est:
         // value0 = amount0 * price = amount0 * sqrtPrice^2
-        // value1 = amount1 * 1 (si token1 = stablecoin)
+        // value1 est exprime dans la meme unite relative de pool; les valorisations USD utilisent price1 ailleurs.
         //
         // ratio0 = value0 / (value0 + value1)
 
@@ -781,7 +794,7 @@ library RangeOperations {
         returns (bool zeroForOne, uint256 amountIn)
     {
         IRmDeposit rm = IRmDeposit(rangeManager);
-        (uint128 price0, uint128 price1, uint160 sp, int24 tk, uint64 ts, bool valid) = rm.priceCache();
+        (uint128 price0, uint128 price1, uint160 sp, int24 tk,, bool valid) = rm.priceCache();
         if (!valid) return (false, 0);
         (, uint8 dec0, uint8 dec1,,,,,,,) = rm.config();
 
@@ -795,20 +808,11 @@ library RangeOperations {
         uint256[] memory positions = rm.getOwnerPositions();
         uint256 ratioBps;
         if (positions.length > 0) {
-            PriceCache memory pc = PriceCache({
-                price0: price0,
-                price1: price1,
-                poolSqrtPriceX96: sp,
-                poolTick: tk,
-                timestamp: ts,
-                valid: valid
-            });
             (,,,,, int24 tickLower, int24 tickUpper,,,,,) = rm.positionManager().positions(positions[0]);
-            ratioBps = calculateOptimalRatio(tickLower, tickUpper, pc.poolTick, pc.poolSqrtPriceX96);
+            ratioBps = calculateOptimalRatio(tickLower, tickUpper, tk, sp);
         } else {
             ratioBps = 5000;
         }
-        if (ratioBps > 10000) ratioBps = 10000;
         uint256 targetV0 = (tot * ratioBps) / 10000;
 
         if (v0 > targetV0) {

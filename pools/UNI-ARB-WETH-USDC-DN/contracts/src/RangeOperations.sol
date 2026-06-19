@@ -47,9 +47,12 @@ library RangeOperations {
     }
 
     struct ProtectionConfig {
+        // Legacy field names kept for ABI/storage compatibility:
+        // sandwichDetectionEnabled = spot/TWAP guard enabled.
         bool sandwichDetectionEnabled;
         bool mevProtectionEnabled;
         bool failureProtectionEnabled;
+        // sandwichThresholdBps = max spot/TWAP tick drift in bps-like ticks.
         uint16 sandwichThresholdBps;
         uint16 maxOracleDeviationBps;
         // audit V1 (V3) : âge max par feed Chainlink (secondes). Différent par feed (ETH/USD vs USDC/USD
@@ -113,6 +116,8 @@ library RangeOperations {
         AggregatorV3Interface token1PriceFeed,
         IUniswapV3Pool pool,
         RangeConfig memory cfg,
+        bool twapGuardEnabled,
+        uint16 maxTwapDeviationBps,
         uint16 maxDeviationBps,
         uint32 maxAge0In,
         uint32 maxAge1In
@@ -158,6 +163,27 @@ library RangeOperations {
         {
             return PriceCache(0, 0, 0, 0, 0, false);
         }
+        if (twapGuardEnabled && _twapDeviationExceeds(pool, tick, maxTwapDeviationBps)) {
+            return PriceCache(0, 0, 0, 0, 0, false);
+        }
+    }
+
+    function _twapDeviationExceeds(IUniswapV3Pool pool, int24 spotTick, uint16 maxTwapDeviationBps)
+        private
+        view
+        returns (bool)
+    {
+        uint32[] memory secondsAgos = new uint32[](2);
+        secondsAgos[0] = 300;
+        try pool.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
+            int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
+            int24 twapTick = int24(tickDelta / int56(uint56(300)));
+            if (tickDelta < 0 && tickDelta % int56(uint56(300)) != 0) twapTick--;
+            int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
+            return uint24(diff) > uint24(maxTwapDeviationBps);
+        } catch {
+            return false;
+        }
     }
 
     /**
@@ -189,8 +215,8 @@ library RangeOperations {
         // Calculer le nombre de ticks pour chaque cote (ASYMETRIQUE)
         // rangeUpPercent et rangeDownPercent sont en basis points (100 = 1%)
         // 1% de prix ≈ 100 ticks (formule exacte: log(1.01) / log(1.0001) ≈ 99.5)
-        int24 ticksUp = int24(uint24(config.rangeUpPercent)) * 100 / 100;
-        int24 ticksDown = int24(uint24(config.rangeDownPercent)) * 100 / 100;
+        int24 ticksUp = int24(uint24(config.rangeUpPercent));
+        int24 ticksDown = int24(uint24(config.rangeDownPercent));
 
         // Arrondir chaque cote au tickSpacing
         int24 spacingsUp = ticksUp / tickSpacing;
@@ -308,25 +334,8 @@ library RangeOperations {
      * @param positionManager Le gestionnaire de positions
      * @param priceCache Cache des prix actuels
      */
-    /// @notice Vérifie que le prix du POOL (slot0, via poolSqrtPriceX96 du cache) ne diverge pas du prix
-    ///         ORACLE Chainlink (price0/price1) au-delà de maxOracleDeviationBps. Revert sinon (audit V1 — High 1).
-    /// @dev Active enfin la config maxOracleDeviationBps (jusque-là morte). Les shares utilisent l'oracle et
-    ///      la composition LP utilise slot0 : si les deux divergent (pool manipulé/stale), mint/rebalance/
-    ///      deposit deviennent dangereux. maxDeviationBps=0 => check désactivé (rétrocompat).
-    ///      Calcul: prixPool(token1 par token0, échelle 1e18) depuis sqrtPriceX96 ; prixOracle = price0/price1
-    ///      ramené à la même échelle en tenant compte des décimales tokens. Compare l'écart relatif en bps.
-    function checkOracleDeviation(
-        PriceCache memory pc,
-        uint16 maxDeviationBps,
-        uint8 token0Decimals,
-        uint8 token1Decimals
-    ) public pure {
-        require(!_deviationExceeds(pc, maxDeviationBps, token0Decimals, token1Decimals), "Oracle deviation");
-    }
-
     /// @notice Cœur partagé du check de déviation : retourne true si l'écart pool/oracle dépasse le seuil.
-    /// @dev Utilisé par checkOracleDeviation (qui revert) ET par updatePriceCache (qui invalide le cache).
-    ///      Mutualise le calcul pour économiser du bytecode. maxDeviationBps=0 ou cache incomplet => false.
+    /// @dev Utilisé par updatePriceCache, qui invalide le cache pour tous les chemins sensibles.
     function _deviationExceeds(PriceCache memory pc, uint16 maxDeviationBps, uint8 token0Decimals, uint8 token1Decimals)
         internal
         pure
@@ -697,7 +706,7 @@ library RangeOperations {
     }
 
     // getCurrentPortfolioValue (version "spot std") RETIRÉE en DN (nettoyage EIP-170) : le Vault DN a sa
-    // PROPRE valorisation hedge-aware (collat − dette + WETH libre), cette version spot n'est jamais appelée.
+    // PROPRE valorisation hedge-aware (collat - dette + token0 libre), cette version spot n'est jamais appelée.
 
     /**
      * @notice Calcule le ratio optimal de tokens pour une position dans un range donne
@@ -734,7 +743,7 @@ library RangeOperations {
         //
         // Le ratio de VALEUR (pas de quantite) est:
         // value0 = amount0 * price = amount0 * sqrtPrice^2
-        // value1 = amount1 * 1 (si token1 = stablecoin)
+        // value1 est exprime dans la meme unite relative de pool; les valorisations USD utilisent price1 ailleurs.
         //
         // ratio0 = value0 / (value0 + value1)
 
@@ -1545,10 +1554,10 @@ library RangeOperations {
     ///      Tous en USD 8 déc, sauf bps. r = part token0 en valeur dans la LP (bps).
     struct HedgeDepositParams {
         uint256 investableUsd; // D : capital investissable du nouveau dépôt (USD 8 déc)
-        uint256 wethLpExistingUsd; // W0 : exposition token0 LP existante (USD 8 déc)
-        uint256 debtUsd; // dette WETH AAVE existante (USD 8 déc)
-        uint256 idleHmUsd; // WETH libre HedgeManager, filtré dust (USD 8 déc)
-        uint256 idleRmUsd; // WETH libre RangeManager, filtré dust (USD 8 déc)
+        uint256 wethLpExistingUsd; // W0 : exposition token0 LP existante (USD 8 déc), nom historique
+        uint256 debtUsd; // dette token0 AAVE existante (USD 8 déc)
+        uint256 idleHmUsd; // token0 libre HedgeManager, filtré dust (USD 8 déc)
+        uint256 idleRmUsd; // token0 libre RangeManager, filtré dust (USD 8 déc)
         uint16 hedgeTargetBps; // H : cible de hedge (10000 = 100%)
         uint16 rBps; // r : part token0 en valeur dans la LP (bps), dérivée du range réel
         uint16 ltvBps; // L : LTV AAVE = liqThresholdBps * 10000 / reserveHfTargetBps (bps)

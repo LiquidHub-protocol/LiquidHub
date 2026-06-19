@@ -58,9 +58,16 @@ cannot mint a distorted share amount by manipulating the pool's instantaneous pr
 ### Pool-vs-oracle deviation guard
 Before any value-sensitive action (mint, rebalance, swap, deposit processing, withdraw), the contracts compare
 the **pool price (`slot0`)** against the **Chainlink oracle price**. If they diverge beyond a governance bound
-(`MAX_ORACLE_DEVIATION_BPS`, default 5%), the price cache is invalidated and the action **reverts** (`"Oracle deviation"` / `"E38"`).
+(`MAX_ORACLE_DEVIATION_BPS`, current deployment target 1%), the price cache is invalidated and the action **reverts** (`"Oracle deviation"` / `"E38"`).
 On the Delta-Neutral pool, `adjustHedge()` has an analogous guard (`MAX_HEDGE_DEVIATION_BPS`, `"LP price deviation"`)
 so a manipulated LP price cannot trigger a wasteful borrow/repay.
+
+### Spot-vs-TWAP guard
+Sensitive LP actions also compare the current Uniswap spot tick against a 300-second TWAP. The governance-configured
+guard (`TWAP_GUARD_ENABLED`, `MAX_TWAP_DEVIATION_BPS`, current target 50 bps) invalidates the price cache when the
+spot price diverges too far from the warm TWAP. During initial deployment, if the pool does not yet have enough
+`observe(300s)` history, the guard bypasses temporarily and becomes effective automatically once the observation
+history exists.
 
 ### Per-feed staleness
 Each Chainlink feed has its own maximum age (`MAX_AGE0` / `MAX_AGE1`, per-feed heartbeats). A price older than

@@ -23,6 +23,8 @@ interface IRangeManagerPostCheck {
         external
         view
         returns (bool hasPosition, uint256 tokenId, bool shouldRebalance, string memory action, string memory reason);
+
+    function getOptimalSwapParams() external view returns (RangeOperations.OptimalSwapParams memory);
 }
 
 contract SecureBotModule {
@@ -44,6 +46,10 @@ contract SecureBotModule {
     bool public directExecution;
     uint8 public botCycleState;
     uint64 public botCycleUpdatedAt;
+    bool private cycleSwapPlanSet;
+    bool private cycleSwapZeroForOne;
+    uint256 private cycleSwapExpectedIn;
+    uint256 private cycleSwapSpentIn;
 
     // Audit V3 (Point 2) : endRebalance() est EXEMPTE de la limite quotidienne dans executeVaultFunction.
     // C'est un DEVERROUILLAGE (il ne deplace aucun fonds, il libere depots/retraits) : si la limite est
@@ -205,7 +211,7 @@ contract SecureBotModule {
     {
         bytes4 selector = bytes4(data[:4]);
         _requireInflowsForSelector(selector);
-        _beforeRangeManagerCall(selector);
+        _beforeRangeManagerCall(selector, data);
 
         _execute(rangeManager, 0, data);
         if (selector == MINT_INITIAL_SELECTOR || selector == ADD_LIQUIDITY_SELECTOR) _requirePostLiquidityHedgeOk();
@@ -376,7 +382,7 @@ contract SecureBotModule {
         }
     }
 
-    function _beforeRangeManagerCall(bytes4 selector) private {
+    function _beforeRangeManagerCall(bytes4 selector, bytes calldata data) private {
         _autoResetStaleCycle();
         uint8 state = botCycleState;
         if (selector == BURN_SELECTOR) {
@@ -387,13 +393,16 @@ contract SecureBotModule {
                 state == CYCLE_LOCKED || state == CYCLE_REBALANCE_BURNED || state == CYCLE_LOCKED_MAINTENANCE,
                 "Bad cycle"
             );
+            _requireCycleSwapPlan(data);
         } else if (selector == MINT_INITIAL_SELECTOR) {
             require(
                 state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE || state == CYCLE_REBALANCE_BURNED,
                 "Bad cycle"
             );
+            _requireSwapPlanCompleteOrNone();
         } else if (selector == ADD_LIQUIDITY_SELECTOR) {
             require(state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE, "Bad cycle");
+            _requireSwapPlanCompleteOrNone();
         }
     }
 
@@ -413,6 +422,9 @@ contract SecureBotModule {
     function _setCycle(uint8 state, bytes4 selector) private {
         botCycleState = state;
         botCycleUpdatedAt = uint64(block.timestamp);
+        if (state == CYCLE_IDLE || state == CYCLE_LOCKED || state == CYCLE_REBALANCE_BURNED) {
+            _clearCycleSwapPlan();
+        }
         emit BotCycleStateUpdated(state, selector);
     }
 
@@ -421,9 +433,51 @@ contract SecureBotModule {
             uint8 previousState = botCycleState;
             botCycleState = CYCLE_IDLE;
             botCycleUpdatedAt = uint64(block.timestamp);
+            _clearCycleSwapPlan();
             emit BotCycleAutoReset(previousState);
             emit BotCycleStateUpdated(CYCLE_IDLE, 0x00000000);
         }
+    }
+
+    function _clearCycleSwapPlan() private {
+        cycleSwapPlanSet = false;
+        cycleSwapZeroForOne = false;
+        cycleSwapExpectedIn = 0;
+        cycleSwapSpentIn = 0;
+    }
+
+    function _requireCycleSwapPlan(bytes calldata data) private {
+        (address tokenIn,, uint256 amountIn,) = abi.decode(data[4:], (address, address, uint256, uint256));
+        IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
+        bool tokenInIsToken0 = tokenIn == rm.token0();
+        if (!cycleSwapPlanSet) {
+            RangeOperations.OptimalSwapParams memory plan = rm.getOptimalSwapParams();
+            require(plan.swapNeeded && plan.amountIn > 0, "No swap plan");
+            cycleSwapPlanSet = true;
+            cycleSwapZeroForOne = plan.zeroForOne;
+            cycleSwapExpectedIn = plan.amountIn;
+            cycleSwapSpentIn = 0;
+        }
+        require(tokenInIsToken0 == cycleSwapZeroForOne, "Bad swap dir");
+        uint256 tolerance = _cycleSwapTolerance(cycleSwapExpectedIn);
+        require(cycleSwapSpentIn + amountIn <= cycleSwapExpectedIn + tolerance, "Swap too high");
+        cycleSwapSpentIn += amountIn;
+    }
+
+    function _requireSwapPlanCompleteOrNone() private view {
+        if (cycleSwapPlanSet) {
+            uint256 tolerance = _cycleSwapTolerance(cycleSwapExpectedIn);
+            require(cycleSwapSpentIn + tolerance >= cycleSwapExpectedIn, "Swap too low");
+            return;
+        }
+        RangeOperations.OptimalSwapParams memory plan = IRangeManagerPostCheck(rangeManager).getOptimalSwapParams();
+        require(!plan.swapNeeded || plan.amountIn == 0, "Swap missing");
+    }
+
+    function _cycleSwapTolerance(uint256 expectedAmountIn) private view returns (uint256 tolerance) {
+        RangeOperations.RangeConfig memory cfg = IRangeManagerPostCheck(rangeManager).config();
+        tolerance = (expectedAmountIn * uint256(cfg.toleranceBps)) / 10000;
+        if (tolerance == 0) tolerance = 1;
     }
 
     function _requireRebalanceTrigger() private view {

@@ -16,7 +16,7 @@ Anyone can run a keeper bot to perform the protocol's permissionless actions for
 Each cycle the keeper:
 
 1. Calls `getBotInstructions()` on the `RangeManager`; if `needsRebalance` is `true`, executes `rebalance()`.
-2. Reads `getPendingDepositsCount()`; if `> 0`, a position NFT exists, and the vault is not locked, calls `processDepositPermissionless()` to process one queued deposit (atomic; reverts if the queue is empty, no NFT exists, or the oracle cache is stale).
+2. Reads `getPendingDepositsCount()`; if `> 0`, a position NFT exists, and the vault is not locked, calls `processDepositPermissionless()` to process one queued deposit (atomic; reverts if the queue is empty, no NFT exists for a community keeper, or the oracle cache is stale).
 3. Calls `isSnapshotDue()`; if `true`, calls `recordPriceSnapshot()` (the contract reverts if a snapshot is not yet due).
 4. **(DN only)** Tries `adjustHedge()`; it executes only if the hedge drift exceeds the on-chain threshold, otherwise it reverts (no-op).
 5. After any successful action, the bounty is paid from the Treasury (if enabled).
