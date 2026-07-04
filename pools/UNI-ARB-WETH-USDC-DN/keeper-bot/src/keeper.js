@@ -148,10 +148,10 @@ async function main() {
             console.log(`  [UNI-ARB-WETH-USDC-DN] No AAVE position (collateral=$${totalCollateralUSD.toFixed(2)}, debt=$${totalDebtUSD.toFixed(2)}) — skip`);
           } else {
             const hfFloat = Number(healthFactor) / 1e18;
-            const warnThreshold = parseFloat(process.env.AAVE_HEALTH_WARN || '1.25');
+            const warnThreshold = parseFloat(process.env.AAVE_HEALTH_WARN || '1.40');
             let status = 'OK';
-            if (hfFloat < parseFloat(process.env.AAVE_HEALTH_EMERGENCY || '1.05')) status = 'EMERGENCY';
-            else if (hfFloat < parseFloat(process.env.AAVE_HEALTH_DELEVERAGE || '1.15')) status = 'DELEVERAGE';
+            if (hfFloat < parseFloat(process.env.AAVE_HEALTH_EMERGENCY || '1.15')) status = 'EMERGENCY';
+            else if (hfFloat < parseFloat(process.env.AAVE_HEALTH_DELEVERAGE || '1.25')) status = 'DELEVERAGE';
             else if (hfFloat < warnThreshold) status = 'WARNING';
             console.log(`  AAVE: collateral=$${totalCollateralUSD.toFixed(2)}, debt=$${totalDebtUSD.toFixed(2)}, HF=${hfFloat.toFixed(4)} (${status})`);
           }
@@ -215,7 +215,8 @@ async function main() {
       // DN refactor: adjustHedge() pilots on the net effective short (debt - free WETH HM - free WETH RM)
       // vs target (hedgeTargetBps × wethInLP). It only corrects an OVER-HEDGE (repay excess, WETH bought
       // on the market). On an UNDER-HEDGE it REVERTS (custom error UnderHedged) — the staticCall below
-      // catches it so we never send a tx for nothing. It also REVERTS when drift < adjustHedgeBps or the
+      // catches it so we never send a tx for nothing. It also REVERTS when drift is below the dynamic
+      // range-width threshold returned by adjustHedgeBps(), or when the
       // on-chain cooldown (hedgeAdjustCooldown) has not elapsed. A successful (over-hedge) call earns the bounty.
       if (!CHECK_ONLY && hedgeSigner) {
         try {
@@ -249,7 +250,7 @@ async function main() {
           // Cooldown skip already logged above — swallow it silently.
           if (e && e.__cooldownSkip) { /* already logged */ }
           else {
-            // Revert is expected here: under-hedge (UnderHedged), drift < adjustHedgeBps, or cooldown. Not fatal.
+            // Revert is expected here: under-hedge (UnderHedged), drift below dynamic threshold, or cooldown. Not fatal.
             console.log(`  Hedge: no adjustment (${(e.reason || e.message || '').slice(0, 80)})`);
           }
         }

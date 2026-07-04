@@ -7,6 +7,7 @@ const RANGEMANAGER_ABI = [
   "function getOptimalSwapParams() external view returns (tuple(bool swapNeeded, bool zeroForOne, uint256 amountIn, uint256 currentBalance0, uint256 currentBalance1, uint256 targetRatio0Bps, int24 tickLower, int24 tickUpper))",
   "function getPositionDetails(uint256 tokenId) external view returns (bool inRange, int24 tickLower, int24 tickUpper, uint128 liquidity, int24 currentTick)",
   "function priceCache() external view returns (uint128 price0, uint128 price1, uint160 poolSqrtPriceX96, int24 poolTick, uint64 timestamp, bool valid)",
+  "function refreshPriceCache() external",
   "function isSystemOperational() external view returns (bool)",
   "function config() external view returns (uint24 fee, uint8 token0Decimals, uint8 token1Decimals, uint16 toleranceBps, uint24 maxSlippageBps, uint64 lastRebalanceTime, bool oraclesConfigured, uint16 rangeUpPercent, uint16 rangeDownPercent, uint32 maxPositions)",
   "function initMultiSwapTvl() external view returns (uint256)",
@@ -17,7 +18,7 @@ const RANGEMANAGER_ABI = [
   // A successful call pays the metrics bounty (USDC) from the Treasury to msg.sender.
   "function recordPriceSnapshot() external",
   "function isSnapshotDue() external view returns (bool)",
-  "function dynRangeConfig() external view returns (bool dynamicRangeEnabled, uint8 maxSnapshotsPerDay, uint8 volatMoyDay, uint8 volatTrimDay, uint16 rangeStepBps, uint16 rangeMultiplicatorBps, uint64 lastSnapshotAt)",
+  "function dynRangeConfig() external view returns (bool dynamicRangeEnabled, uint8 maxSnapshotsPerDay, uint8 volatMoyDay, uint8 volatTrimDay, uint16 rangeStepBps, uint16 rangeMultiplicatorBps, uint16 rangeMinBps, uint16 rangeMaxBps, uint64 lastSnapshotAt)",
   // getOwnerPositions: confirme qu'un NFT existe (depot permissionless interdit si aucune position)
   "function getOwnerPositions() external view returns (uint256[] memory)"
 ];
@@ -35,6 +36,7 @@ const VAULT_ABI = [
   // AUDIT H-01/H-03 : plan de swap du PROCHAIN dépôt (état post-transfert, ratio NFT existant). À utiliser
   // pour le dépôt (PAS getOptimalSwapParams du RangeManager, qui reflète l état rebalance/post-burn).
   "function getDepositSwapParams() external view returns (bool zeroForOne, uint256 amountIn)",
+  "function syncFeesForDeposits() external",
   "function isRebalancing() external view returns (bool)"
 ];
 

@@ -18,6 +18,7 @@ interface IHedgeDep {
         view
         returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase);
     function hedgeTargetBps() external view returns (uint16);
+    function criticalHedgeRangeDivisor() external view returns (uint16);
     function reserveHfTargetBps() external view returns (uint16);
     function liqThresholdBps() external view returns (uint16);
     function donationDustToken0() external view returns (uint256); // filtre dust cohérent (audit M-02)
@@ -372,6 +373,23 @@ library DnDepositLib {
         if (cappedAmountInMaximum > budget) cappedAmountInMaximum = budget;
     }
 
+    function aaveReserveExcessStable(
+        address aavePool,
+        uint256 fallbackLiqThresholdBps,
+        uint256 targetHfBps,
+        address rangeManager,
+        uint8 stableDecimals
+    ) external view returns (uint256 excessStable) {
+        (uint256 collateralBase, uint256 debtBase,, uint256 liveThreshold,,) =
+            IAavePoolDep(aavePool).getUserAccountData(address(this));
+        if (debtBase == 0 || collateralBase == 0) return 0;
+        uint256 liquidationThresholdBps = liveThreshold > 0 ? liveThreshold : fallbackLiqThresholdBps;
+        if (liquidationThresholdBps == 0) return 0;
+        uint256 collateralTargetBase = (debtBase * targetHfBps) / liquidationThresholdBps;
+        if (collateralBase <= collateralTargetBase) return 0;
+        return _aaveBaseToStable(collateralBase - collateralTargetBase, rangeManager, stableDecimals);
+    }
+
     function _requireSwapPlan(
         uint256 expectedAmountIn,
         bool expectedZeroForOne,
@@ -408,12 +426,13 @@ library DnDepositLib {
         address token0 = rm.token0();
 
         // effectiveShort = dette - token0 idle (HM + RM, filtre dust), en USD 8 dec. C'est le short FIXE a couvrir.
+        // Si idle >= dette, la cible token0 LP est 0 : le rebalance doit pouvoir vendre le token0 LP restant
+        // vers token1 au lieu de retourner "no swap", sinon le post-check DN resterait impossible a satisfaire.
         uint256 dustTok0 = hm.donationDustToken0();
         uint256 debtUsd = _toUsd(hm.getWethDebt(), price0, dec0);
         uint256 idleUsd = _toUsd(_dust(hm.getWethBalance(), dustTok0), price0, dec0)
             + _toUsd(_dust(IERC20(token0).balanceOf(rangeManager), dustTok0), price0, dec0);
-        if (debtUsd <= idleUsd) return (false, 0); // pas de short net positif → rien à viser
-        uint256 effShortUsd = debtUsd - idleUsd;
+        uint256 effShortUsd = debtUsd > idleUsd ? debtUsd - idleUsd : 0;
 
         uint256 H = hm.hedgeTargetBps();
         if (H == 0) return (false, 0);
@@ -438,6 +457,8 @@ library DnDepositLib {
     }
 
     /// @notice Post-check DN après addLiquidity (DÉPÔT). Revert PreAdjustRequired si hors tolérance/HF.
+    /// @dev maxDriftBps est un plafond configuré ; le seuil effectif est resserré au seuil critique dynamique
+    ///      quand le range courant est étroit, afin qu'un dépôt ne puisse pas ressortir déjà "critique".
     function postCheckDepositHedge(
         Addrs calldata a,
         uint128 price0,
@@ -467,6 +488,7 @@ library DnDepositLib {
 
     /// @dev Cœur du post-check DN (partagé dépôt + rebalance). Audit H-03/M-02 : dette EXACTE (getWethDebt),
     ///      wethInLp = NFT seulement (total − libre RM, pas de double comptage avec idleRm), filtre dust cohérent.
+    ///      Le drift max effectif = min(maxDriftBps configuré, seuil critique dynamique range/divisor).
     function _postCheck(
         address hedgeManager,
         address rangeManager,
@@ -477,7 +499,8 @@ library DnDepositLib {
         uint256 dustFloorUsd
     ) private view {
         IHedgeDep hm = IHedgeDep(hedgeManager);
-        (bool ok,) = _driftBps(hedgeManager, rangeManager, token0, price0, dec0, maxDriftBps, dustFloorUsd);
+        uint16 effectiveMaxDriftBps = _postCheckMaxDriftBps(hedgeManager, rangeManager, maxDriftBps);
+        (bool ok,) = _driftBps(hedgeManager, rangeManager, token0, price0, dec0, effectiveMaxDriftBps, dustFloorUsd);
         if (!ok) revert PreAdjustRequired();
 
         if (_toUsd(hm.getWethDebt(), price0, dec0) > 0) {
@@ -485,6 +508,20 @@ library DnDepositLib {
             uint256 hfMin = (uint256(hm.reserveHfTargetBps()) * 1e18) / 10000;
             if (hf < hfMin) revert PreAdjustRequired();
         }
+    }
+
+    /// @dev Le post-check garde le paramètre .env comme plafond, puis se resserre automatiquement avec le range.
+    function _postCheckMaxDriftBps(address hedgeManager, address rangeManager, uint16 configuredMaxBps)
+        private
+        view
+        returns (uint16)
+    {
+        uint16 effectiveMaxBps = configuredMaxBps;
+        try IHedgeDep(hedgeManager).criticalHedgeRangeDivisor() returns (uint16 divisor) {
+            uint16 criticalBps = _rangeHedgeThresholdBps(rangeManager, divisor, 250);
+            if (criticalBps < effectiveMaxBps) effectiveMaxBps = criticalBps;
+        } catch {}
+        return effectiveMaxBps;
     }
 
     /// @dev Cœur de lecture du drift DN on-chain (effectiveShort vs cible). Retourne (ok, driftBps).
@@ -527,8 +564,58 @@ library DnDepositLib {
     ) external view returns (bool) {
         address hedgeManager = IVaultDep(IRmDep(rangeManager).vault()).hedgeManager();
         if (hedgeManager == address(0)) return false;
-        (bool ok,) = _driftBps(hedgeManager, rangeManager, token0, price0, dec0, critBps, dustFloorUsd);
-        return !ok; // ok == drift <= critBps ; donc !ok == drift > critBps (critique)
+        uint16 effectiveCritBps = critBps;
+        try IHedgeDep(hedgeManager).criticalHedgeRangeDivisor() returns (uint16 divisor) {
+            uint16 dynamicCritBps = _rangeHedgeThresholdBps(rangeManager, divisor, 250);
+            if (dynamicCritBps < effectiveCritBps) effectiveCritBps = dynamicCritBps;
+        } catch {}
+        (bool ok,) = _driftBps(hedgeManager, rangeManager, token0, price0, dec0, effectiveCritBps, dustFloorUsd);
+        return !ok; // ok == drift <= seuil critique effectif ; donc !ok == drift > seuil critique (critique)
+    }
+
+    /// @notice Seuil dynamique depuis la config range d'un RangeManager.
+    function rangeHedgeThresholdBps(address rangeManager, uint16 rangeDivisor, uint16 floorBps)
+        external
+        view
+        returns (uint16)
+    {
+        return _rangeHedgeThresholdBps(rangeManager, rangeDivisor, floorBps);
+    }
+
+    /// @notice Calcule un seuil hedge dynamique depuis la largeur du range courant.
+    /// @dev threshold = max(floorBps, (rangeUpBps + rangeDownBps) / rangeDivisor).
+    ///      Exemple: divisor=4 => range ±2% (400 bps wide) => 100 bps ; range ±5% => 250 bps.
+    function dynamicHedgeThresholdBps(uint16 rangeUpBps, uint16 rangeDownBps, uint16 rangeDivisor, uint16 floorBps)
+        external
+        pure
+        returns (uint16)
+    {
+        return _dynamicHedgeThresholdBps(rangeUpBps, rangeDownBps, rangeDivisor, floorBps);
+    }
+
+    function _rangeHedgeThresholdBps(address rangeManager, uint16 rangeDivisor, uint16 floorBps)
+        private
+        view
+        returns (uint16)
+    {
+        if (rangeManager == address(0)) return floorBps;
+        (bool ok, bytes memory data) = rangeManager.staticcall(abi.encodeWithSelector(IRmDep.config.selector));
+        if (!ok || data.length < 320) return floorBps;
+        (,,,,,,, uint16 rangeUpBps, uint16 rangeDownBps,) =
+            abi.decode(data, (uint24, uint8, uint8, uint16, uint24, uint64, bool, uint16, uint16, uint32));
+        return _dynamicHedgeThresholdBps(rangeUpBps, rangeDownBps, rangeDivisor, floorBps);
+    }
+
+    function _dynamicHedgeThresholdBps(uint16 rangeUpBps, uint16 rangeDownBps, uint16 rangeDivisor, uint16 floorBps)
+        private
+        pure
+        returns (uint16)
+    {
+        if (rangeDivisor == 0) return floorBps;
+        uint256 threshold = (uint256(rangeUpBps) + uint256(rangeDownBps)) / uint256(rangeDivisor);
+        if (threshold < uint256(floorBps)) threshold = uint256(floorBps);
+        if (threshold > type(uint16).max) threshold = type(uint16).max;
+        return uint16(threshold);
     }
 
     /// @notice Composition token0 du NFT LP + ticks, utilisée par AaveHedgeManager.adjustHedge().
@@ -610,7 +697,12 @@ library DnDepositLib {
             if (tickDelta < 0 && tickDelta % int56(uint56(300)) != 0) twapTick--;
             int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
             require(uint24(diff) <= uint24(maxTwapDeviationBps), "LP TWAP");
-        } catch {}
+        } catch {
+            // Same policy as RangeOperations: fail-open only while the pool has not written enough
+            // observations for a 300s TWAP. After warm-up, unavailable TWAP is unsafe for hedge actions.
+            (,,, uint16 observationCardinality,,,) = pool.slot0();
+            require(observationCardinality < 2, "LP TWAP unavailable");
+        }
     }
 
     // ===== helpers internes (inlinés dans la library) =====

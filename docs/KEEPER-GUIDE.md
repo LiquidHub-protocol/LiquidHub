@@ -83,9 +83,9 @@ This prints the current pool state, whether a rebalance is needed, and the curre
 | Variable | Description |
 |----------|-------------|
 | `AAVE_HEDGE_MANAGER_ADDRESS` | AaveHedgeManager contract address |
-| `AAVE_HEALTH_WARN` | Health factor warn threshold (e.g., 1.25) |
-| `AAVE_HEALTH_DELEVERAGE` | Health factor deleverage threshold (e.g., 1.15) |
-| `AAVE_HEALTH_EMERGENCY` | Health factor emergency threshold (e.g., 1.05) |
+| `AAVE_HEALTH_WARN` | Health factor warn threshold (e.g., 1.40 when reserve target is 1.40) |
+| `AAVE_HEALTH_DELEVERAGE` | Health factor critical/deleverage threshold (e.g., 1.25) |
+| `AAVE_HEALTH_EMERGENCY` | Health factor emergency threshold (e.g., 1.15) |
 
 ---
 

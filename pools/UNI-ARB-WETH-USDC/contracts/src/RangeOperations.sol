@@ -35,6 +35,9 @@ interface IRmDeposit {
 library RangeOperations {
     using SafeERC20 for IERC20;
 
+    int24 private constant MIN_TICK = -887272;
+    int24 private constant MAX_TICK = 887272;
+
     // ===== STRUCTS (partages) =====
 
     struct RangeConfig {
@@ -112,6 +115,8 @@ library RangeOperations {
         uint8 volatTrimDay; // nombre d'extremes hauts ET bas retires (trim des pics)
         uint16 rangeStepBps; // palier d'arrondi du range, ex 50 = 0,5%
         uint16 rangeMultiplicatorBps; // facteur d'amplitude, 10000 = x1,0 ; 12500 = x1,25 ; 8000 = x0,8
+        uint16 rangeMinBps; // borne basse par cote du range dynamique (ex 100 = +/-1%)
+        uint16 rangeMaxBps; // borne haute par cote du range dynamique (ex 1000 = +/-10%)
         uint64 lastSnapshotAt; // timestamp du dernier snapshot (timing regulier)
     }
 
@@ -191,7 +196,10 @@ library RangeOperations {
             int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
             return uint24(diff) > uint24(maxTwapDeviationBps);
         } catch {
-            return false;
+            // Warm-up only: bypass if Uniswap has not written enough observations yet. Once at least two
+            // observations exist, an observe(300s) failure is treated as unsafe and invalidates the cache.
+            (,,, uint16 observationCardinality,,,) = pool.slot0();
+            return observationCardinality > 1;
         }
     }
 
@@ -497,6 +505,9 @@ library RangeOperations {
         });
 
         (tokenId, liquidity,,) = positionManager.mint(mintParams);
+
+        IERC20(token0).safeApprove(address(positionManager), 0);
+        IERC20(token1).safeApprove(address(positionManager), 0);
     }
 
     // audit V1 (M3-B-fix3, retour Codex) : collectAndRemoveLiquidity() SUPPRIMEE — helper externe mort (aucun
@@ -959,7 +970,7 @@ library RangeOperations {
         INonfungiblePositionManager positionManager,
         uint24 maxSlippageBps
     ) private returns (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) {
-        return positionManager.increaseLiquidity(
+        (liquidity, amount0Added, amount1Added) = positionManager.increaseLiquidity(
             INonfungiblePositionManager.IncreaseLiquidityParams({
                 tokenId: tokenId,
                 amount0Desired: amount0Desired,
@@ -969,11 +980,19 @@ library RangeOperations {
                 deadline: block.timestamp + 300
             })
         );
+        // Clear any unused approval left after Uniswap consumed less than desired.
+        // This keeps repeated LP operations safe without changing bot/keeper flows.
+        address token0Addr;
+        address token1Addr;
+        (,, token0Addr, token1Addr,,,,,,,,) = positionManager.positions(tokenId);
+        IERC20(token0Addr).safeApprove(address(positionManager), 0);
+        IERC20(token1Addr).safeApprove(address(positionManager), 0);
     }
 
     function _minWithSlippage(uint256 amount, uint24 slippageBps) private pure returns (uint256) {
         if (amount == 0) return 0;
-        uint256 slip = slippageBps >= 10000 ? 9999 : uint256(slippageBps);
+        require(slippageBps < 10000, "bad slippage");
+        uint256 slip = uint256(slippageBps);
         return (amount * (10000 - slip)) / 10000;
     }
 
@@ -1044,7 +1063,7 @@ library RangeOperations {
             _isAlignedToTickSpacing(tickLower, tickSpacing) && _isAlignedToTickSpacing(tickUpper, tickSpacing),
             "Tick spacing misalignment"
         );
-        require(tickLower >= -887272 && tickUpper <= 887272, "Tick out of bounds");
+        require(tickLower >= MIN_TICK && tickUpper <= MAX_TICK, "Tick out of bounds");
         require(tickUpper - tickLower >= int24(int256(tickSpacing) * int256(10)), "Range too narrow");
         require(tickLower >= currentTick - 50000 && tickUpper <= currentTick + 50000, "Range too wide");
     }
@@ -1054,16 +1073,20 @@ library RangeOperations {
      * @dev Gere correctement les nombres negatifs (ex: -196327 avec spacing 10 -> -196330)
      */
     function _floorToTickSpacing(int24 tick, int24 tickSpacing) private pure returns (int24) {
+        if (tick <= MIN_TICK) return MIN_TICK;
         int24 remainder = tick % tickSpacing;
         if (remainder == 0) {
             return tick;
         }
         // Pour les nombres negatifs, le reste peut etre negatif
         // floor(-196327, 10) devrait donner -196330, pas -196320
+        int24 rounded;
         if (tick < 0 && remainder != 0) {
-            return tick - remainder - tickSpacing;
+            rounded = tick - remainder - tickSpacing;
+        } else {
+            rounded = tick - remainder;
         }
-        return tick - remainder;
+        return rounded < MIN_TICK ? MIN_TICK : rounded;
     }
 
     /**
@@ -1071,15 +1094,19 @@ library RangeOperations {
      * @dev Gere correctement les nombres negatifs (ex: -196323 avec spacing 10 -> -196320)
      */
     function _ceilToTickSpacing(int24 tick, int24 tickSpacing) private pure returns (int24) {
+        if (tick >= MAX_TICK) return MAX_TICK;
         int24 remainder = tick % tickSpacing;
         if (remainder == 0) {
             return tick;
         }
         // Pour les nombres negatifs, ceil(-196327, 10) devrait donner -196320
+        int24 rounded;
         if (tick < 0) {
-            return tick - remainder;
+            rounded = tick - remainder;
+        } else {
+            rounded = tick - remainder + tickSpacing;
         }
-        return tick - remainder + tickSpacing;
+        return rounded > MAX_TICK ? MAX_TICK : rounded;
     }
 
     /**
@@ -1095,80 +1122,6 @@ library RangeOperations {
     function _safeUint128(uint256 value) private pure returns (uint128) {
         require(value <= type(uint128).max, "Overflow uint128");
         return uint128(value);
-    }
-
-    // ===== HELPERS MULTI-USER =====
-
-    /**
-     * @notice Calcule la liquidite necessaire pour un retrait partiel
-     */
-    function calculateLiquidityForWithdrawal(
-        uint256 amount0Desired,
-        uint256 amount1Desired,
-        uint128 totalLiquidity,
-        uint256 tokenId,
-        INonfungiblePositionManager positionManager,
-        IUniswapV3Pool pool
-    ) internal view returns (uint128 liquidityNeeded) {
-        // Utiliser la fonction existante
-        (uint256 amount0Current, uint256 amount1Current) = getPositionAmounts(tokenId, positionManager, pool);
-
-        // Si pas de liquidite
-        if (amount0Current == 0 && amount1Current == 0) return 0;
-
-        // Calculer le ratio necessaire
-        uint256 ratio0 = amount0Current > 0 ? (amount0Desired * 1e18) / amount0Current : 0;
-        uint256 ratio1 = amount1Current > 0 ? (amount1Desired * 1e18) / amount1Current : 0;
-
-        uint256 ratio = ratio0 > ratio1 ? ratio0 : ratio1;
-        if (ratio > 1e18) ratio = 1e18;
-
-        liquidityNeeded = uint128((uint256(totalLiquidity) * ratio) / 1e18);
-    }
-
-    /**
-     * @notice Calcule les montants exacts de token0 et token1 dans une position
-     */
-    function getPositionAmounts(uint256 tokenId, INonfungiblePositionManager positionManager, IUniswapV3Pool pool)
-        internal
-        view
-        returns (uint256 amount0, uint256 amount1)
-    {
-        (,,,,, int24 tickLower, int24 tickUpper, uint128 liquidity,,,,) = positionManager.positions(tokenId);
-
-        if (liquidity == 0) return (0, 0);
-
-        (uint160 sqrtPriceX96, int24 currentTick,,,,,) = pool.slot0();
-        uint160 sqrtRatioAX96 = getSqrtRatioAtTick(tickLower);
-        uint160 sqrtRatioBX96 = getSqrtRatioAtTick(tickUpper);
-
-        if (currentTick < tickLower) {
-            return (getAmount0ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity), 0);
-        } else if (currentTick >= tickUpper) {
-            return (0, getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity));
-        } else {
-            return (
-                getAmount0ForLiquidity(sqrtPriceX96, sqrtRatioBX96, liquidity),
-                getAmount1ForLiquidity(sqrtRatioAX96, sqrtPriceX96, liquidity)
-            );
-        }
-    }
-
-    /**
-     * @notice Recupere les fees non collectees d'une position
-     * @param tokenId L'ID de la position NFT
-     * @param positionManager Le contrat NFT position manager
-     * @return tokensOwed0 Montant de fees en token0
-     * @return tokensOwed1 Montant de fees en token1
-     */
-    function getUnclaimedFees(uint256 tokenId, INonfungiblePositionManager positionManager)
-        internal
-        view
-        returns (uint128 tokensOwed0, uint128 tokensOwed1)
-    {
-        (,,,,,,,,,, tokensOwed0, tokensOwed1) = positionManager.positions(tokenId);
-
-        return (tokensOwed0, tokensOwed1);
     }
 
     /**
@@ -1299,23 +1252,6 @@ library RangeOperations {
      * @return halfRangeBps Demi-range symetrique en bps (rangeUp == rangeDown).
      * @return enoughData False si pas assez de snapshots dans la fenetre (cold start).
      */
-    /// @notice Valide les parametres dynamic range et retourne la capacite du ring buffer.
-    /// @dev Deportee depuis RangeManager.setDynamicRangeConfig pour alleger le bytecode.
-    function validateDynamicRangeConfig(
-        uint8 maxSnapshotsPerDay,
-        uint8 volatMoyDay,
-        uint8 volatTrimDay,
-        uint16 rangeStepBps,
-        uint16 rangeMultiplicatorBps
-    ) external pure returns (uint16 ringCap) {
-        require(maxSnapshotsPerDay >= 1 && maxSnapshotsPerDay <= 24, "E40");
-        require(volatMoyDay >= 1 && volatMoyDay <= 20, "E41");
-        require(uint16(volatTrimDay) * 2 + 1 <= uint16(volatMoyDay) * uint16(maxSnapshotsPerDay), "E42");
-        require(rangeStepBps >= 10 && rangeStepBps <= 1000, "E43");
-        require(rangeMultiplicatorBps >= 5000 && rangeMultiplicatorBps <= 30000, "E44");
-        return uint16(volatMoyDay) * uint16(maxSnapshotsPerDay);
-    }
-
     /// @notice Écrit un snapshot dans le ring buffer circulaire (push tant que < cap, sinon overwrite à head).
     /// @dev Déporté du RangeManager (gain bytecode) : la library opère directement sur le storage array passé
     ///      par référence et renvoie le nouvel index de tête. cap==0 traité comme 1. Miroir exact de la pool DN.
@@ -1365,23 +1301,6 @@ library RangeOperations {
     ///      assez restrictif. Sans cette garde, un appelant permissionless pouvait passer 0 et
     ///      se faire sandwicher en MEV (V4 audit). N'execute pas les swaps : c'est au caller
     ///      d'appeler swapRouter (le delegatecall library briserait le contexte msg.sender/balance).
-    /// @notice Calcule les amounts a envoyer au user lors d'un withdraw (cap par balance dispo).
-    /// @dev Deporte depuis RangeManager.transferTokensForWithdraw pour alignement std/DN
-    ///      (meme code partout) et liberer du bytecode. Pure compute : le RM fait les safeTransfer
-    ///      lui-meme avec le resultat.
-    function computeWithdrawAmounts(
-        IERC20 token0,
-        IERC20 token1,
-        address holder,
-        uint256 amount0Requested,
-        uint256 amount1Requested
-    ) external view returns (uint256 amount0Sent, uint256 amount1Sent) {
-        uint256 b0 = token0.balanceOf(holder);
-        uint256 b1 = token1.balanceOf(holder);
-        amount0Sent = b0 >= amount0Requested ? amount0Requested : b0;
-        amount1Sent = b1 >= amount1Requested ? amount1Requested : b1;
-    }
-
     /// @notice Valide les pre-conditions de chaque chunk de swap rebalance :
     ///         (1) chunk cap (en USD) <= initMultiSwapTvl si > 0,
     ///         (2) minAmountsOut[i] >= plancher oracle Chainlink (anti-sandwich V4 audit).
@@ -1498,8 +1417,8 @@ library RangeOperations {
      * @notice Calcule le nouveau demi-range ET decide s'il faut l'appliquer.
      * @dev Encapsule le calcul + la decision pour alleger le RangeManager (bytecode).
      *      Retourne shouldApply=false si: dynamique desactive, cold start, ou range trop petit (<10 bps).
-     *      PAS d'hysteresis : appele uniquement lors d'un (re)mint/rebalance, le range calcule s'applique
-     *      tel quel (la position est recreee de toute facon, aucune economie a conserver l'ancien range).
+     *      PAS d'hysteresis : appele lors du snapshot on-chain qui met a jour la config de range.
+     *      Le mint/rebalance suivant lit cette config deja figee, ce qui garde le plan de swap coherent.
      * @return newHalfBps Demi-range a appliquer (borne 10..5000), valide seulement si shouldApply.
      * @return shouldApply True s'il faut reecrire config.rangeUp/DownPercent.
      */
@@ -1512,14 +1431,18 @@ library RangeOperations {
         if (!drc.dynamicRangeEnabled || currentPrice == 0) return (0, false);
 
         (uint16 halfBps, bool ok) = _computeDynamicRangeBps(snapshots, currentPrice, drc, nowTs);
-        if (!ok || halfBps < 10) return (0, false);
+        if (!ok) return (0, false);
 
-        // PAS d'hysteresis : _applyDynamicRangeIfDue n'est appele que lors d'un (re)mint, c.-a-d. un
-        // rebalance ou la position est de toute facon recreee. Il n'y a donc aucune economie de gas a
-        // faire en conservant l'ancien range : le nouveau range calcule doit s'appliquer tel quel pour
-        // que la position rebalancee reflete la volatilite courante. (Le palier rangeStepBps reste
-        // applique en amont comme arrondi de l'amplitude dans _computeDynamicRangeBps.)
-        if (halfBps > 5000) halfBps = 5000;
+        uint16 minBps = drc.rangeMinBps == 0 ? 10 : drc.rangeMinBps;
+        uint16 maxBps = drc.rangeMaxBps == 0 ? 5000 : drc.rangeMaxBps;
+        if (minBps < 10 || minBps > maxBps || maxBps > 5000) return (0, false);
+
+        // PAS d'hysteresis : le snapshot on-chain applique directement le nouveau range calcule.
+        // Le rebalance/mint suivant utilise ensuite cette config de range deja figee, ce qui evite
+        // une divergence entre le plan de swap lu par le bot/keeper et le range effectivement minte.
+        // (Le palier rangeStepBps reste applique en amont dans _computeDynamicRangeBps.)
+        if (halfBps < minBps) halfBps = minBps;
+        if (halfBps > maxBps) halfBps = maxBps;
         return (halfBps, true);
     }
 }

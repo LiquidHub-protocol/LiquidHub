@@ -102,16 +102,20 @@ Treasury.authorizeRangeManager(RANGEMANAGER_ADDRESS, true)
 ## Step 6: Configure Price Oracles
 
 Set the Chainlink price feed addresses used by the RangeManager for position calculations.
+RangeManager governance settings are relayed through the Vault, so the Safe calls
+`MultiUserVault.executeRangeManagerGovernance(bytes)` with the encoded RangeManager calldata.
 
-**Contract:** RangeManager (`RANGEMANAGER_ADDRESS`)
+**Contract:** MultiUserVault (`VAULT_ADDRESS`)
 
 ```
-RangeManager.configurePriceFeeds(TOKEN0_ORACLE, TOKEN1_ORACLE, NATIVE_ORACLE)
+MultiUserVault.executeRangeManagerGovernance(
+  abi.encodeCall(RangeManager.configurePriceFeeds, (TOKEN0_ORACLE, TOKEN1_ORACLE, NATIVE_ORACLE))
+)
 ```
 
-**ABI:**
+**Outer ABI:**
 ```json
-[{"inputs":[{"internalType":"address","name":"_token0Oracle","type":"address"},{"internalType":"address","name":"_token1Oracle","type":"address"},{"internalType":"address","name":"_ethPriceOracle","type":"address"}],"name":"configurePriceFeeds","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+[{"inputs":[{"internalType":"bytes","name":"data","type":"bytes"}],"name":"executeRangeManagerGovernance","outputs":[{"internalType":"bytes","name":"result","type":"bytes"}],"stateMutability":"nonpayable","type":"function"}]
 ```
 
 ---
@@ -120,15 +124,17 @@ RangeManager.configurePriceFeeds(TOKEN0_ORACLE, TOKEN1_ORACLE, NATIVE_ORACLE)
 
 Set the initial range percentages for the LP position (e.g., 500 = 5% up, 500 = 5% down from current price). Values are in basis points of percent (100 = 1%).
 
-**Contract:** RangeManager (`RANGEMANAGER_ADDRESS`)
+**Contract:** MultiUserVault (`VAULT_ADDRESS`)
 
 ```
-RangeManager.configureRanges(rangeUpPercent, rangeDownPercent)
+MultiUserVault.executeRangeManagerGovernance(
+  abi.encodeCall(RangeManager.configureRanges, (rangeUpPercent, rangeDownPercent))
+)
 ```
 
-**ABI:**
+**Outer ABI:**
 ```json
-[{"inputs":[{"internalType":"uint16","name":"_rangeUpPercent","type":"uint16"},{"internalType":"uint16","name":"_rangeDownPercent","type":"uint16"}],"name":"configureRanges","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+[{"inputs":[{"internalType":"bytes","name":"data","type":"bytes"}],"name":"executeRangeManagerGovernance","outputs":[{"internalType":"bytes","name":"result","type":"bytes"}],"stateMutability":"nonpayable","type":"function"}]
 ```
 
 ---

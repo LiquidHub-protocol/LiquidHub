@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.19;
 
-import "openzeppelin-contracts/contracts/access/Ownable.sol";
+import "openzeppelin-contracts/contracts/access/Ownable2Step.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -68,7 +68,7 @@ interface IStargate {
         returns (MessagingReceipt memory, OFTReceipt memory, Ticket memory);
 }
 
-contract Treasury is Ownable {
+contract Treasury is Ownable2Step {
     using SafeERC20 for IERC20;
 
     error BridgeBountyCooldownZero();
@@ -106,6 +106,7 @@ contract Treasury is Ownable {
     // et REVERT si aucun feed n'est configuré pour tokenIn (pas de swap d'un token non oraclé).
     mapping(address => AggregatorV3Interface) public swapFeeds; // tokenIn => feed Chainlink (prix en USD)
     mapping(address => uint32) public swapFeedMaxAges; // tokenIn => heartbeat max accepte pour ce feed
+    mapping(address => uint16) public swapFeedSlippageBps; // tokenIn => slippage max tolere pour le floor oracle
     uint16 public swapSlippageBps; // slippage max toléré sur les swaps Treasury (ex 100 = 1%)
 
     // --- Bridge Bounty (Phase 2) — paid to whoever calls bridgeToStakers / collectAndBridge ---
@@ -169,6 +170,7 @@ contract Treasury is Ownable {
     event KeeperBountyDailyCapConfigured(uint256 dailyCap);
     event HedgeBountyDailyCapConfigured(uint256 dailyCap);
     event BridgeBountyPaid(address indexed keeper, uint256 amount);
+    event BridgeBountySkipped(address indexed keeper, string reason);
     event BridgeBountyConfigured(bool enabled, uint256 amount);
     event BridgeBountyCooldownConfigured(uint64 cooldown, uint16 minRatio);
     event BridgeMinReceivedConfigured(uint16 minReceivedBps);
@@ -199,6 +201,7 @@ contract Treasury is Ownable {
         usdc = IERC20(_usdc);
         usdcDecimals = IERC20Metadata(_usdc).decimals();
         require(usdcDecimals <= 18, "Invalid decimals");
+        require(_validMonthlyCap(_monthlyCap), "Invalid cap");
         swapRouter = ISwapRouter(_swapRouter);
         monthlyCap = _monthlyCap;
         adminWithdrawEnabled = true;
@@ -293,18 +296,34 @@ contract Treasury is Ownable {
             oftReceipt.amountSentLD, oftReceipt.amountReceivedLD, bridgeDestinationEid, msgReceipt.guid
         );
         _payBridgeBounty(msg.sender, oftReceipt.amountSentLD);
+        _refundNativeSurplus(fee.nativeFee);
     }
 
     /// @dev Pays the bridge bounty to `keeper` if enabled, the treasury holds enough USDC,
     ///      the cooldown has passed, and `bridgedAmount` is large enough to justify the bounty.
-    ///      Silent no-op otherwise — never blocks the bridge itself.
+    ///      Explicit no-op otherwise — never blocks the bridge itself.
     function _payBridgeBounty(address keeper, uint256 bridgedAmount) internal {
-        if (!bridgeBountyEnabled || bridgeBountyAmount == 0) return;
-        if (block.timestamp < uint256(lastBridgeBountyAt) + uint256(bridgeBountyCooldown)) return;
+        if (!bridgeBountyEnabled || bridgeBountyAmount == 0) {
+            emit BridgeBountySkipped(keeper, "disabled");
+            return;
+        }
         uint256 ratio = uint256(bridgeBountyMinRatio);
-        if (bridgeBountyCooldown == 0 || ratio == 0) return;
-        if (bridgedAmount < bridgeBountyAmount * ratio) return;
-        if (usdc.balanceOf(address(this)) < bridgeBountyAmount) return;
+        if (bridgeBountyCooldown == 0 || ratio == 0) {
+            emit BridgeBountySkipped(keeper, "unconfigured");
+            return;
+        }
+        if (block.timestamp < uint256(lastBridgeBountyAt) + uint256(bridgeBountyCooldown)) {
+            emit BridgeBountySkipped(keeper, "cooldown");
+            return;
+        }
+        if (bridgedAmount < bridgeBountyAmount * ratio) {
+            emit BridgeBountySkipped(keeper, "too-small");
+            return;
+        }
+        if (usdc.balanceOf(address(this)) < bridgeBountyAmount) {
+            emit BridgeBountySkipped(keeper, "balance");
+            return;
+        }
         lastBridgeBountyAt = uint64(block.timestamp);
         usdc.safeTransfer(keeper, bridgeBountyAmount);
         emit BridgeBountyPaid(keeper, bridgeBountyAmount);
@@ -397,6 +416,13 @@ contract Treasury is Ownable {
         usdcBridged = oftReceipt.amountReceivedLD;
         emit CollectedAndBridged(tokenIn, usdcAmount, usdcBridged, bridgeDestinationEid);
         _payBridgeBounty(msg.sender, oftReceipt.amountSentLD);
+        _refundNativeSurplus(msgFee.nativeFee);
+    }
+
+    function _refundNativeSurplus(uint256 usedNativeFee) internal {
+        if (msg.value <= usedNativeFee) return;
+        (bool ok,) = msg.sender.call{value: msg.value - usedNativeFee}("");
+        require(ok, "Refund failed");
     }
 
     /// @notice Estimate bridge fee in native token (ETH/AVAX/MATIC/BNB)
@@ -424,6 +450,7 @@ contract Treasury is Ownable {
     function adminWithdraw(uint256 amount, address to) external onlyOwner {
         require(adminWithdrawEnabled, "Admin withdraw disabled");
         require(to != address(0), "Invalid recipient");
+        require(amount > 0, "Zero amount");
 
         if (block.timestamp >= currentMonthStart + 30 days) {
             currentMonthStart = block.timestamp;
@@ -438,6 +465,7 @@ contract Treasury is Ownable {
     }
 
     function setMonthlyCap(uint256 newCap) external onlyOwner {
+        require(_validMonthlyCap(newCap), "Invalid cap");
         emit MonthlyCapUpdated(monthlyCap, newCap);
         monthlyCap = newCap;
     }
@@ -725,6 +753,7 @@ contract Treasury is Ownable {
         if (feed == address(0)) {
             delete swapFeeds[token];
             delete swapFeedMaxAges[token];
+            delete swapFeedSlippageBps[token];
             emit SwapFeedConfigured(token, feed, _swapSlippageBps, 0);
             return;
         }
@@ -735,6 +764,7 @@ contract Treasury is Ownable {
         );
         swapFeeds[token] = AggregatorV3Interface(feed);
         swapFeedMaxAges[token] = _maxAge;
+        swapFeedSlippageBps[token] = _swapSlippageBps;
         swapSlippageBps = _swapSlippageBps;
         emit SwapFeedConfigured(token, feed, _swapSlippageBps, _maxAge);
     }
@@ -745,8 +775,10 @@ contract Treasury is Ownable {
     function _oracleMinUsdcOut(address tokenIn, uint256 amountIn) internal view returns (uint256) {
         AggregatorV3Interface feed = swapFeeds[tokenIn];
         uint32 maxAge = swapFeedMaxAges[tokenIn];
+        uint16 slippageBps = swapFeedSlippageBps[tokenIn];
         require(address(feed) != address(0), "No feed for token");
         require(maxAge != 0, "No max age");
+        require(slippageBps != 0, "No slippage");
         (uint80 roundId, int256 px,, uint256 updatedAt, uint80 answeredInRound) = feed.latestRoundData();
         require(
             px > 0 && updatedAt != 0 && answeredInRound >= roundId && block.timestamp - updatedAt <= maxAge,
@@ -757,7 +789,11 @@ contract Treasury is Ownable {
         uint8 usdcDec = IERC20Metadata(address(usdc)).decimals();
         // valeur_usdc = amountIn * px * 10^usdcDec / (10^tokenDec * 10^feedDec)
         uint256 theo = (amountIn * uint256(px) * (10 ** usdcDec)) / ((10 ** tokenDec) * (10 ** feedDec));
-        return (theo * (10000 - swapSlippageBps)) / 10000;
+        return (theo * (10000 - slippageBps)) / 10000;
+    }
+
+    function _validMonthlyCap(uint256 cap) internal view returns (bool) {
+        return cap > 0 && cap <= 1_000_000 * (10 ** uint256(usdcDecimals));
     }
 
     // --- Bridge Configuration (onlyOwner = Safe) ---

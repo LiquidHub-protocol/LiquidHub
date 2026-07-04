@@ -7,6 +7,7 @@ pragma solidity ^0.8.19;
 contract PauseController {
     error E_PAUSED();
     error E_COOLDOWN();
+    error E_ACTIVE();
 
     address public immutable safe;
     address public governance;
@@ -72,12 +73,14 @@ contract PauseController {
     }
 
     function pauseInflows() external onlyPauseGuardianOrGovernance {
+        if (block.timestamp < inflowsPausedUntil) revert E_ACTIVE();
         uint64 until = uint64(block.timestamp) + MAX_INFLOWS_PAUSE;
         inflowsPausedUntil = until;
         emit InflowsPaused(until);
     }
 
     function pauseWithdrawals() external onlyPauseGuardianOrGovernance {
+        if (block.timestamp < withdrawalsPausedUntil) revert E_ACTIVE();
         uint64 until = uint64(block.timestamp) + MAX_WITHDRAW_PAUSE;
         withdrawalsPausedUntil = until;
         if (inflowsPausedUntil < until) {

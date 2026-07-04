@@ -144,20 +144,20 @@ forcing failing actions.
 | Function | Access | Description |
 |----------|--------|-------------|
 | `rebalance()` | Public (permissionless) | Atomic burn → swaps → mint; protected by the refresh + deviation guard, oracle-bounded `minAmountsOut`, and `needsRebalance` check |
-| `executeSwap()` | `onlyAuthorized` | Safe/module/RM only; refreshes the cache + enforces the oracle floor |
-| `mintInitialPosition()` | `onlyAuthorized` | Safe or module only; refreshes the cache + deviation guard before minting |
-| `burnPosition()` | `onlyVaultOrAuthorized` | Vault, Safe or module; tokens go to the vault |
-| `configurePriceFeeds()` / `setOracleParams()` | `onlySafe` | Oracle addresses & deviation/heartbeat params — Safe only (not the module) |
-| `refreshPriceCache()` | `onlyVaultOrAuthorized` | Refreshes the price cache (no address change) |
-| `configureRanges()` | `onlyAuthorized` | Safe or module only |
-| `setSwapFeeBps()` | `onlyAuthorized` | Safe or module only |
-| `setTreasuryAddress()` | `onlyAuthorized` | Safe or module only |
+| `executeSwap()` | `onlyAuthorized` | Operational executor/module only; refreshes the cache + enforces the oracle floor |
+| `mintInitialPosition()` | `onlyAuthorized` | Operational executor/module only; refreshes the cache + deviation guard before minting |
+| `burnPosition()` | `onlyVaultOrAuthorized` | Vault or operational executor/module; tokens stay in the protocol flow |
+| `configurePriceFeeds()` / `setOracleParams()` | Vault owner relay | Governance settings via `MultiUserVault.executeRangeManagerGovernance(bytes)`: Safe in phase 1, Timelock in phase 2 |
+| `refreshPriceCache()` | Public | Refreshes the price cache (no address change) |
+| `configureRanges()` | Vault owner relay | Governance setting via Safe/Timelock relay, not the bot module |
+| `setSwapFeeBps()` | Vault owner relay | Governance setting via Safe/Timelock relay |
+| `setTreasuryAddress()` | Vault owner relay | Governance setting via Safe/Timelock relay |
 
 ### Treasury
 
 | Function | Access | Description |
 |----------|--------|-------------|
-| `swapToUSDC()` | Public | Converts WETH to USDC; tokens stay in Treasury |
+| `swapToUSDC()` | `onlyOwner` (Safe / governance owner) | Converts ERC-20 tokens to USDC; tokens stay in Treasury |
 | `adminWithdraw()` | `onlyOwner` (Safe) | Monthly cap enforced |
 | `payKeeperBounty()` | Authorized RangeManagers only | Called automatically after rebalance |
 | `disableAdminWithdraw()` | `onlyOwner` | **IRREVERSIBLE** |

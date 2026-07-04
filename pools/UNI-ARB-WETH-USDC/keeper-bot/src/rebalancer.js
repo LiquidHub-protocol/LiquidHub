@@ -33,6 +33,7 @@ class Rebalancer {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
     try {
+      const priceCache = await this._freshPriceCache('rebalance plan/minOut');
       // 1. Read optimal swap params (what the contract would expect) — REBALANCE = état post-burn (NFT inclus).
       const swapParams = await this.rangeManager.getOptimalSwapParams();
 
@@ -49,7 +50,6 @@ class Rebalancer {
 
         // Read on-chain chunk cap (initMultiSwapTvl in USD, contract value)
         const initMultiSwapTvl = await this.rangeManager.initMultiSwapTvl();
-        const priceCache = await this.rangeManager.priceCache();
         // Decimals read ON-CHAIN from config() (generic for any pair, not the .env) — same source as processDeposit
         const cfg = await this.rangeManager.config();
         const dec0 = Number(cfg.token0Decimals);
@@ -99,6 +99,8 @@ class Rebalancer {
   async processDeposit() {
     console.log('\n=== Processing queued deposit (permissionless) ===');
     try {
+      const priceCache = await this._freshPriceCache('deposit plan/minOut');
+      await this._syncFeesForDepositPlan();
       // AUDIT H-01/H-03 : DÉPÔT → vue dédiée (état post-transfert du dépôt + ratio NFT existant), PAS
       // getOptimalSwapParams (qui reflète l'état rebalance/post-burn → faux pour un dépôt).
       const [zeroForOne, amountIn] = await this.vault.getDepositSwapParams();
@@ -115,7 +117,6 @@ class Rebalancer {
         tokenOut = zeroForOne ? token1 : token0;
 
         const initMultiSwapTvl = await this.rangeManager.initMultiSwapTvl();
-        const priceCache = await this.rangeManager.priceCache();
         const cfg = await this.rangeManager.config();
 
         const dec0 = Number(cfg.token0Decimals);
@@ -165,6 +166,47 @@ class Rebalancer {
     const theo = (BigInt(amountIn) * priceIn * (10n ** BigInt(decOut))) / (priceOut * (10n ** BigInt(decIn)));
     const slip = slippageBps >= 10000 ? 9999n : BigInt(slippageBps);
     return (theo * (10000n - slip)) / 10000n;
+  }
+
+  async _freshPriceCache(label) {
+    let priceCache = await this.rangeManager.priceCache();
+    if (!this._needsPriceCacheRefresh(priceCache)) return priceCache;
+
+    console.log(`  priceCache stale/invalid before ${label}; calling refreshPriceCache()...`);
+    try {
+      const tx = await this.rmConnected.refreshPriceCache();
+      const receipt = await tx.wait();
+      console.log(`  priceCache refreshed: ${receipt.hash}`);
+      priceCache = await this.rangeManager.priceCache();
+    } catch (error) {
+      console.log(`  refreshPriceCache skipped/failed: ${(error.reason || error.shortMessage || error.message || '').slice(0, 100)}`);
+    }
+
+    if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) {
+      throw new Error('priceCache invalid after refresh attempt');
+    }
+    if (this._needsPriceCacheRefresh(priceCache)) {
+      throw new Error('priceCache still stale after refresh attempt');
+    }
+    return priceCache;
+  }
+
+  async _syncFeesForDepositPlan() {
+    try {
+      const tx = await this.vaultConnected.syncFeesForDeposits();
+      const receipt = await tx.wait();
+      console.log(`  Fees synced before deposit plan: ${receipt.hash}`);
+    } catch (error) {
+      console.log(`  Fee sync skipped (${(error.reason || error.message || '').slice(0, 90)})`);
+    }
+  }
+
+  _needsPriceCacheRefresh(priceCache) {
+    if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) return true;
+    const maxAgeSec = parseInt(process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || '300', 10);
+    const ts = Number(priceCache.timestamp || 0);
+    if (!Number.isFinite(maxAgeSec) || maxAgeSec <= 0 || !ts) return false;
+    return Math.floor(Date.now() / 1000) - ts > maxAgeSec;
   }
 }
 

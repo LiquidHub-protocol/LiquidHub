@@ -85,6 +85,7 @@ contract SequencerCheckedAggregator is AggregatorV3Interface {
     {
         _checkSequencer();
         (roundId, answer, startedAt, updatedAt, answeredInRound) = underlyingFeed.getRoundData(_roundId);
+        if (updatedAt == 0 || answeredInRound < roundId) revert SequencerDown();
         answer = _normalizeAnswer(answer);
     }
 

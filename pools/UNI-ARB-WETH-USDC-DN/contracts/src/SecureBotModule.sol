@@ -27,6 +27,10 @@ interface IRangeManagerPostCheck {
     function getOptimalSwapParams() external view returns (RangeOperations.OptimalSwapParams memory);
 }
 
+interface IVaultRebalancePlan {
+    function getRebalanceSwapParams() external view returns (bool zeroForOne, uint256 amountIn);
+}
+
 contract SecureBotModule {
     address public immutable safe;
     address public immutable botAddress;
@@ -36,6 +40,7 @@ contract SecureBotModule {
     address public immutable hedgeManager;
     address public immutable treasury;
     address public owner;
+    address public pendingOwner;
 
     // Sécurité renforcée
     mapping(bytes4 => bool) public allowedFunctions;
@@ -54,14 +59,21 @@ contract SecureBotModule {
     // Audit V3 (Point 2) : endRebalance() est EXEMPTE de la limite quotidienne dans executeVaultFunction.
     // C'est un DEVERROUILLAGE (il ne deplace aucun fonds, il libere depots/retraits) : si la limite est
     // atteinte un jour de forte activite, le vault ne doit JAMAIS rester verrouille. startRebalance()
-    // (qui verrouille) reste lui soumis a la limite. onlyBot/paused/onlyAllowedFunction restent actifs.
+    // (qui verrouille) reste lui soumis a la limite. La pause module bloque les flux non-maintenance,
+    // pas les actions vitales de position (rebalance/swap/snapshot/hedge/deverrouillage).
     bytes4 private constant END_REBALANCE_SELECTOR = 0x0040718e; // endRebalance()
     bytes4 private constant START_REBALANCE_SELECTOR = 0x4dce7057; // startRebalance()
+    bytes4 private constant REFRESH_PRICE_SELECTOR = 0x0be1c372; // refreshPriceCache()
     bytes4 private constant MINT_INITIAL_SELECTOR = 0x63ccfd0b; // mintInitialPosition()
     bytes4 private constant ADD_LIQUIDITY_SELECTOR = 0x2a7cf2fe; // addLiquidityToPosition()
     bytes4 private constant BURN_SELECTOR = 0x38ca63bc; // burnPosition(uint256)
     bytes4 private constant SWAP_SELECTOR = 0xb07391c0; // executeSwap(address,address,uint256,uint256)
+    bytes4 private constant SEND_TOKEN_FOR_HEDGE_SELECTOR = 0x9be8feaa; // sendTokenForHedge(address,uint256,address)
     bytes4 private constant BORROW_MORE_SELECTOR = 0x9d0bf2e9; // borrowMore(uint256)
+    bytes4 private constant REPAY_AND_WITHDRAW_SELECTOR = 0xebc9b94d; // repayAndWithdraw(uint256,uint256)
+    bytes4 private constant REPAY_DEBT_SELECTOR = 0x6b09de45; // repayDebt(uint256)
+    bytes4 private constant SWEEP_WETH_SELECTOR = 0xacf31cb1; // sweepWeth(address)
+    // Plafond post-check fixe ; DnDepositLib applique dynamiquement min(plafond, seuil critique du range courant).
     uint16 private constant DN_REBAL_MAX_DRIFT_BPS = 300;
     uint16 private constant DN_REBAL_CRIT_DRIFT_BPS = 900;
     uint256 private constant DN_REBAL_DUST_FLOOR_USD = 50e8;
@@ -69,7 +81,9 @@ contract SecureBotModule {
     uint8 private constant CYCLE_LOCKED = 1;
     uint8 private constant CYCLE_REBALANCE_BURNED = 2;
     uint8 private constant CYCLE_LOCKED_MAINTENANCE = 5;
-    uint32 public constant BOT_CYCLE_TIMEOUT = 1 hours;
+    // Monitoring only: marks an interrupted bot cycle as stale for alerts.
+    // It never auto-resets or unlocks the module.
+    uint32 public constant BOT_CYCLE_TIMEOUT = 30 minutes;
 
     // Events
     event FunctionExecuted(bytes4 indexed selector, uint256 dailyCount);
@@ -78,9 +92,9 @@ contract SecureBotModule {
     event Paused(bool paused);
     event DirectExecutionUpdated(bool enabled);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event ModuleSweep(address indexed token, uint256 amount);
     event BotCycleStateUpdated(uint8 state, bytes4 indexed selector);
-    event BotCycleAutoReset(uint8 previousState);
 
     constructor(
         address _safe,
@@ -120,7 +134,9 @@ contract SecureBotModule {
         allowedFunctions[0xb07391c0] = true; // executeSwap (swaps via Uniswap V3)
         allowedFunctions[0x6ecfe0f8] = true; // recordPriceSnapshot() - snapshot de prix (fallback bot si aucun keeper)
         // Setters de stratégie/risk retirés du module: configureRanges, setDynamicRangeEnabled,
-        // configureSlippage, setMaxPositions, configureProtections, configureTolerance.
+        // configureSlippage, configureProtections, configureTolerance.
+        // sendTokenForHedge reste indispensable au solveur DN, mais uniquement pendant un cycle
+        // rebalance/maintenance : hors cycle, il n'y a pas de raison de sortir des tokens du RangeManager.
         allowedFunctions[0x9be8feaa] = true; // sendTokenForHedge(address,uint256,address)
 
         // Fonctions MultiUserVault
@@ -133,8 +149,9 @@ contract SecureBotModule {
         allowedFunctions[0x76919a59] = true; // processDepositPermissionless(uint256[],uint256[],address,address)
         allowedFunctions[0x4dce7057] = true; // startRebalance()
         allowedFunctions[0x0040718e] = true; // endRebalance()
-        allowedFunctions[0x2a7cf2fe] = true; // addLiquidityToPosition
-        // withdrawReservedCollateral (0xa5993427) RETIRÉ (audit) : fonction supprimée du Vault (réserve gérée off-chain)
+        // Sélecteur RangeManager, exécuté via executeRangeManagerFunction (pas via executeVaultFunction).
+        allowedFunctions[0x2a7cf2fe] = true; // addLiquidityToPosition()
+        // withdrawReservedCollateral() RETIRÉ (audit) : fonction supprimée du Vault (réserve gérée off-chain)
         // AUDIT M-02 : decreaseLiquidityPartial(uint128) (0x41f60e3c) RETIRÉ de la whitelist — entrée publique DN
         // supprimée (trimming LP indépendant abandonné en DN strict). Plus aucune surface pour une clé bot compromise.
         // Emergency functions (EmergencyBurnPositions, EmergencyRecoverUser, sendTokenForHedgeRepay)
@@ -148,16 +165,16 @@ contract SecureBotModule {
         // (sur-hedge critique). NB : le cooldown on-chain s'applique aussi au bot (pas de bypass) — garde-fou
         // anti-spam légitime. Le sur-hedge non corrigé immédiatement le sera au cycle suivant ou par un keeper.
         allowedFunctions[0x1e694f32] = true; // adjustHedge()
-        // borrowMore(uint256) reste necessaire au solveur DN, mais il est borne au cycle rebalance post-burn
-        // par _beforeHedgeCall() : une cle bot compromise ne peut pas augmenter la dette hors maintenance LP.
+        // Les appels de solveur (borrow/repay/withdraw/sweeps) restent necessaires au rebalance DN multi-tx,
+        // mais sont bornes au cycle rebalance post-burn/maintenance par _beforeHedgeCall().
         allowedFunctions[0x9d0bf2e9] = true;
         allowedFunctions[0xebc9b94d] = true; // repayAndWithdraw(uint256,uint256)
         allowedFunctions[0x6b09de45] = true; // repayDebt(uint256)
-        allowedFunctions[0x0af504cc] = true; // withdrawCollateral(uint256,address) — destination figée on-chain (audit V1)
+        allowedFunctions[0x0af504cc] = true; // withdrawCollateral(uint256,address) — destination figée + cycle-gate
         // closeAll (0xf6b32008) RETIRÉE (audit V1) : fonction d'URGENCE rare qui envoie TOUT
         // le hedge à un recipient → réservée à la Safe directe (jamais via le bot).
         allowedFunctions[0xacf31cb1] = true; // sweepWeth(address) — destination figée on-chain (audit V1)
-        allowedFunctions[0x58ea510a] = true; // sweepUsdc(address) — destination figée on-chain (audit V1)
+        allowedFunctions[0x58ea510a] = true; // sweepUsdc(address) — destination figée + cycle-gate
 
         // Fonctions Treasury (bridge Stargate v2 vers staking contract Phase 2)
         allowedFunctions[0xa5599124] = true; // bridgeToStakers(uint256)
@@ -169,7 +186,6 @@ contract SecureBotModule {
 
     modifier onlyBot() {
         require(msg.sender == botAddress, "Only bot allowed");
-        require(!paused, "Module paused");
         _;
     }
 
@@ -203,15 +219,13 @@ contract SecureBotModule {
     }
 
     // Fonction existante pour RangeManager
-    function executeRangeManagerFunction(bytes calldata data)
-        external
-        onlyBot
-        onlyAllowedFunction(data)
-        withinDailyLimit
-    {
+    function executeRangeManagerFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
         bytes4 selector = bytes4(data[:4]);
         _requireInflowsForSelector(selector);
         _beforeRangeManagerCall(selector, data);
+        if (selector != REFRESH_PRICE_SELECTOR) {
+            _consumeDailyLimit();
+        }
 
         _execute(rangeManager, 0, data);
         if (selector == MINT_INITIAL_SELECTOR || selector == ADD_LIQUIDITY_SELECTOR) _requirePostLiquidityHedgeOk();
@@ -249,6 +263,7 @@ contract SecureBotModule {
 
     /// @notice Execute a Treasury function (bridge operations only, per whitelist)
     function executeTreasuryFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) withinDailyLimit {
+        require(!paused, "Module paused");
         _execute(treasury, 0, data);
 
         bytes4 selector = bytes4(data[:4]);
@@ -264,6 +279,7 @@ contract SecureBotModule {
         onlyAllowedFunction(data)
         withinDailyLimit
     {
+        require(!paused, "Module paused");
         require(msg.value == value, "Invalid ETH value");
 
         _execute(treasury, value, data);
@@ -288,6 +304,9 @@ contract SecureBotModule {
 
     function setDailyLimit(uint256 newLimit) external onlyOwner {
         require(newLimit > 0 && newLimit <= 1000, "Invalid limit");
+        uint256 currentDay = block.timestamp / 86400;
+        uint256 actualSpent = (currentDay == lastResetDay) ? dailySpent : 0;
+        require(newLimit >= actualSpent, "Below spent");
         dailyLimit = newLimit;
         emit DailyLimitUpdated(newLimit);
     }
@@ -308,8 +327,16 @@ contract SecureBotModule {
 
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "Invalid address");
-        emit OwnershipTransferred(owner, newOwner);
-        owner = newOwner;
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner, "Only pending owner");
+        address oldOwner = owner;
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(oldOwner, owner);
     }
 
     /// @notice Reset manuel du cycle bot si une suite multi-tx a ete interrompue hors-chain.
@@ -319,15 +346,14 @@ contract SecureBotModule {
         _setCycle(CYCLE_IDLE, 0x00000000);
     }
 
-    /// @notice Reset permissionless d'un cycle bot expire. Ne fait rien tant que le timeout n'est pas atteint.
-    /// @dev Liveness uniquement: aucun fonds, aucune allowlist, aucun parametre sensible.
-    function resetStaleBotCycle() external returns (bool reset) {
-        uint8 previousState = botCycleState;
-        _autoResetStaleCycle();
-        return previousState != CYCLE_IDLE && botCycleState == CYCLE_IDLE;
+    /// @notice Legacy no-op: stale bot cycles are never reset permissionlessly.
+    /// @dev Kept for ABI compatibility; Safe must call resetBotCycle() after diagnosis.
+    function resetStaleBotCycle() external pure returns (bool reset) {
+        return false;
     }
 
     function sweepNativeToBot() external onlyBot {
+        require(!paused, "Module paused");
         uint256 amount = address(this).balance;
         require(amount > 0, "No balance");
         (bool ok,) = botAddress.call{value: amount}("");
@@ -336,6 +362,7 @@ contract SecureBotModule {
     }
 
     function sweepTokenToBot(address token) external onlyBot {
+        require(!paused, "Module paused");
         uint256 amount = IERC20Sweep(token).balanceOf(address(this));
         require(amount > 0, "No balance");
         require(IERC20Sweep(token).transfer(botAddress, amount), "Sweep failed");
@@ -352,10 +379,10 @@ contract SecureBotModule {
         emit ModuleSweep(token, amount);
     }
 
-    function _execute(address target, uint256 value, bytes calldata data) private {
+    function _execute(address target, uint256 value, bytes memory data) private {
         if (directExecution) {
-            (bool success,) = target.call{value: value}(data);
-            require(success, "Execution failed");
+            (bool success, bytes memory reason) = target.call{value: value}(data);
+            if (!success) _revertWithReason(reason);
         } else {
             if (value > 0) {
                 (bool sent,) = safe.call{value: value}("");
@@ -366,11 +393,21 @@ contract SecureBotModule {
         }
     }
 
+    function _revertWithReason(bytes memory reason) private pure {
+        if (reason.length > 0) {
+            assembly {
+                revert(add(32, reason), mload(reason))
+            }
+        }
+        revert("Execution failed");
+    }
+
     function _beforeVaultCall(bytes4 selector) private {
-        _autoResetStaleCycle();
         if (selector == START_REBALANCE_SELECTOR) {
             require(botCycleState == CYCLE_IDLE, "Bad cycle");
             _requireVaultUnlocked();
+            _refreshRangeManagerCache();
+            _requireStartRebalanceTrigger();
         }
     }
 
@@ -383,10 +420,10 @@ contract SecureBotModule {
     }
 
     function _beforeRangeManagerCall(bytes4 selector, bytes calldata data) private {
-        _autoResetStaleCycle();
         uint8 state = botCycleState;
         if (selector == BURN_SELECTOR) {
             require(state == CYCLE_LOCKED, "Bad cycle");
+            _refreshRangeManagerCache();
             _requireRebalanceTrigger();
         } else if (selector == SWAP_SELECTOR) {
             require(
@@ -403,6 +440,8 @@ contract SecureBotModule {
         } else if (selector == ADD_LIQUIDITY_SELECTOR) {
             require(state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE, "Bad cycle");
             _requireSwapPlanCompleteOrNone();
+        } else if (selector == SEND_TOKEN_FOR_HEDGE_SELECTOR) {
+            _requireActiveHedgeCycle(state);
         }
     }
 
@@ -428,17 +467,6 @@ contract SecureBotModule {
         emit BotCycleStateUpdated(state, selector);
     }
 
-    function _autoResetStaleCycle() private {
-        if (botCycleState != CYCLE_IDLE && block.timestamp > uint256(botCycleUpdatedAt) + uint256(BOT_CYCLE_TIMEOUT)) {
-            uint8 previousState = botCycleState;
-            botCycleState = CYCLE_IDLE;
-            botCycleUpdatedAt = uint64(block.timestamp);
-            _clearCycleSwapPlan();
-            emit BotCycleAutoReset(previousState);
-            emit BotCycleStateUpdated(CYCLE_IDLE, 0x00000000);
-        }
-    }
-
     function _clearCycleSwapPlan() private {
         cycleSwapPlanSet = false;
         cycleSwapZeroForOne = false;
@@ -446,16 +474,23 @@ contract SecureBotModule {
         cycleSwapSpentIn = 0;
     }
 
+    function _refreshRangeManagerCache() private {
+        _execute(rangeManager, 0, abi.encodeWithSelector(REFRESH_PRICE_SELECTOR));
+    }
+
     function _requireCycleSwapPlan(bytes calldata data) private {
         (address tokenIn,, uint256 amountIn,) = abi.decode(data[4:], (address, address, uint256, uint256));
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
         bool tokenInIsToken0 = tokenIn == rm.token0();
         if (!cycleSwapPlanSet) {
-            RangeOperations.OptimalSwapParams memory plan = rm.getOptimalSwapParams();
-            require(plan.swapNeeded && plan.amountIn > 0, "No swap plan");
+            // DN-specific: the multi-tx bot path must enforce the same debt-compatible plan as
+            // RangeManager.rebalance(). getOptimalSwapParams() only targets LP range composition and can
+            // diverge when a critical hedge drift is corrected while the NFT is still in range.
+            (bool zeroForOne, uint256 expectedAmountIn) = IVaultRebalancePlan(vault).getRebalanceSwapParams();
+            require(expectedAmountIn > 0, "No swap plan");
             cycleSwapPlanSet = true;
-            cycleSwapZeroForOne = plan.zeroForOne;
-            cycleSwapExpectedIn = plan.amountIn;
+            cycleSwapZeroForOne = zeroForOne;
+            cycleSwapExpectedIn = expectedAmountIn;
             cycleSwapSpentIn = 0;
         }
         require(tokenInIsToken0 == cycleSwapZeroForOne, "Bad swap dir");
@@ -470,8 +505,8 @@ contract SecureBotModule {
             require(cycleSwapSpentIn + tolerance >= cycleSwapExpectedIn, "Swap too low");
             return;
         }
-        RangeOperations.OptimalSwapParams memory plan = IRangeManagerPostCheck(rangeManager).getOptimalSwapParams();
-        require(!plan.swapNeeded || plan.amountIn == 0, "Swap missing");
+        (, uint256 expectedAmountIn) = IVaultRebalancePlan(vault).getRebalanceSwapParams();
+        require(expectedAmountIn == 0, "Swap missing");
     }
 
     function _cycleSwapTolerance(uint256 expectedAmountIn) private view returns (uint256 tolerance) {
@@ -495,11 +530,23 @@ contract SecureBotModule {
         require(criticalDrift, "No rebalance");
     }
 
+    function _requireStartRebalanceTrigger() private view {
+        (bool hasPosition,,,,) = IRangeManagerPostCheck(rangeManager).getBotInstructions();
+        if (hasPosition) _requireRebalanceTrigger();
+    }
+
     function _beforeHedgeCall(bytes4 selector) private view {
-        if (selector == BORROW_MORE_SELECTOR) {
-            uint8 state = botCycleState;
-            require(state == CYCLE_REBALANCE_BURNED || state == CYCLE_LOCKED_MAINTENANCE, "Bad cycle");
+        if (
+            selector == BORROW_MORE_SELECTOR || selector == REPAY_AND_WITHDRAW_SELECTOR
+                || selector == REPAY_DEBT_SELECTOR || selector == SWEEP_WETH_SELECTOR || selector == 0x0af504cc // withdrawCollateral(uint256,address)
+                || selector == 0x58ea510a // sweepUsdc(address)
+        ) {
+            _requireActiveHedgeCycle(botCycleState);
         }
+    }
+
+    function _requireActiveHedgeCycle(uint8 state) private pure {
+        require(state == CYCLE_REBALANCE_BURNED || state == CYCLE_LOCKED_MAINTENANCE, "Bad cycle");
     }
 
     // Fonctions de lecture
@@ -512,7 +559,8 @@ contract SecureBotModule {
         uint256 actualSpent = (currentDay == lastResetDay) ? dailySpent : 0;
 
         // UI/monitoring countdown only; this timestamp modulo is not randomness.
-        return (dailyLimit, actualSpent, dailyLimit - actualSpent, 86400 - (block.timestamp % 86400));
+        uint256 remainingToday = dailyLimit > actualSpent ? dailyLimit - actualSpent : 0;
+        return (dailyLimit, actualSpent, remainingToday, 86400 - (block.timestamp % 86400));
     }
 
     function isFunctionAllowed(bytes4 selector) external view returns (bool) {
@@ -534,6 +582,7 @@ contract SecureBotModule {
         if (
             selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
         ) {
+            require(!paused, "Module paused");
             address controller = pauseController;
             // Yul shl order is shl(shift, value): left-align requireInflowsActive().
             assembly ("memory-safe") {
@@ -553,7 +602,8 @@ contract SecureBotModule {
 
     function _requirePostLiquidityHedgeOk() private view {
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
-        (uint128 price0,,,,,) = rm.priceCache();
+        (uint128 price0,,,,, bool valid) = rm.priceCache();
+        require(valid && price0 > 0, "Bad cache");
         RangeOperations.RangeConfig memory cfg = rm.config();
         DnDepositLib.postCheckRebalanceHedge(
             rangeManager, rm.token0(), price0, cfg.token0Decimals, DN_REBAL_MAX_DRIFT_BPS, DN_REBAL_DUST_FLOOR_USD

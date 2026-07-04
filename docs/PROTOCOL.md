@@ -36,7 +36,7 @@ It reverts if the queue is empty, the required position state is missing, or the
 The range is computed entirely by `RangeManager` — no off-chain bot or database is involved in the math, so any keeper can reproduce it.
 
 - `RangeManager` keeps a ring buffer of price snapshots. `recordPriceSnapshot()` is **permissionless** and stores a Chainlink price; the contract spaces snapshots regularly (`24h / maxSnapshotsPerDay`) and reverts if one is not yet due.
-- On each mint/rebalance, the contract takes the pure high/low amplitude over the last `volatMoyDay` days — `(highest − lowest) / current price`, the real dispersion of the window independent of the instantaneous price — (trimming the `volatTrimDay` most extreme days), scales it by a governance multiplier `RANGE_MULTIPLICATOR`, and produces a symmetric range rounded up to the nearest `RANGE_STEP_BPS` (0.5%). The freshly computed range is applied on every rebalance (the position is recreated regardless), so it always tracks current volatility.
+- On each mint/rebalance, the contract takes the pure high/low amplitude over the last `volatMoyDay` days — `(highest − lowest) / current price`, the real dispersion of the window independent of the instantaneous price — (trimming the `volatTrimDay` most extreme days), scales it by a governance multiplier `RANGE_MULTIPLICATOR`, and produces a symmetric range rounded up to the nearest `RANGE_STEP_BPS`. The final half-range is bounded per side by `RANGE_MIN_BPS` and `RANGE_MAX_BPS` (for example `100` means at least -1%/+1%, not 1% total width). The freshly computed range is applied on every rebalance (the position is recreated regardless), so it always tracks current volatility while staying within governance bounds.
 - When `DYNAMIC_RANGE_ENABLED` is `false` (e.g. stablecoin pools), the range stays fixed at `RANGE_UP_BASE` / `RANGE_DOWN_BASE` (in basis points), configured by the multisig.
 
 ---
@@ -66,7 +66,7 @@ The range is computed entirely by `RangeManager` — no off-chain bot or databas
 
 #### Hedge Adjustment (`adjustHedge`, on-chain)
 
-`adjustHedge()` is permissionless. It reads the LP position and the Chainlink price on-chain and pilots on the **net effective short** (`effectiveShort = debt − idle WETH`) versus the target (`hedgeTargetBps × wethInLP`). If **over-hedged** it repays the excess — the repay leg acquires WETH via an on-chain USDC→WETH swap bounded by the oracle (anti-MEV, `SWAP_SLIPPAGE_BPS`). If **under-hedged** it **reverts `UnderHedged`** — borrowing-and-holding would not change the net short, so an under-hedge is corrected by rebuilding the LP composition during a `rebalance()` (with an on-chain post-check), not here. It **reverts unless the drift vs the target exceeds `adjustHedgeBps`** (the anti-drain guard) **and the on-chain cooldown (`hedgeAdjustCooldown`) has elapsed** — the cooldown applies to **all callers** (keepers and the protocol bot alike). After an over-hedge correction, surplus collateral above `RESERVE_HF_TARGET_BPS` is released as USDC on the HedgeManager to replenish the reserve, all in the same call. A successful over-hedge correction pays the **hedge bounty**.
+`adjustHedge()` is permissionless. It reads the LP position and the Chainlink price on-chain and pilots on the **net effective short** (`effectiveShort = debt − idle WETH`) versus the target (`hedgeTargetBps × wethInLP`). If **over-hedged** it repays the excess — the repay leg acquires WETH via an on-chain USDC→WETH swap bounded by the oracle (anti-MEV, `SWAP_SLIPPAGE_BPS`). If **under-hedged** it **reverts `UnderHedged`** — borrowing-and-holding would not change the net short, so an under-hedge is corrected by rebuilding the LP composition during a `rebalance()` (with an on-chain post-check), not here. It **reverts unless the drift vs the target exceeds the dynamic on-chain threshold** (`adjustHedgeBps()` returns the current effective threshold; internally it is `max(100 bps, rangeWidth / HEDGE_ADJUST_RANGE_DIVISOR)`) **and the on-chain cooldown (`hedgeAdjustCooldown`) has elapsed** — the cooldown applies to **all callers** (keepers and the protocol bot alike). After an over-hedge correction, surplus collateral above `RESERVE_HF_TARGET_BPS` is released as USDC on the HedgeManager to replenish the reserve, all in the same call. A successful over-hedge correction pays the **hedge bounty**.
 
 ---
 
@@ -89,13 +89,13 @@ Large swaps are split into smaller chunks to reduce price impact on the pool:
 4. **`mintInitialPosition()`** — Create a new LP position at the range computed on-chain (or the fixed base range when dynamic ranges are disabled).
 5. **`endRebalance()`** — Unlock the vault, pay keeper bounty (if enabled).
 
-On DN pools the AAVE hedge is **not** recalibrated inside the rebalance — it is adjusted independently and permissionlessly via `adjustHedge()` (see Hedge Adjustment), which any keeper can call for a separate bounty whenever the drift crosses the threshold.
+On DN pools, routine over-hedge corrections are adjusted independently and permissionlessly via `adjustHedge()` (see Hedge Adjustment). Severe under-hedge is handled by the permissionless `rebalance()` path: the LP composition is rebuilt and the transaction includes strict post-checks so a badly hedged result reverts atomically.
 
 ---
 
 ## Commission System
 
-- **LP commissions** are collected on each rebalance (`TAUX_PRELEV_PRCT`, default 10% of earned fees).
+- **LP commissions** are collected on each rebalance (`TAUX_PRELEV_BPS`, default `1000` bps = 10% of earned fees).
 - Commissions are sent to the Treasury contract in WETH + USDC.
 - Treasury can convert any ERC-20 token to USDC via `swapToUSDC(tokenIn, fee, amountIn, minAmountOut)`.
 - **Frontend swap commission**: a partner fee (`PARTNER_FEE_BPS=3`, i.e. 0.03%) is applied on frontend swaps and sent directly to the Treasury. The Treasury accepts any token received from these swaps.

@@ -21,7 +21,9 @@ interface IRangeManagerExtended {
         uint8 _volatMoyDay,
         uint8 _volatTrimDay,
         uint16 _rangeStepBps,
-        uint16 _rangeMultiplicatorBps
+        uint16 _rangeMultiplicatorBps,
+        uint16 _rangeMinBps,
+        uint16 _rangeMaxBps
     ) external;
 }
 
@@ -143,7 +145,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     uint256 public totalShares;
-    uint256 private constant DEAD_SHARES = 1000; // Brûlées au premier dépôt (anti-inflation attack)
+    uint256 private constant DEAD_SHARES = 1_000_000; // Brûlées au premier dépôt (anti-inflation attack)
 
     // Systeme de tracking des fees
     mapping(address => uint256) public userFeeDebtToken0;
@@ -158,11 +160,13 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     uint64 private _rebalanceStartedAt;
 
     uint256 public minDepositUSD;
+    uint256 public maxDepositUsd; // USD 8 decimals, 0 only before deployment batch sets the production cap
     address public emergencySafe;
 
     // Age max (secondes) du cache prix accepte par processDepositPermissionless (anti-prix-perime).
-    // Reglable par la Safe sans redeploiement. Defaut 3600 (1h) ; pool stablecoin peut elargir.
-    uint256 public depositMaxCacheAge = 3600;
+    // Reglable par la Safe sans redeploiement. Defaut 300s, aligne bot/keepers.
+    uint256 public depositMaxCacheAge = 300;
+    uint256 public depositRefundDelay = 7 days;
 
     // Système de tracking des fees time-weighted
     // audit V1 (M3-B-fix, retour Codex) : COMPTA DES FEES — accFeePerShare pro-rata des SHARES courantes.
@@ -179,11 +183,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     event Deposit(address indexed user, uint256 amount0, uint256 amount1, uint256 shares);
     event Withdraw(address indexed user, uint256 amount0, uint256 amount1, uint256 shares);
     event PendingDepositAdded(address indexed user, uint256 amount0, uint256 amount1);
+    event DepositRefunded(address indexed user, uint256 amount0, uint256 amount1);
+    event DepositRefundDelayUpdated(uint256 oldDelay, uint256 newDelay);
     // event DepositsProcessed supprimé avec la fonction batch processPendingDeposits (audit V1)
     event FeesDistributed(uint256 fees0, uint256 fees1);
     event CommissionRateUpdated(uint256 oldRate, uint256 newRate);
-    event RebalancingStarted(uint256 timestamp);
-    event RebalancingEnded(uint256 timestamp);
     event RangeManagerSet(address indexed rangeManager);
     event EmergencyUserRecovered(
         address indexed user, uint256 amount0Recovered, uint256 amount1Recovered, uint256 sharesRemoved
@@ -191,6 +195,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     event PositionBurned(uint256 indexed tokenId, address indexed executor);
     event AllPositionsBurned(uint256 positionCount, address indexed executor);
     event MinDepositUpdated(uint256 oldMinimum, uint256 newMinimum);
+    event MaxDepositUpdated(uint256 oldMaximum, uint256 newMaximum);
     event BotModuleSet(address indexed module);
     event TreasuryAddressUpdated(address indexed oldTreasury, address indexed newTreasury);
     event ExecutorAuthorizedOnRangeManager(address indexed executor, bool authorized);
@@ -243,6 +248,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         authorizedRecipients[address(this)] = true;
 
+        require(_minDepositUSD > 0, "E23");
         minDepositUSD = _minDepositUSD;
         emergencySafe = msg.sender;
 
@@ -285,10 +291,19 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint8 _volatMoyDay,
         uint8 _volatTrimDay,
         uint16 _rangeStepBps,
-        uint16 _rangeMultiplicatorBps
+        uint16 _rangeMultiplicatorBps,
+        uint16 _rangeMinBps,
+        uint16 _rangeMaxBps
     ) external onlyOwner {
         IRangeManagerExtended(address(rangeManager)).setDynamicRangeConfig(
-            _enabled, _maxSnapshotsPerDay, _volatMoyDay, _volatTrimDay, _rangeStepBps, _rangeMultiplicatorBps
+            _enabled,
+            _maxSnapshotsPerDay,
+            _volatMoyDay,
+            _volatTrimDay,
+            _rangeStepBps,
+            _rangeMultiplicatorBps,
+            _rangeMinBps,
+            _rangeMaxBps
         );
     }
 
@@ -297,9 +312,28 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     ///      on RangeManager, governance can still execute RangeManager setters through this relay.
     function executeRangeManagerGovernance(bytes calldata data) external onlyOwner returns (bytes memory result) {
         require(data.length >= 4, "E20");
+        bytes4 selector = bytes4(data[:4]);
+        require(_isAllowedRangeManagerGovernanceSelector(selector), "E20");
         (bool ok, bytes memory ret) = address(rangeManager).call(data);
         require(ok, "E20");
         return ret;
+    }
+
+    function _isAllowedRangeManagerGovernanceSelector(bytes4 selector) private pure returns (bool) {
+        return selector == bytes4(keccak256("configureRanges(uint16,uint16)"))
+            || selector == bytes4(keccak256("setDynamicRangeConfig(bool,uint8,uint8,uint8,uint16,uint16,uint16,uint16)"))
+            || selector == bytes4(keccak256("setDynamicRangeEnabled(bool)"))
+            || selector == bytes4(keccak256("setRangeMultiplicator(uint16)"))
+            || selector == bytes4(keccak256("configureSlippage(uint24)"))
+            || selector == bytes4(keccak256("configureTolerance(uint16)"))
+            || selector == bytes4(keccak256("configureProtections(bool,bool,bool,uint16)"))
+            || selector == bytes4(keccak256("setOracleParams(uint16,uint32,uint32)"))
+            || selector == bytes4(keccak256("configurePriceFeeds(address,address,address)"))
+            || selector == bytes4(keccak256("setInitMultiSwapTvl(uint256)"))
+            || selector == bytes4(keccak256("setSwapFeeBps(uint16)"))
+            || selector == bytes4(keccak256("setTreasuryAddress(address)"))
+            || selector == bytes4(keccak256("setSafeAddress(address)"))
+            || selector == bytes4(keccak256("setAuthorizedExecutor(address,bool)"));
     }
 
     // AUDIT (nettoyage code mort, parité avec la pool DN) : calculateUserShareOfFees + estimateTotalFees
@@ -328,10 +362,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         require(amount0 > 0 || amount1 > 0, "E21");
         require(!hasPendingDeposit[msg.sender], "E22");
 
-        // Vérifier le montant minimum seulement si > 0
-        if (minDepositUSD > 0) {
+        rangeManager.refreshPriceCache();
+        (uint128 p0, uint128 p1,,, uint64 ts, bool valid) = rangeManager.priceCache();
+        require(valid && p0 > 0 && p1 > 0 && block.timestamp - uint256(ts) <= depositMaxCacheAge, "E38");
+
+        // Vérifier les bornes dépôt sur la valeur oracle avant transfert.
+        if (minDepositUSD > 0 || maxDepositUsd > 0) {
             uint256 depositValueUSD = _calculateDepositValue(amount0, amount1);
-            require(depositValueUSD >= minDepositUSD, "E23");
+            if (minDepositUSD > 0) require(depositValueUSD >= minDepositUSD, "E23");
+            if (maxDepositUsd > 0) require(depositValueUSD <= maxDepositUsd, "E26");
         }
 
         // Transferer les tokens au vault
@@ -352,15 +391,36 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit PendingDepositAdded(msg.sender, amount0, amount1);
     }
 
+    /// @notice Rembourse le dépôt en tête de file s'il reste inexécutable trop longtemps.
+    /// @dev Permissionless et destination figée au déposant : libère la queue sans pouvoir détourner de fonds.
+    function refundStaleHeadDeposit() external nonReentrant {
+        require(_pendingCount() > 0, "E24");
+        PendingDeposit memory pd = pendingDeposits[_pendingHead];
+        require(block.timestamp >= pd.timestamp + depositRefundDelay, "E_NOT_REFUNDABLE");
+
+        hasPendingDeposit[pd.user] = false;
+        _pendingHead++;
+        if (_pendingHead >= pendingDeposits.length) {
+            delete pendingDeposits;
+            _pendingHead = 0;
+        }
+
+        if (pd.amount0 > 0) token0.safeTransfer(pd.user, pd.amount0);
+        if (pd.amount1 > 0) token1.safeTransfer(pd.user, pd.amount1);
+
+        emit DepositRefunded(pd.user, pd.amount0, pd.amount1);
+    }
+
     // ===== PROCESS DEPOSITS ET WITHDRAW =====
 
     // SÉCURITÉ (audit V1) : la fonction batch processPendingDeposits() a été SUPPRIMÉE. Elle figeait
     // currentTotalValue avant la boucle tout en incrémentant totalShares à chaque itération, ce qui
     // sur-mintait des shares aux dépôts tardifs d'un même lot (dilution des holders existants). Elle
     // était `onlyBot` mais le selector restait whitelisté dans le module → atteignable par une clé bot
-    // compromise. Le traitement des dépôts se fait désormais UNIQUEMENT un par un via des chemins atomiques :
-    // processDepositPermissionless() en production bot/keepers, processSingleDeposit() comme chemin onlyBot
-    // historique. Tous recalculent la valeur du vault à CHAQUE dépôt (accounting juste).
+    // compromise. Le traitement des dépôts se fait désormais UNIQUEMENT un par un. Le flux public/bot/keepers
+    // de production est processDepositPermissionless() (swap + mint/add atomiques). processSingleDeposit()
+    // reste un chemin onlyBot historique non whitelisté module : ne pas l'utiliser comme flux keeper normal.
+    // Tous recalculent la valeur du vault à CHAQUE dépôt (accounting juste).
 
     // ===== TRAITEMENT INDIVIDUEL DES DEPOTS =====
 
@@ -397,26 +457,39 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         return RangeOperations.depositSwapParams(address(rangeManager), pd.amount0, pd.amount1);
     }
 
-    /**
-     * @notice Traite UN SEUL dépôt (le premier de la queue)
-     * @dev Chemin onlyBot historique. Le flux de production utilise processDepositPermissionless(),
-     *      qui fait swaps + mint/add en une transaction atomique.
-     *      Chaque utilisateur paie ses propres frais de swap proportionnels à son dépôt
-     */
-    function processSingleDeposit() external onlyBot {
-        require(_pendingCount() > 0, "E24");
-        _processOneDeposit();
+    /// @notice Cristallise les fees LP avant de calculer un plan de dépôt.
+    /// @dev Permissionless/no-bounty. Utile si des fees latentes déséquilibrent les soldes libres du RM :
+    ///      bot/keepers peuvent appeler ceci, puis relire getDepositSwapParams() avant processDepositPermissionless().
+    function syncFeesForDeposits() external nonReentrant {
+        rangeManager.collectFeesForVault();
     }
 
     /**
-     * @notice Logique partagee de traitement d'UN depot de la file (premier element).
-     * @dev Extraite de processSingleDeposit pour etre reutilisee par processDepositPermissionless,
-     *      garantissant un calcul de shares IDENTIQUE (oracle Chainlink). Calcule les shares,
-     *      met a jour l'accounting utilisateur, transfere les fonds du depot au RangeManager,
-     *      retire le depot de la file, emet Deposit. Le caller gere verrou/swaps/addLiquidity/bounty.
-     * @return amount0 Montant token0 du depot traite. @return amount1 Montant token1.
+     * @notice Traite UN SEUL dépôt (le premier de la queue)
+     * @dev Chemin onlyBot historique, non whitelisté dans SecureBotModule. Le flux de production bot/keepers
+     *      utilise processDepositPermissionless(), qui fait swaps + mint/add en une transaction atomique.
+     *      Chaque utilisateur paie ses propres frais de swap proportionnels à son dépôt
      */
-    function _processOneDeposit() private returns (uint256 amount0, uint256 amount1, uint256 depositValue) {
+    function processSingleDeposit() external onlyBot nonReentrant {
+        require(_pendingCount() > 0, "E24");
+        bool hasPosition = rangeManager.getOwnerPositions().length > 0;
+        if (hasPosition) rangeManager.collectFeesForVault();
+        (PendingDeposit memory pd, uint256 depositValue, uint256 valueBefore, uint256 sharesBefore) =
+            _processOneDeposit();
+        if (hasPosition) rangeManager.addLiquidityToPosition();
+        else rangeManager.mintInitialPosition();
+        _finalizeProcessedDeposit(pd, depositValue, 0, valueBefore, sharesBefore);
+    }
+
+    /**
+     * @notice Prepare UN depot de la file (premier element), sans minter les shares.
+     * @dev H-01: les shares sont finalisees APRES swaps/addLiquidity afin que le slippage reel du
+     *      depot soit impute au deposant, pas socialise aux holders existants.
+     */
+    function _processOneDeposit()
+        private
+        returns (PendingDeposit memory pd, uint256 depositValue, uint256 currentTotalValue, uint256 totalSharesBefore)
+    {
         _requirePause(0x5ea9e82a); // requireInflowsActive()
         // SÉCURITÉ (audit V1 — High) : le calcul des shares utilise getCurrentBalances() (composition LP au
         // prix slot0 Uniswap, MANIPULABLE) au dénominateur, alors que depositValue vient de l'oracle Chainlink.
@@ -432,70 +505,17 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
 
         // Récupérer le premier dépôt EN ATTENTE (tête de file = _pendingHead)
-        PendingDeposit memory pd = pendingDeposits[_pendingHead];
+        pd = pendingDeposits[_pendingHead];
 
-        // audit V1 (M3-B-fix2, retour Codex — Medium) : CRISTALLISER les fees Uniswap AVANT de calculer les
-        // shares. getCurrentBalances() ne valorise que tokens libres + liquidite + tokensOwed DEJA cristallises,
-        // PAS le feeGrowth latent. Sans cette collecte, un deposant entrerait avec un denominateur SOUS-EVALUE
-        // puis capterait une part des fees pre-depot d'autrui lors de la prochaine collecte. collectFeesForVault()
-        // pousse le feeGrowth -> met a jour accFeePerShare pour les porteurs EXISTANTS + libere les tokens (donc
-        // _calculateTotalValue ci-dessous est exact). Le nouvel user est checkpointe APRES (debt=shares*acc).
-        // FAIL-CLOSED : si la collecte revert (position existante), on bloque le mint (retry au cycle suivant).
-        if (rangeManager.getOwnerPositions().length > 0) {
-            rangeManager.collectFeesForVault();
-        }
-
-        uint256 currentTotalValue = _calculateTotalValue();
-
-        // Calculer les shares
+        currentTotalValue = _calculateTotalValue();
         depositValue = _calculateDepositValue(pd.amount0, pd.amount1);
-        uint256 sharesToMint;
-
-        if (totalShares <= DEAD_SHARES) {
-            // Premier dépôt (ou re-dépôt après withdraw total, ne reste que les dead shares)
-            totalShares = 0; // Reset pour recalculer proprement
-            sharesToMint = depositValue * 1e10;
-            require(sharesToMint > DEAD_SHARES, "First deposit too small");
-            sharesToMint -= DEAD_SHARES;
-            totalShares += DEAD_SHARES; // Dead shares permanentes (pas attribuées)
-        } else {
+        totalSharesBefore = totalShares;
+        if (totalSharesBefore > DEAD_SHARES) {
             require(currentTotalValue > 0, "E25");
             require(depositValue > 0, "E_ZERO_VALUE"); // audit V1 (Medium) : pas de dépôt sans valeur
-            sharesToMint = (depositValue * totalShares) / currentTotalValue;
-            require(sharesToMint > 0, "E_ZERO_SHARES"); // audit V1 (Medium) : pas de mint à 0 share
+        } else {
+            require(depositValue > 0, "E_ZERO_VALUE");
         }
-
-        // Mettre a jour les infos utilisateur
-        UserInfo storage user = userInfo[pd.user];
-
-        // audit V1 (M3-B-fix) — COMPTA accFeePerShare : REGLER les fees AVANT d'ajouter les nouvelles shares
-        // (fige la dette sur l'ancien solde). No-op si shares==0 (1er depot / re-depot apres retrait total).
-        _updateUserFees(pd.user);
-
-        if (user.shares == 0) {
-            user.firstDepositTime = block.timestamp;
-        }
-
-        user.shares += sharesToMint;
-        user.depositedToken0 += pd.amount0;
-        user.depositedToken1 += pd.amount1;
-        user.depositedValueUSD += depositValue;
-        user.lastDepositTime = block.timestamp;
-        // Anti-flash-loan: bloque withdraw dans le meme bloc que le processing du depot.
-        // Sans ce garde-fou, un attaquant peut deposit+process+withdraw dans une seule tx
-        // et exploiter l'ecart entre prix oracle (sert au calcul des shares) et balances LP
-        // (servent au calcul du withdraw). Voir audit V1+V3.
-        user.lastDepositBlock = block.number;
-
-        _registerUser(pd.user);
-
-        // audit V1 (M3-B-fix) — RE-CHECKPOINT la dette sur le NOUVEAU solde : les shares fraichement mintees
-        // ne reclament pas les fees passees. debt = shares * acc.
-        userFeeDebtToken0[pd.user] = user.shares * accFeePerShare0;
-        userFeeDebtToken1[pd.user] = user.shares * accFeePerShare1;
-
-        totalShares += sharesToMint;
-        hasPendingDeposit[pd.user] = false;
 
         // Envoyer les fonds de CE DEPOT UNIQUEMENT au RangeManager
         if (pd.amount0 > 0) {
@@ -506,6 +526,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
 
         // Retirer ce dépôt de la queue : avancer la tête (O(1), audit V1 — DoS gas A) au lieu du shift O(n).
+        hasPendingDeposit[pd.user] = false;
         _pendingHead++;
         // Compactage : si la file est entièrement traitée, libérer le storage et réinitialiser la tête.
         if (_pendingHead >= pendingDeposits.length) {
@@ -513,8 +534,48 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             _pendingHead = 0;
         }
 
+        return (pd, depositValue, currentTotalValue, totalSharesBefore);
+    }
+
+    function _finalizeProcessedDeposit(
+        PendingDeposit memory pd,
+        uint256 depositValue,
+        uint256 swapLossUsd,
+        uint256 currentTotalValue,
+        uint256 totalSharesBefore
+    ) private returns (uint256 sharesToMint) {
+        uint256 creditedValue = depositValue > swapLossUsd ? depositValue - swapLossUsd : 0;
+        require(creditedValue > 0, "E_ZERO_VALUE");
+
+        if (totalSharesBefore <= DEAD_SHARES) {
+            require(currentTotalValue == 0, "E_ORPHAN_VALUE");
+            totalShares = 0;
+            sharesToMint = creditedValue * 1e10;
+            require(sharesToMint > DEAD_SHARES, "First deposit too small");
+            sharesToMint -= DEAD_SHARES;
+            totalShares = DEAD_SHARES;
+        } else {
+            sharesToMint = (creditedValue * totalSharesBefore) / currentTotalValue;
+            require(sharesToMint > 0, "E_ZERO_SHARES");
+        }
+
+        UserInfo storage user = userInfo[pd.user];
+        _updateUserFees(pd.user);
+        if (user.shares == 0) user.firstDepositTime = block.timestamp;
+
+        user.shares += sharesToMint;
+        user.depositedToken0 += pd.amount0;
+        user.depositedToken1 += pd.amount1;
+        user.depositedValueUSD += creditedValue;
+        user.lastDepositTime = block.timestamp;
+        user.lastDepositBlock = block.number;
+        _registerUser(pd.user);
+
+        userFeeDebtToken0[pd.user] = user.shares * accFeePerShare0;
+        userFeeDebtToken1[pd.user] = user.shares * accFeePerShare1;
+        totalShares += sharesToMint;
+
         emit Deposit(pd.user, pd.amount0, pd.amount1, sharesToMint);
-        return (pd.amount0, pd.amount1, depositValue);
     }
 
     /**
@@ -537,6 +598,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         address tokenOut
     ) external nonReentrant {
         require(swapAmountsIn.length == minAmountsOut.length, "len");
+        require(!_processingRebalance, "E32");
         // 1. File non vide (anti-drain bounty : on ne paie que sur depot reel)
         require(_pendingCount() > 0, "E24");
         // 2. Etat LP : si aucun NFT n'existe, seule l'execution botModule/owner peut minter la position initiale.
@@ -557,22 +619,26 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         (uint128 price0, uint128 price1,,, uint64 ts, bool valid) = rangeManager.priceCache();
         require(valid && price0 > 0 && price1 > 0, "E38");
         require(block.timestamp - uint256(ts) <= depositMaxCacheAge, "stale");
+        if (hasPosition) rangeManager.collectFeesForVault();
         PendingDeposit memory pdPlan = pendingDeposits[_pendingHead];
         rangeManager.validateDepositSwapPlan(
             pdPlan.amount0, pdPlan.amount1, swapAmountsIn, minAmountsOut, tokenIn, tokenOut
         );
-
         // 4. VERROU (un withdraw concurrent revert E32 ; pose pendant toute la modification de position)
         _processingRebalance = true;
+        _rebalanceStartedAt = uint64(block.timestamp);
 
-        // 5. Shares + transfert des fonds au RangeManager (meme logique comptable que processSingleDeposit)
-        (,, uint256 depositValue) = _processOneDeposit();
+        // 5. Transfert des fonds au RangeManager. Shares finalisees APRES swaps/addLiquidity (H-01).
+        (PendingDeposit memory pd, uint256 depositValue, uint256 valueBefore, uint256 sharesBefore) =
+            _processOneDeposit();
 
         // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk
         uint256 n = swapAmountsIn.length;
+        uint256 swapLossUsd;
         if (n > 0) {
             for (uint256 i = 0; i < n; i++) {
-                rangeManager.executeSwap(tokenIn, tokenOut, swapAmountsIn[i], minAmountsOut[i]);
+                uint256 amountOut = rangeManager.executeSwap(tokenIn, tokenOut, swapAmountsIn[i], minAmountsOut[i]);
+                swapLossUsd += _swapLossUsd(tokenIn == address(token0), swapAmountsIn[i], amountOut);
             }
         }
 
@@ -580,8 +646,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (hasPosition) rangeManager.addLiquidityToPosition();
         else rangeManager.mintInitialPosition();
 
+        _finalizeProcessedDeposit(pd, depositValue, swapLossUsd, valueBefore, sharesBefore);
+
         // 8. DEVERROU
         _processingRebalance = false;
+        _rebalanceStartedAt = 0;
 
         // 9. Deposit bounty (silent: ne jamais bloquer l'action si treasury vide / desactive)
         if (treasuryAddress != address(0)) {
@@ -602,17 +671,27 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function startRebalance() external onlyBot {
-        require(!_processingRebalance || block.timestamp > uint256(_rebalanceStartedAt) + 30 minutes, "E32");
+        require(!_processingRebalance, "E32");
         _processingRebalance = true;
         _rebalanceStartedAt = uint64(block.timestamp);
     }
 
-    function endRebalance() external onlyBot {
+    function endRebalance() external {
+        require(
+            msg.sender == owner() || msg.sender == botModule || msg.sender == address(rangeManager)
+                || msg.sender == emergencySafe,
+            "Only bot"
+        );
         _processingRebalance = false;
+        _rebalanceStartedAt = 0;
     }
 
     function isRebalancing() external view returns (bool) {
-        return _processingRebalance && block.timestamp <= uint256(_rebalanceStartedAt) + 30 minutes;
+        return _processingRebalance;
+    }
+
+    function getRebalanceLockStatus() external view returns (bool locked, uint64 startedAt) {
+        return (_processingRebalance, _rebalanceStartedAt);
     }
 
     function withdraw(uint256 shareAmount) external nonReentrant {
@@ -634,7 +713,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      */
     function _withdrawInternal(uint256 shareAmount) internal {
         // ===== CHECKS =====
-        require(!_processingRebalance || block.timestamp > uint256(_rebalanceStartedAt) + 30 minutes, "E32");
+        require(!_processingRebalance, "E32");
         UserInfo storage user = userInfo[msg.sender];
         require(user.shares >= shareAmount && shareAmount > 0 && totalShares > 0, "E33");
         // Anti-flash-loan: refuse tout withdraw dans le meme bloc que le processing du dernier
@@ -835,6 +914,23 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
     }
 
+    function _swapLossUsd(bool tokenInIsToken0, uint256 amountIn, uint256 amountOut) private view returns (uint256) {
+        (uint128 price0, uint128 price1,,,, bool valid) = rangeManager.priceCache();
+        require(valid, "E38");
+        RangeOperations.RangeConfig memory config = rangeManager.config();
+
+        uint256 valueIn;
+        uint256 valueOut;
+        if (tokenInIsToken0) {
+            valueIn = (amountIn * uint256(price0)) / (10 ** config.token0Decimals);
+            valueOut = (amountOut * uint256(price1)) / (10 ** config.token1Decimals);
+        } else {
+            valueIn = (amountIn * uint256(price1)) / (10 ** config.token1Decimals);
+            valueOut = (amountOut * uint256(price0)) / (10 ** config.token0Decimals);
+        }
+        return valueIn > valueOut ? valueIn - valueOut : 0;
+    }
+
     // ===== VIEW FONCTIONS =====
 
     function isAuthorizedRecipient(address recipient) external view returns (bool) {
@@ -967,6 +1063,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 } else {
                     // Retirer un pourcentage de liquidité proportionnel aux shares
                     liquidityToRemove = (totalLiquidity * shareAmount) / totalSharesBefore;
+                    require(liquidityToRemove > 0, "E_ZERO_LIQ");
                 }
             }
         }
@@ -1155,10 +1252,24 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit MinDepositUpdated(oldMinimum, _newMinimum);
     }
 
+    function setMaxDepositUsd(uint256 _newMaximum) external onlyOwner {
+        require(_newMaximum > minDepositUSD, "E18");
+        uint256 oldMaximum = maxDepositUsd;
+        maxDepositUsd = _newMaximum;
+        emit MaxDepositUpdated(oldMaximum, _newMaximum);
+    }
+
     /// @notice Age max du cache prix (s) accepte par processDepositPermissionless. Gouvernance.
     function setDepositMaxCacheAge(uint256 _maxAge) external onlyOwner {
         require(_maxAge >= 60 && _maxAge <= 86400, "E18");
         depositMaxCacheAge = _maxAge;
+    }
+
+    function setDepositRefundDelay(uint256 refundDelay) external onlyOwner {
+        require(refundDelay >= 3600 && refundDelay <= 30 days, "E18");
+        uint256 oldDelay = depositRefundDelay;
+        depositRefundDelay = refundDelay;
+        emit DepositRefundDelayUpdated(oldDelay, refundDelay);
     }
 
     function setBotModule(address _module) external onlyOwner {

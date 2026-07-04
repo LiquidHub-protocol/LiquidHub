@@ -34,6 +34,7 @@ class Rebalancer {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
     try {
+      const priceCache = await this._freshPriceCache('rebalance plan/minOut');
       // 1. AUDIT M-01 : en DN, le plan de swap du rebalance doit viser une composition LP compatible avec la
       // DETTE AAVE FIXE (rebalance() ne touche pas AAVE) : wethInLP ≈ effectiveShort/H. Sinon le post-check DN
       // on-chain reverte. On utilise donc la vue dédiée getRebalanceSwapParams (Vault) au lieu du plan range
@@ -53,7 +54,6 @@ class Rebalancer {
 
         // Read on-chain chunk cap (initMultiSwapTvl in USD, contract value)
         const initMultiSwapTvl = await this.rangeManager.initMultiSwapTvl();
-        const priceCache = await this.rangeManager.priceCache();
         // Decimals read ON-CHAIN from config() (generic for any pair, not the .env) — same source as processDeposit
         const cfg = await this.rangeManager.config();
         const dec0 = Number(cfg.token0Decimals);
@@ -116,6 +116,8 @@ class Rebalancer {
   async processDeposit() {
     console.log('\n=== Processing queued deposit (permissionless) ===');
     try {
+      const priceCache = await this._freshPriceCache('deposit plan/minOut');
+      await this._syncFeesForDepositPlan();
       // AUDIT H-01 : pour un DÉPÔT, on utilise la vue DÉDIÉE du Vault (état post-transfert du dépôt +
       // post-ouverture du hedge), PAS rangeManager.getOptimalSwapParams (qui reflète l état rebalance/post-burn
       // — inclut le NFT, ignore le dépôt + le WETH emprunté → 0 swap erroné ou swap sur fonds bloqués).
@@ -133,7 +135,6 @@ class Rebalancer {
         tokenOut = zeroForOne ? token1 : token0;
 
         const initMultiSwapTvl = await this.rangeManager.initMultiSwapTvl();
-        const priceCache = await this.rangeManager.priceCache();
         const cfg = await this.rangeManager.config();
 
         const dec0 = Number(cfg.token0Decimals);
@@ -144,12 +145,12 @@ class Rebalancer {
         const amountUSD = parseFloat(ethers.formatUnits(amountIn, decimals)) * price;
         const capUSD = Number(initMultiSwapTvl);
         const numSwaps = capUSD > 0 ? Math.max(1, Math.ceil(amountUSD / capUSD)) : 1;
-        // AUDIT : cap anti-DoS on-chain DN_MAX_SWAP_CHUNKS=8. Au-delà, processDepositPermissionless reverte
+        // AUDIT : cap anti-DoS on-chain DN_MAX_SWAP_CHUNKS=10. Au-delà, processDepositPermissionless reverte
         // (E_DEPOSIT_TOO_LARGE). On SKIP proprement plutôt que d'envoyer une tx condamnée (pas de gas gaspillé).
         // Le dépôt reste en tête de file (remboursable via refundStaleHeadDeposit après délai).
-        if (numSwaps > 8) {
-          console.log(`  Deposit needs ${numSwaps} swaps > 8 (anti-DoS cap) -> skip (no tx sent, deposit left in queue).`);
-          return { success: false, error: 'deposit too large (> 8 swap chunks)', txHashes: [] };
+        if (numSwaps > 10) {
+          console.log(`  Deposit needs ${numSwaps} swaps > 10 (anti-DoS cap) -> skip (no tx sent, deposit left in queue).`);
+          return { success: false, error: 'deposit too large (> 10 swap chunks)', txHashes: [] };
         }
         swapAmounts = divideIntoChunks(amountIn, numSwaps);
 
@@ -157,7 +158,7 @@ class Rebalancer {
         const slippageBps = Number(cfg.maxSlippageBps);
         minOuts = swapAmounts.map((amt) => this._oracleMinOut(zeroForOne, amt, priceCache, dec0, dec1, slippageBps));
 
-        console.log(`  Swap: ${numSwaps} chunk(s), ~$${amountUSD.toFixed(0)} total (cap $${capUSD}/chunk), minOut floored by oracle`);
+        console.log(`  Swap: ${numSwaps} chunk(s), ~$${amountUSD.toFixed(0)} total (cap $${capUSD}/chunk), minOut floored by oracle, on-chain slippage ${slippageBps} bps`);
       } else {
         console.log('  No swap needed (deposit already balanced)');
       }
@@ -187,6 +188,47 @@ class Rebalancer {
     const theo = (BigInt(amountIn) * priceIn * (10n ** BigInt(decOut))) / (priceOut * (10n ** BigInt(decIn)));
     const slip = slippageBps >= 10000 ? 9999n : BigInt(slippageBps);
     return (theo * (10000n - slip)) / 10000n;
+  }
+
+  async _freshPriceCache(label) {
+    let priceCache = await this.rangeManager.priceCache();
+    if (!this._needsPriceCacheRefresh(priceCache)) return priceCache;
+
+    console.log(`  priceCache stale/invalid before ${label}; calling refreshPriceCache()...`);
+    try {
+      const tx = await this.rmConnected.refreshPriceCache();
+      const receipt = await tx.wait();
+      console.log(`  priceCache refreshed: ${receipt.hash}`);
+      priceCache = await this.rangeManager.priceCache();
+    } catch (error) {
+      console.log(`  refreshPriceCache skipped/failed: ${(error.reason || error.shortMessage || error.message || '').slice(0, 100)}`);
+    }
+
+    if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) {
+      throw new Error('priceCache invalid after refresh attempt');
+    }
+    if (this._needsPriceCacheRefresh(priceCache)) {
+      throw new Error('priceCache still stale after refresh attempt');
+    }
+    return priceCache;
+  }
+
+  async _syncFeesForDepositPlan() {
+    try {
+      const tx = await this.vaultConnected.syncFeesForDeposits();
+      const receipt = await tx.wait();
+      console.log(`  Fees synced before deposit plan: ${receipt.hash}`);
+    } catch (error) {
+      console.log(`  Fee sync skipped (${(error.reason || error.message || '').slice(0, 90)})`);
+    }
+  }
+
+  _needsPriceCacheRefresh(priceCache) {
+    if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) return true;
+    const maxAgeSec = parseInt(process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || '300', 10);
+    const ts = Number(priceCache.timestamp || 0);
+    if (!Number.isFinite(maxAgeSec) || maxAgeSec <= 0 || !ts) return false;
+    return Math.floor(Date.now() / 1000) - ts > maxAgeSec;
   }
 }
 
