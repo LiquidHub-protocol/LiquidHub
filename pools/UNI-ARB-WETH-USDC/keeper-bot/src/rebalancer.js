@@ -21,12 +21,11 @@ function divideIntoChunks(totalAmount, numChunks) {
  * Permissionless: no keeper role required — anyone can trigger when needsRebalance is true.
  */
 class Rebalancer {
-  constructor(rangeManager, vault, wallet) {
+  constructor(rangeManager, vault, wallet, rpcPool) {
     this.rangeManager = rangeManager;
     this.vault = vault;
     this.wallet = wallet;
-    this.rmConnected = this.rangeManager.connect(wallet);
-    this.vaultConnected = this.vault.connect(wallet);
+    this.rpcPool = rpcPool;
   }
 
   async executeRebalance(tokenId) {
@@ -35,7 +34,9 @@ class Rebalancer {
     try {
       const priceCache = await this._freshPriceCache('rebalance plan/minOut');
       // 1. Read optimal swap params (what the contract would expect) — REBALANCE = état post-burn (NFT inclus).
-      const swapParams = await this.rangeManager.getOptimalSwapParams();
+      const swapParams = await this.rpcPool.executeWithRetry(async (provider) => {
+        return await this.rangeManager.connect(provider).getOptimalSwapParams();
+      });
 
       let swapAmounts = [];
       let minOuts = [];
@@ -49,9 +50,13 @@ class Rebalancer {
         tokenOut = swapParams.zeroForOne ? token1 : token0;
 
         // Read on-chain chunk cap (initMultiSwapTvl in USD, contract value)
-        const initMultiSwapTvl = await this.rangeManager.initMultiSwapTvl();
+        const initMultiSwapTvl = await this.rpcPool.executeWithRetry(async (provider) => {
+          return await this.rangeManager.connect(provider).initMultiSwapTvl();
+        });
         // Decimals read ON-CHAIN from config() (generic for any pair, not the .env) — same source as processDeposit
-        const cfg = await this.rangeManager.config();
+        const cfg = await this.rpcPool.executeWithRetry(async (provider) => {
+          return await this.rangeManager.connect(provider).config();
+        });
         const dec0 = Number(cfg.token0Decimals);
         const dec1 = Number(cfg.token1Decimals);
         const decimals = swapParams.zeroForOne ? dec0 : dec1;
@@ -77,8 +82,12 @@ class Rebalancer {
 
       // 2. Single atomic call — contract does burn → swap(s) → mint → bounty
       console.log('  Executing rebalance() on-chain...');
-      const tx = await this.rmConnected.rebalance(swapAmounts, minOuts, tokenIn, tokenOut);
-      const receipt = await tx.wait();
+      const receipt = await this.rpcPool.executeWithRetry(async (provider) => {
+        const rm = this.rangeManager.connect(this.wallet.connect(provider));
+        await rm.rebalance.staticCall(swapAmounts, minOuts, tokenIn, tokenOut);
+        const tx = await rm.rebalance(swapAmounts, minOuts, tokenIn, tokenOut);
+        return await tx.wait();
+      });
       console.log(`  Rebalance complete: ${receipt.hash}`);
 
       return { success: true, txHashes: [receipt.hash] };
@@ -103,7 +112,9 @@ class Rebalancer {
       await this._syncFeesForDepositPlan();
       // AUDIT H-01/H-03 : DÉPÔT → vue dédiée (état post-transfert du dépôt + ratio NFT existant), PAS
       // getOptimalSwapParams (qui reflète l'état rebalance/post-burn → faux pour un dépôt).
-      const [zeroForOne, amountIn] = await this.vault.getDepositSwapParams();
+      const [zeroForOne, amountIn] = await this.rpcPool.executeWithRetry(async (provider) => {
+        return await this.vault.connect(provider).getDepositSwapParams();
+      });
 
       let swapAmounts = [];
       let minOuts = [];
@@ -116,8 +127,10 @@ class Rebalancer {
         tokenIn = zeroForOne ? token0 : token1;
         tokenOut = zeroForOne ? token1 : token0;
 
-        const initMultiSwapTvl = await this.rangeManager.initMultiSwapTvl();
-        const cfg = await this.rangeManager.config();
+        const [initMultiSwapTvl, cfg] = await this.rpcPool.executeWithRetry(async (provider) => {
+          const rm = this.rangeManager.connect(provider);
+          return await Promise.all([rm.initMultiSwapTvl(), rm.config()]);
+        });
 
         const dec0 = Number(cfg.token0Decimals);
         const dec1 = Number(cfg.token1Decimals);
@@ -141,8 +154,12 @@ class Rebalancer {
       }
 
       console.log('  Executing processDepositPermissionless() on-chain...');
-      const tx = await this.vaultConnected.processDepositPermissionless(swapAmounts, minOuts, tokenIn, tokenOut);
-      const receipt = await tx.wait();
+      const receipt = await this.rpcPool.executeWithRetry(async (provider) => {
+        const vault = this.vault.connect(this.wallet.connect(provider));
+        await vault.processDepositPermissionless.staticCall(swapAmounts, minOuts, tokenIn, tokenOut);
+        const tx = await vault.processDepositPermissionless(swapAmounts, minOuts, tokenIn, tokenOut);
+        return await tx.wait();
+      });
       console.log(`  Deposit processed: ${receipt.hash}`);
 
       return { success: true, txHashes: [receipt.hash] };
@@ -169,15 +186,22 @@ class Rebalancer {
   }
 
   async _freshPriceCache(label) {
-    let priceCache = await this.rangeManager.priceCache();
+    let priceCache = await this.rpcPool.executeWithRetry(async (provider) => {
+      return await this.rangeManager.connect(provider).priceCache();
+    });
     if (!this._needsPriceCacheRefresh(priceCache)) return priceCache;
 
     console.log(`  priceCache stale/invalid before ${label}; calling refreshPriceCache()...`);
     try {
-      const tx = await this.rmConnected.refreshPriceCache();
-      const receipt = await tx.wait();
+      const receipt = await this.rpcPool.executeWithRetry(async (provider) => {
+        const rm = this.rangeManager.connect(this.wallet.connect(provider));
+        const tx = await rm.refreshPriceCache();
+        return await tx.wait();
+      });
       console.log(`  priceCache refreshed: ${receipt.hash}`);
-      priceCache = await this.rangeManager.priceCache();
+      priceCache = await this.rpcPool.executeWithRetry(async (provider) => {
+        return await this.rangeManager.connect(provider).priceCache();
+      });
     } catch (error) {
       console.log(`  refreshPriceCache skipped/failed: ${(error.reason || error.shortMessage || error.message || '').slice(0, 100)}`);
     }
@@ -193,8 +217,11 @@ class Rebalancer {
 
   async _syncFeesForDepositPlan() {
     try {
-      const tx = await this.vaultConnected.syncFeesForDeposits();
-      const receipt = await tx.wait();
+      const receipt = await this.rpcPool.executeWithRetry(async (provider) => {
+        const vault = this.vault.connect(this.wallet.connect(provider));
+        const tx = await vault.syncFeesForDeposits();
+        return await tx.wait();
+      });
       console.log(`  Fees synced before deposit plan: ${receipt.hash}`);
     } catch (error) {
       console.log(`  Fee sync skipped (${(error.reason || error.message || '').slice(0, 90)})`);
@@ -203,7 +230,7 @@ class Rebalancer {
 
   _needsPriceCacheRefresh(priceCache) {
     if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) return true;
-    const maxAgeSec = parseInt(process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || '300', 10);
+    const maxAgeSec = parseInt(process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || process.env.BOT_PRICE_CACHE_MAX_AGE_SEC || '300', 10);
     const ts = Number(priceCache.timestamp || 0);
     if (!Number.isFinite(maxAgeSec) || maxAgeSec <= 0 || !ts) return false;
     return Math.floor(Date.now() / 1000) - ts > maxAgeSec;

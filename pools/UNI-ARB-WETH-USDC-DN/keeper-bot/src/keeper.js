@@ -7,6 +7,36 @@ const { Rebalancer } = require('./rebalancer');
 
 const CHECK_INTERVAL_MS = (parseInt(process.env.CHECK_INTERVAL_MIN || '10', 10)) * 60 * 1000;
 const CHECK_ONLY = process.argv.includes('--check-only');
+const PRICE_CACHE_MAX_AGE_SEC = parseInt(
+  process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || process.env.BOT_PRICE_CACHE_MAX_AGE_SEC || '300',
+  10
+);
+
+function needsPriceCacheRefresh(priceCache) {
+  if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) return true;
+  const ts = Number(priceCache.timestamp || 0);
+  return !ts || (Math.floor(Date.now() / 1000) - ts) > PRICE_CACHE_MAX_AGE_SEC;
+}
+
+async function ensureFreshPriceCacheBeforeDecision(rangeManager, wallet, rpcPool) {
+  const priceCache = await rpcPool.executeWithRetry(async (provider) => {
+    return await rangeManager.connect(provider).priceCache();
+  });
+  if (!needsPriceCacheRefresh(priceCache)) return;
+
+  if (!wallet) {
+    console.log('  priceCache stale/invalid before keeper decision — check-only mode, refresh skipped');
+    return;
+  }
+
+  console.log('  priceCache stale/invalid before keeper decision; calling refreshPriceCache()...');
+  const receipt = await rpcPool.executeWithRetry(async (provider) => {
+    const rm = rangeManager.connect(wallet.connect(provider));
+    const tx = await rm.refreshPriceCache();
+    return await tx.wait();
+  });
+  console.log(`  priceCache refreshed before keeper decision: ${receipt.hash}`);
+}
 
 /**
  * Resolves the Treasury contract. Prefers TREASURY_ADDRESS from .env (lets the keeper read
@@ -98,18 +128,18 @@ async function main() {
     console.log('Treasury info unavailable\n');
   }
 
-  let wallet, rebalancer, rmSigner, hedgeSigner;
+  let wallet, rebalancer;
   if (!CHECK_ONLY) {
     wallet = new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY, provider);
-    rebalancer = new Rebalancer(rangeManager, vault, hedgeManager, wallet);
-    rmSigner = rangeManager.connect(wallet);
-    if (hedgeManager) hedgeSigner = hedgeManager.connect(wallet);
+    rebalancer = new Rebalancer(rangeManager, vault, hedgeManager, wallet, rpcPool);
     console.log(`Keeper wallet: ${wallet.address}\n`);
   }
 
   while (true) {
     try {
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
+
+      await ensureFreshPriceCacheBeforeDecision(rangeManager, wallet, rpcPool);
 
       const [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
         async (p) => {
@@ -126,7 +156,9 @@ async function main() {
       let inflowsPaused = false;
       if (pauseController) {
         try {
-          inflowsPaused = await pauseController.inflowsPaused();
+          inflowsPaused = await rpcPool.executeWithRetry(async (p) => {
+            return await pauseController.connect(p).inflowsPaused();
+          });
           if (inflowsPaused) {
             console.log('  PauseController: inflows paused — skip deposit processing; rebalance and hedge maintenance remain enabled');
           }
@@ -141,7 +173,9 @@ async function main() {
       // availableBorrowsBase (all 8-decimal USD except healthFactor in 1e18).
       if (hedgeManager) {
         try {
-          const [totalCollateralBase, totalDebtBase, healthFactor] = await hedgeManager.getHedgeData();
+          const [totalCollateralBase, totalDebtBase, healthFactor] = await rpcPool.executeWithRetry(async (p) => {
+            return await hedgeManager.connect(p).getHedgeData();
+          });
           const totalCollateralUSD = Number(totalCollateralBase) / 1e8;
           const totalDebtUSD = Number(totalDebtBase) / 1e8;
           if (totalCollateralUSD < 1 && totalDebtUSD < 1) {
@@ -170,14 +204,19 @@ async function main() {
       // lets a single cycle both snapshot (bounty) and rebalance on a fresh price.
       if (!CHECK_ONLY) {
         try {
-          const due = await rangeManager.isSnapshotDue();
+          const due = await rpcPool.executeWithRetry(async (p) => {
+            return await rangeManager.connect(p).isSnapshotDue();
+          });
           if (due) {
             const metricsEnabled = treasury ? await treasury.metricsBountyEnabled() : false;
             const metricsAmount = treasury ? await treasury.metricsBountyAmount() : 0n;
             await checkBountyFunding('metrics', metricsEnabled, metricsAmount, treasuryAddr, usdc);
             console.log('  -> Snapshot due, recording price on-chain...');
-            const tx = await rmSigner.recordPriceSnapshot();
-            const rcpt = await tx.wait();
+            const rcpt = await rpcPool.executeWithRetry(async (p) => {
+              const rm = rangeManager.connect(wallet.connect(p));
+              const tx = await rm.recordPriceSnapshot();
+              return await tx.wait();
+            });
             console.log(`  -> Snapshot recorded: ${rcpt.hash}`);
           }
         } catch (e) {
@@ -196,9 +235,16 @@ async function main() {
       // reverts if the resulting hedge drifts beyond tolerance.
       if (!CHECK_ONLY && !inflowsPaused) {
         try {
-          const pending = await vault.getPendingDepositsCount();
-          const positions = await rangeManager.getOwnerPositions();
-          if (pending > 0n && positions.length > 0 && !(await vault.isRebalancing())) {
+          const [pending, positions, isRebalancing] = await rpcPool.executeWithRetry(async (p) => {
+            const v = vault.connect(p);
+            const rm = rangeManager.connect(p);
+            return await Promise.all([
+              v.getPendingDepositsCount(),
+              rm.getOwnerPositions(),
+              v.isRebalancing(),
+            ]);
+          });
+          if (pending > 0n && positions.length > 0 && !isRebalancing) {
             const depEnabled = treasury ? await treasury.depositBountyEnabled() : false;
             const depAmount = treasury ? await treasury.depositBountyAmount() : 0n;
             await checkBountyFunding('deposit', depEnabled, depAmount, treasuryAddr, usdc);
@@ -218,15 +264,18 @@ async function main() {
       // catches it so we never send a tx for nothing. It also REVERTS when drift is below the dynamic
       // range-width threshold returned by adjustHedgeBps(), or when the
       // on-chain cooldown (hedgeAdjustCooldown) has not elapsed. A successful (over-hedge) call earns the bounty.
-      if (!CHECK_ONLY && hedgeSigner) {
+      if (!CHECK_ONLY && hedgeManager && wallet) {
         try {
           // Pre-tx cooldown check: read the on-chain cooldown + last adjust timestamp and skip BEFORE
           // any tx (and even before the static-call) when the cooldown window is still open. This is
           // the single source of truth shared with the protocol bot — no divergence. cooldown=0 = off.
-          const [cooldownSec, lastAdjustAt] = await Promise.all([
-            hedgeManager.hedgeAdjustCooldown(),
-            hedgeManager.lastHedgeAdjustAt(),
-          ]);
+          const [cooldownSec, lastAdjustAt] = await rpcPool.executeWithRetry(async (p) => {
+            const hedge = hedgeManager.connect(p);
+            return await Promise.all([
+              hedge.hedgeAdjustCooldown(),
+              hedge.lastHedgeAdjustAt(),
+            ]);
+          });
           const cd = Number(cooldownSec);
           if (cd > 0) {
             const nowSec = Math.floor(Date.now() / 1000);
@@ -238,13 +287,16 @@ async function main() {
           }
           const hedgeEnabled = treasury ? await treasury.hedgeBountyEnabled() : false;
           const hedgeAmount = treasury ? await treasury.hedgeBountyAmount() : 0n;
-          // Static-call first: lets us distinguish "drift below threshold" (revert, normal) from
-          // actually sending a tx, so we only pay gas when an adjustment will go through.
-          await hedgeSigner.adjustHedge.staticCall();
           await checkBountyFunding('hedge', hedgeEnabled, hedgeAmount, treasuryAddr, usdc);
           console.log('  -> Hedge drift above threshold, adjusting on-chain...');
-          const tx = await hedgeSigner.adjustHedge();
-          const rcpt = await tx.wait();
+          const rcpt = await rpcPool.executeWithRetry(async (p) => {
+            const hedge = hedgeManager.connect(wallet.connect(p));
+            // Static-call first: lets us distinguish "drift below threshold" (revert, normal) from
+            // actually sending a tx, so we only pay gas when an adjustment will go through.
+            await hedge.adjustHedge.staticCall();
+            const tx = await hedge.adjustHedge();
+            return await tx.wait();
+          });
           console.log(`  -> Hedge adjusted: ${rcpt.hash}`);
         } catch (e) {
           // Cooldown skip already logged above — swallow it silently.

@@ -7,6 +7,36 @@ const { Rebalancer } = require('./rebalancer');
 
 const CHECK_INTERVAL_MS = (parseInt(process.env.CHECK_INTERVAL_MIN || '10', 10)) * 60 * 1000;
 const CHECK_ONLY = process.argv.includes('--check-only');
+const PRICE_CACHE_MAX_AGE_SEC = parseInt(
+  process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || process.env.BOT_PRICE_CACHE_MAX_AGE_SEC || '300',
+  10
+);
+
+function needsPriceCacheRefresh(priceCache) {
+  if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) return true;
+  const ts = Number(priceCache.timestamp || 0);
+  return !ts || (Math.floor(Date.now() / 1000) - ts) > PRICE_CACHE_MAX_AGE_SEC;
+}
+
+async function ensureFreshPriceCacheBeforeDecision(rangeManager, wallet, rpcPool) {
+  const priceCache = await rpcPool.executeWithRetry(async (provider) => {
+    return await rangeManager.connect(provider).priceCache();
+  });
+  if (!needsPriceCacheRefresh(priceCache)) return;
+
+  if (!wallet) {
+    console.log('  priceCache stale/invalid before keeper decision — check-only mode, refresh skipped');
+    return;
+  }
+
+  console.log('  priceCache stale/invalid before keeper decision; calling refreshPriceCache()...');
+  const receipt = await rpcPool.executeWithRetry(async (provider) => {
+    const rm = rangeManager.connect(wallet.connect(provider));
+    const tx = await rm.refreshPriceCache();
+    return await tx.wait();
+  });
+  console.log(`  priceCache refreshed before keeper decision: ${receipt.hash}`);
+}
 
 /**
  * Resolves the Treasury contract. Prefers TREASURY_ADDRESS from .env (lets the keeper read
@@ -95,11 +125,10 @@ async function main() {
     console.log('Treasury info unavailable\n');
   }
 
-  let wallet, rebalancer, rmSigner;
+  let wallet, rebalancer;
   if (!CHECK_ONLY) {
     wallet = new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY, provider);
-    rebalancer = new Rebalancer(rangeManager, vault, wallet);
-    rmSigner = rangeManager.connect(wallet);
+    rebalancer = new Rebalancer(rangeManager, vault, wallet, rpcPool);
     console.log(`Keeper wallet: ${wallet.address}\n`);
   }
 
@@ -107,6 +136,8 @@ async function main() {
   while (true) {
     try {
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
+
+      await ensureFreshPriceCacheBeforeDecision(rangeManager, wallet, rpcPool);
 
       const [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
         async (p) => {
@@ -123,7 +154,9 @@ async function main() {
       let inflowsPaused = false;
       if (pauseController) {
         try {
-          inflowsPaused = await pauseController.inflowsPaused();
+          inflowsPaused = await rpcPool.executeWithRetry(async (p) => {
+            return await pauseController.connect(p).inflowsPaused();
+          });
           if (inflowsPaused) {
             console.log('  PauseController: inflows paused — skip deposit processing; rebalance remains enabled');
           }
@@ -142,14 +175,19 @@ async function main() {
       // only so one cycle can both snapshot and rebalance on a fresh price.
       if (!CHECK_ONLY) {
         try {
-          const due = await rangeManager.isSnapshotDue();
+          const due = await rpcPool.executeWithRetry(async (p) => {
+            return await rangeManager.connect(p).isSnapshotDue();
+          });
           if (due) {
             const metricsEnabled = treasury ? await treasury.metricsBountyEnabled() : false;
             const metricsAmount = treasury ? await treasury.metricsBountyAmount() : 0n;
             await checkBountyFunding('metrics', metricsEnabled, metricsAmount, treasuryAddr, usdc);
             console.log('  -> Snapshot due, recording price on-chain...');
-            const tx = await rmSigner.recordPriceSnapshot();
-            const rcpt = await tx.wait();
+            const rcpt = await rpcPool.executeWithRetry(async (p) => {
+              const rm = rangeManager.connect(wallet.connect(p));
+              const tx = await rm.recordPriceSnapshot();
+              return await tx.wait();
+            });
             console.log(`  -> Snapshot recorded: ${rcpt.hash}`);
           }
         } catch (e) {
@@ -166,9 +204,16 @@ async function main() {
       // job), or the cache is stale — so we just try when a deposit is pending and skip on revert.
       if (!CHECK_ONLY && !inflowsPaused) {
         try {
-          const pending = await vault.getPendingDepositsCount();
-          const positions = await rangeManager.getOwnerPositions();
-          if (pending > 0n && positions.length > 0 && !(await vault.isRebalancing())) {
+          const [pending, positions, isRebalancing] = await rpcPool.executeWithRetry(async (p) => {
+            const v = vault.connect(p);
+            const rm = rangeManager.connect(p);
+            return await Promise.all([
+              v.getPendingDepositsCount(),
+              rm.getOwnerPositions(),
+              v.isRebalancing(),
+            ]);
+          });
+          if (pending > 0n && positions.length > 0 && !isRebalancing) {
             const depEnabled = treasury ? await treasury.depositBountyEnabled() : false;
             const depAmount = treasury ? await treasury.depositBountyAmount() : 0n;
             await checkBountyFunding('deposit', depEnabled, depAmount, treasuryAddr, usdc);

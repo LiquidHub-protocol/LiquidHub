@@ -48,14 +48,15 @@ class RPCPool {
 
   async executeWithRetry(fn, maxRetries = 3) {
     let lastError;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const attempts = Math.max(maxRetries, this.providers.length);
+    for (let attempt = 1; attempt <= attempts; attempt++) {
       const provider = this.getProvider();
       try {
         return await fn(provider);
       } catch (error) {
         lastError = error;
         this.markUnhealthy(provider);
-        console.warn(`RPC attempt ${attempt}/${maxRetries} failed: ${error.message}`);
+        console.warn(`RPC attempt ${attempt}/${attempts} failed: ${error.message}`);
       }
     }
     throw lastError;

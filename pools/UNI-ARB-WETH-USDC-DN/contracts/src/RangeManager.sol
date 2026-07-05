@@ -299,9 +299,19 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     // ===== FONCTIONS DE CONFIGURATION (gouvernance via Vault owner) =====
 
+    function _minTotalRangeBps() private view returns (uint16) {
+        uint24 f = config.fee;
+        if (f == 100) return 10;
+        if (f == 500) return 100;
+        if (f == 3000) return 600;
+        if (f == 10000) return 2000;
+        return 100;
+    }
+
     function configureRanges(uint16 _rangeUpPercent, uint16 _rangeDownPercent) external onlyVaultOwner {
         require(_rangeUpPercent >= 10 && _rangeUpPercent <= 5000, "E17");
         require(_rangeDownPercent >= 10 && _rangeDownPercent <= 5000, "E18");
+        require(uint256(_rangeUpPercent) + _rangeDownPercent >= _minTotalRangeBps(), "E40");
 
         config.rangeUpPercent = _rangeUpPercent;
         config.rangeDownPercent = _rangeDownPercent;
@@ -326,7 +336,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
                 && uint16(_volatTrimDay) * 2 + 1 <= uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay)
                 && _rangeStepBps >= 10 && _rangeStepBps <= 1000 && _rangeMultiplicatorBps >= 5000
                 && _rangeMultiplicatorBps <= 30000 && _rangeMinBps >= 10 && _rangeMinBps <= _rangeMaxBps
-                && _rangeMaxBps <= 5000,
+                && _rangeMaxBps <= 5000 && uint256(_rangeMinBps) * 2 >= _minTotalRangeBps(),
             "E40"
         );
         _ringCap = uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay);

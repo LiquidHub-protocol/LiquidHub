@@ -1556,8 +1556,9 @@ library RangeOperations {
             : target + effNegMag; // effectiveShort < 0
         if (target == 0 || target <= dustFloorUsd) {
             if (dustFloorUsd == 0) return (diff == 0, diff == 0 ? 0 : type(uint256).max);
+            if (diff <= dustFloorUsd) return (true, 0);
             driftBps = Math.mulDiv(diff, 10000, dustFloorUsd);
-            return (diff <= dustFloorUsd, driftBps);
+            return (false, driftBps);
         }
         driftBps = Math.mulDiv(diff, 10000, target);
         ok = driftBps <= uint256(maxDriftBps);

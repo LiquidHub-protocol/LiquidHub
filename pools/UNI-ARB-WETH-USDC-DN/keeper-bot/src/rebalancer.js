@@ -21,13 +21,12 @@ function divideIntoChunks(totalAmount, numChunks) {
  * Permissionless: no keeper role required — anyone can trigger when needsRebalance is true.
  */
 class Rebalancer {
-  constructor(rangeManager, vault, hedgeManager, wallet) {
+  constructor(rangeManager, vault, hedgeManager, wallet, rpcPool) {
     this.rangeManager = rangeManager;
     this.vault = vault;
     this.hedgeManager = hedgeManager;
     this.wallet = wallet;
-    this.rmConnected = this.rangeManager.connect(wallet);
-    this.vaultConnected = this.vault.connect(wallet);
+    this.rpcPool = rpcPool;
   }
 
   async executeRebalance(tokenId) {
@@ -39,7 +38,9 @@ class Rebalancer {
       // DETTE AAVE FIXE (rebalance() ne touche pas AAVE) : wethInLP ≈ effectiveShort/H. Sinon le post-check DN
       // on-chain reverte. On utilise donc la vue dédiée getRebalanceSwapParams (Vault) au lieu du plan range
       // getOptimalSwapParams — valable que le rebalance soit déclenché par le range OU par un drift DN in-range.
-      const [zeroForOne, amountIn] = await this.vault.getRebalanceSwapParams();
+      const [zeroForOne, amountIn] = await this.rpcPool.executeWithRetry(async (provider) => {
+        return await this.vault.connect(provider).getRebalanceSwapParams();
+      });
 
       let swapAmounts = [];
       let minOuts = [];
@@ -53,9 +54,13 @@ class Rebalancer {
         tokenOut = zeroForOne ? token1 : token0;
 
         // Read on-chain chunk cap (initMultiSwapTvl in USD, contract value)
-        const initMultiSwapTvl = await this.rangeManager.initMultiSwapTvl();
+        const initMultiSwapTvl = await this.rpcPool.executeWithRetry(async (provider) => {
+          return await this.rangeManager.connect(provider).initMultiSwapTvl();
+        });
         // Decimals read ON-CHAIN from config() (generic for any pair, not the .env) — same source as processDeposit
-        const cfg = await this.rangeManager.config();
+        const cfg = await this.rpcPool.executeWithRetry(async (provider) => {
+          return await this.rangeManager.connect(provider).config();
+        });
         const dec0 = Number(cfg.token0Decimals);
         const dec1 = Number(cfg.token1Decimals);
         const decimals = zeroForOne ? dec0 : dec1;
@@ -82,7 +87,10 @@ class Rebalancer {
       // 2. Simulate first: DN drift plans can be non-zero even when the on-chain rebalance gate
       // (needsRebalance || dnDriftCritical) refuses the call. Skip instead of sending a doomed tx.
       try {
-        await this.rmConnected.rebalance.staticCall(swapAmounts, minOuts, tokenIn, tokenOut);
+        await this.rpcPool.executeWithRetry(async (provider) => {
+          const rm = this.rangeManager.connect(this.wallet.connect(provider));
+          return await rm.rebalance.staticCall(swapAmounts, minOuts, tokenIn, tokenOut);
+        });
       } catch (simError) {
         console.log(`  Rebalance skipped by on-chain gate: ${(simError.reason || simError.shortMessage || simError.message || '').slice(0, 120)}`);
         return { success: false, error: 'rebalance simulation rejected by on-chain gate', txHashes: [] };
@@ -90,8 +98,11 @@ class Rebalancer {
 
       // 3. Single atomic call — contract does burn → swap(s) → mint → bounty
       console.log('  Executing rebalance() on-chain...');
-      const tx = await this.rmConnected.rebalance(swapAmounts, minOuts, tokenIn, tokenOut);
-      const receipt = await tx.wait();
+      const receipt = await this.rpcPool.executeWithRetry(async (provider) => {
+        const rm = this.rangeManager.connect(this.wallet.connect(provider));
+        const tx = await rm.rebalance(swapAmounts, minOuts, tokenIn, tokenOut);
+        return await tx.wait();
+      });
       console.log(`  Rebalance complete: ${receipt.hash}`);
 
       return { success: true, txHashes: [receipt.hash] };
@@ -121,7 +132,9 @@ class Rebalancer {
       // AUDIT H-01 : pour un DÉPÔT, on utilise la vue DÉDIÉE du Vault (état post-transfert du dépôt +
       // post-ouverture du hedge), PAS rangeManager.getOptimalSwapParams (qui reflète l état rebalance/post-burn
       // — inclut le NFT, ignore le dépôt + le WETH emprunté → 0 swap erroné ou swap sur fonds bloqués).
-      const [zeroForOne, amountIn] = await this.vault.getDepositSwapParams();
+      const [zeroForOne, amountIn] = await this.rpcPool.executeWithRetry(async (provider) => {
+        return await this.vault.connect(provider).getDepositSwapParams();
+      });
 
       let swapAmounts = [];
       let minOuts = [];
@@ -134,8 +147,10 @@ class Rebalancer {
         tokenIn = zeroForOne ? token0 : token1;
         tokenOut = zeroForOne ? token1 : token0;
 
-        const initMultiSwapTvl = await this.rangeManager.initMultiSwapTvl();
-        const cfg = await this.rangeManager.config();
+        const [initMultiSwapTvl, cfg] = await this.rpcPool.executeWithRetry(async (provider) => {
+          const rm = this.rangeManager.connect(provider);
+          return await Promise.all([rm.initMultiSwapTvl(), rm.config()]);
+        });
 
         const dec0 = Number(cfg.token0Decimals);
         const dec1 = Number(cfg.token1Decimals);
@@ -164,8 +179,12 @@ class Rebalancer {
       }
 
       console.log('  Executing processDepositPermissionless() on-chain...');
-      const tx = await this.vaultConnected.processDepositPermissionless(swapAmounts, minOuts, tokenIn, tokenOut);
-      const receipt = await tx.wait();
+      const receipt = await this.rpcPool.executeWithRetry(async (provider) => {
+        const vault = this.vault.connect(this.wallet.connect(provider));
+        await vault.processDepositPermissionless.staticCall(swapAmounts, minOuts, tokenIn, tokenOut);
+        const tx = await vault.processDepositPermissionless(swapAmounts, minOuts, tokenIn, tokenOut);
+        return await tx.wait();
+      });
       console.log(`  Deposit processed: ${receipt.hash}`);
 
       return { success: true, txHashes: [receipt.hash] };
@@ -191,15 +210,22 @@ class Rebalancer {
   }
 
   async _freshPriceCache(label) {
-    let priceCache = await this.rangeManager.priceCache();
+    let priceCache = await this.rpcPool.executeWithRetry(async (provider) => {
+      return await this.rangeManager.connect(provider).priceCache();
+    });
     if (!this._needsPriceCacheRefresh(priceCache)) return priceCache;
 
     console.log(`  priceCache stale/invalid before ${label}; calling refreshPriceCache()...`);
     try {
-      const tx = await this.rmConnected.refreshPriceCache();
-      const receipt = await tx.wait();
+      const receipt = await this.rpcPool.executeWithRetry(async (provider) => {
+        const rm = this.rangeManager.connect(this.wallet.connect(provider));
+        const tx = await rm.refreshPriceCache();
+        return await tx.wait();
+      });
       console.log(`  priceCache refreshed: ${receipt.hash}`);
-      priceCache = await this.rangeManager.priceCache();
+      priceCache = await this.rpcPool.executeWithRetry(async (provider) => {
+        return await this.rangeManager.connect(provider).priceCache();
+      });
     } catch (error) {
       console.log(`  refreshPriceCache skipped/failed: ${(error.reason || error.shortMessage || error.message || '').slice(0, 100)}`);
     }
@@ -215,8 +241,11 @@ class Rebalancer {
 
   async _syncFeesForDepositPlan() {
     try {
-      const tx = await this.vaultConnected.syncFeesForDeposits();
-      const receipt = await tx.wait();
+      const receipt = await this.rpcPool.executeWithRetry(async (provider) => {
+        const vault = this.vault.connect(this.wallet.connect(provider));
+        const tx = await vault.syncFeesForDeposits();
+        return await tx.wait();
+      });
       console.log(`  Fees synced before deposit plan: ${receipt.hash}`);
     } catch (error) {
       console.log(`  Fee sync skipped (${(error.reason || error.message || '').slice(0, 90)})`);
@@ -225,7 +254,7 @@ class Rebalancer {
 
   _needsPriceCacheRefresh(priceCache) {
     if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) return true;
-    const maxAgeSec = parseInt(process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || '300', 10);
+    const maxAgeSec = parseInt(process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || process.env.BOT_PRICE_CACHE_MAX_AGE_SEC || '300', 10);
     const ts = Number(priceCache.timestamp || 0);
     if (!Number.isFinite(maxAgeSec) || maxAgeSec <= 0 || !ts) return false;
     return Math.floor(Date.now() / 1000) - ts > maxAgeSec;
