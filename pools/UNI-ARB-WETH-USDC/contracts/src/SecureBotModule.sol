@@ -91,8 +91,8 @@ contract SecureBotModule {
     uint8 private constant CYCLE_LOCKED = 1;
     uint8 private constant CYCLE_REBALANCE_BURNED = 2;
     uint8 private constant CYCLE_LOCKED_MAINTENANCE = 5;
-    // Monitoring only: marks an interrupted bot cycle as stale for alerts.
-    // It never auto-resets or unlocks the module.
+    // Marks an interrupted bot cycle as stale for alerts and lets the bot clear it after timeout.
+    // resetStaleBotCycle only resets local module state; it never moves funds or unlocks the Vault.
     uint32 public constant BOT_CYCLE_TIMEOUT = 30 minutes;
 
     // Events
@@ -313,10 +313,13 @@ contract SecureBotModule {
         _setCycle(CYCLE_IDLE, 0x00000000);
     }
 
-    /// @notice Legacy no-op: stale bot cycles are never reset permissionlessly.
-    /// @dev Kept for ABI compatibility; Safe must call resetBotCycle() after diagnosis.
-    function resetStaleBotCycle() external pure returns (bool reset) {
-        return false;
+    /// @notice Let the hot bot clear an interrupted module cycle after timeout.
+    /// @dev Only resets the module's internal cycle state. The Vault lock, if any, remains controlled by Vault/Safe.
+    function resetStaleBotCycle() external onlyBot returns (bool reset) {
+        if (botCycleState == CYCLE_IDLE) return false;
+        if (block.timestamp <= uint256(botCycleUpdatedAt) + uint256(BOT_CYCLE_TIMEOUT)) return false;
+        _setCycle(CYCLE_IDLE, 0x00000000);
+        return true;
     }
 
     function sweepNativeToBot() external onlyBot {

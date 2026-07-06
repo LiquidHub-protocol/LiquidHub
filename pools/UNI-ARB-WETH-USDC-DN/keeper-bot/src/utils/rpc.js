@@ -61,6 +61,41 @@ class RPCPool {
     }
     throw lastError;
   }
+
+  async executeTxWithRetry(sendFn, label = 'transaction', maxRetries = 3) {
+    let txHash = null;
+    return await this.executeWithRetry(async (provider) => {
+      if (txHash) {
+        const receipt = await provider.getTransactionReceipt(txHash);
+        if (receipt) {
+          if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+          return receipt;
+        }
+        const waited = await provider.waitForTransaction(txHash, 1, 60_000);
+        if (waited) {
+          if (waited.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+          return waited;
+        }
+        throw new Error(`${label} receipt pending after broadcast: ${txHash}`);
+      }
+
+      const tx = await sendFn(provider);
+      txHash = tx.hash;
+      try {
+        const receipt = await tx.wait();
+        if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+        return receipt;
+      } catch (error) {
+        const receipt = await provider.getTransactionReceipt(txHash).catch(() => null);
+        if (receipt) {
+          if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+          return receipt;
+        }
+        error.message = `${error.message} (broadcast tx: ${txHash})`;
+        throw error;
+      }
+    }, maxRetries);
+  }
 }
 
 module.exports = { RPCPool };

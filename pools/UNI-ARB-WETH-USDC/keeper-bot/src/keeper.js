@@ -18,24 +18,12 @@ function needsPriceCacheRefresh(priceCache) {
   return !ts || (Math.floor(Date.now() / 1000) - ts) > PRICE_CACHE_MAX_AGE_SEC;
 }
 
-async function ensureFreshPriceCacheBeforeDecision(rangeManager, wallet, rpcPool) {
+async function logPriceCacheBeforeDecision(rangeManager, rpcPool) {
   const priceCache = await rpcPool.executeWithRetry(async (provider) => {
     return await rangeManager.connect(provider).priceCache();
   });
   if (!needsPriceCacheRefresh(priceCache)) return;
-
-  if (!wallet) {
-    console.log('  priceCache stale/invalid before keeper decision — check-only mode, refresh skipped');
-    return;
-  }
-
-  console.log('  priceCache stale/invalid before keeper decision; calling refreshPriceCache()...');
-  const receipt = await rpcPool.executeWithRetry(async (provider) => {
-    const rm = rangeManager.connect(wallet.connect(provider));
-    const tx = await rm.refreshPriceCache();
-    return await tx.wait();
-  });
-  console.log(`  priceCache refreshed before keeper decision: ${receipt.hash}`);
+  console.log('  priceCache stale/invalid before keeper decision — action paths refresh it atomically before use');
 }
 
 /**
@@ -137,7 +125,7 @@ async function main() {
     try {
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
 
-      await ensureFreshPriceCacheBeforeDecision(rangeManager, wallet, rpcPool);
+      await logPriceCacheBeforeDecision(rangeManager, rpcPool);
 
       const [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
         async (p) => {
@@ -183,11 +171,10 @@ async function main() {
             const metricsAmount = treasury ? await treasury.metricsBountyAmount() : 0n;
             await checkBountyFunding('metrics', metricsEnabled, metricsAmount, treasuryAddr, usdc);
             console.log('  -> Snapshot due, recording price on-chain...');
-            const rcpt = await rpcPool.executeWithRetry(async (p) => {
+            const rcpt = await rpcPool.executeTxWithRetry(async (p) => {
               const rm = rangeManager.connect(wallet.connect(p));
-              const tx = await rm.recordPriceSnapshot();
-              return await tx.wait();
-            });
+              return await rm.recordPriceSnapshot();
+            }, 'recordPriceSnapshot');
             console.log(`  -> Snapshot recorded: ${rcpt.hash}`);
           }
         } catch (e) {
