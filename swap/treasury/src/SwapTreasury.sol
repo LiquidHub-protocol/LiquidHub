@@ -67,7 +67,7 @@ interface IStargate {
 }
 
 /// @notice Dedicated treasury for frontend Velora swap commissions.
-/// @dev It intentionally contains no pool/trading-vault bounty logic. Its only permissionless
+/// @dev It intentionally contains no pool bounty logic. Its only permissionless
 ///      surface is bridging accumulated fees to the Phase 2 staking destination.
 contract SwapTreasury is Ownable {
     using SafeERC20 for IERC20;
