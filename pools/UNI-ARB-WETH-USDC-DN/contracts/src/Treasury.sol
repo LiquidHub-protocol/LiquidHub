@@ -102,12 +102,12 @@ contract Treasury is Ownable2Step {
     // SÉCURITÉ (audit V1) : plancher oracle anti-sandwich pour les swaps de la Treasury.
     // Le Treasury est PARTAGÉ par toutes les pools d'une même chaîne → il peut swapper des tokens
     // volatils variés (WETH, WBTC, ...). Un feed Chainlink par token est déclaré par la gouvernance.
-    // swapToUSDC/collectAndBridge imposent amountOutMinimum >= prix oracle × (1 − swapSlippageBps),
+    // swapToUSDC/collectAndBridge imposent amountOutMinimum >= prix oracle × (1 − swapFeedSlippageBps[token]),
     // et REVERT si aucun feed n'est configuré pour tokenIn (pas de swap d'un token non oraclé).
     mapping(address => AggregatorV3Interface) public swapFeeds; // tokenIn => feed Chainlink (prix en USD)
     mapping(address => uint32) public swapFeedMaxAges; // tokenIn => heartbeat max accepte pour ce feed
     mapping(address => uint16) public swapFeedSlippageBps; // tokenIn => slippage max tolere pour le floor oracle
-    uint16 public swapSlippageBps; // slippage max toléré sur les swaps Treasury (ex 100 = 1%)
+    uint16 public swapSlippageBps; // legacy mirror du dernier slippage configure; utiliser swapFeedSlippageBps[token]
 
     // --- Bridge Bounty (Phase 2) — paid to whoever calls bridgeToStakers / collectAndBridge ---
     // Anti-drain protections (configurable by multisig):

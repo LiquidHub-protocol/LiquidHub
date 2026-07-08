@@ -669,6 +669,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // audit V1 (V3-H2) : barrière déviation/staleness avant d'ajouter de la liquidité (composition LP
         // sensible au prix du pool). Cache invalidé si le pool diverge de l'oracle => on refuse.
         uint256 tokenId = _refreshAndFirstPosition();
+        require(!RangeOperations.isPositionOutOfRange(tokenId, positionManager, priceCache), "E32");
         (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) = RangeOperations.addLiquidityWithoutSwap(
             token0, token1, tokenId, positionManager, config.maxSlippageBps, address(this)
         );

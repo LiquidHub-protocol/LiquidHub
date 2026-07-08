@@ -473,7 +473,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     function processSingleDeposit() external onlyBot nonReentrant {
         require(_pendingCount() > 0, "E24");
         bool hasPosition = rangeManager.getOwnerPositions().length > 0;
-        if (hasPosition) rangeManager.collectFeesForVault();
+        if (hasPosition) {
+            rangeManager.collectFeesForVault();
+        }
         (PendingDeposit memory pd, uint256 depositValue, uint256 valueBefore, uint256 sharesBefore) =
             _processOneDeposit();
         if (hasPosition) rangeManager.addLiquidityToPosition();
@@ -1299,28 +1301,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         require(to != address(0), "Invalid recipient");
         IERC20(tokenAddr).safeTransfer(to, amount);
         emit TokenRescued(tokenAddr, to, amount);
-    }
-
-    // ===== FONCTIONS DE VUE =====
-
-    function getCommissionStats()
-        external
-        view
-        returns (
-            uint256 pendingToken0,
-            uint256 pendingToken1,
-            uint256 totalCollectedToken0,
-            uint256 totalCollectedToken1,
-            uint256 currentRate
-        )
-    {
-        return (
-            0, // plus de pending — commissions envoyees directement au Treasury
-            0,
-            totalCommissionCollectedToken0,
-            totalCommissionCollectedToken1,
-            commissionRate
-        );
     }
 
     // ===== FONCTIONS DE RECUPERATION USER ET TOKENS PERDUS =====

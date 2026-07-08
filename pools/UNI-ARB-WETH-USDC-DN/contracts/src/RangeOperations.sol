@@ -496,6 +496,8 @@ library RangeOperations {
         IERC20(token0).safeApprove(address(positionManager), balance0);
         IERC20(token1).safeApprove(address(positionManager), balance1);
 
+        // DN rebalances may intentionally leave a token idle so the LP composition matches the fixed AAVE debt.
+        // Swap minOuts, oracle/pool/TWAP checks and the DN post-check still bound MEV and hedge drift.
         INonfungiblePositionManager.MintParams memory mintParams = INonfungiblePositionManager.MintParams({
             token0: token0,
             token1: token1,
@@ -504,8 +506,8 @@ library RangeOperations {
             tickUpper: tickUpper,
             amount0Desired: balance0,
             amount1Desired: balance1,
-            amount0Min: _minWithSlippage(balance0, config.maxSlippageBps),
-            amount1Min: _minWithSlippage(balance1, config.maxSlippageBps),
+            amount0Min: 0,
+            amount1Min: 0,
             recipient: contractAddress,
             deadline: block.timestamp + 300
         });

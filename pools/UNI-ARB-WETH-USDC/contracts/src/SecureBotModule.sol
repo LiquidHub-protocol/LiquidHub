@@ -282,6 +282,7 @@ contract SecureBotModule {
     /// @dev En Phase 2, owner devient le timelock mais la Safe immutable reste guardian d'urgence.
     function setPaused(bool _paused) external {
         require(msg.sender == owner || msg.sender == safe, "Only owner");
+        if (msg.sender == safe && msg.sender != owner) require(_paused, "Safe pause only");
         paused = _paused;
         emit Paused(_paused);
     }
@@ -400,15 +401,18 @@ contract SecureBotModule {
                 state == CYCLE_LOCKED || state == CYCLE_REBALANCE_BURNED || state == CYCLE_LOCKED_MAINTENANCE,
                 "Bad cycle"
             );
+            _refreshRangeManagerCache();
             _requireCycleSwapPlan(data);
         } else if (selector == MINT_INITIAL_SELECTOR) {
             require(
                 state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE || state == CYCLE_REBALANCE_BURNED,
                 "Bad cycle"
             );
+            _refreshRangeManagerCache();
             _requireSwapPlanCompleteOrNone();
         } else if (selector == ADD_LIQUIDITY_SELECTOR) {
             require(state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE, "Bad cycle");
+            _refreshRangeManagerCache();
             _requireSwapPlanCompleteOrNone();
         }
     }

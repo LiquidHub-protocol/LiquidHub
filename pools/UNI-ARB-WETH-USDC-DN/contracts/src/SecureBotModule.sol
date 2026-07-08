@@ -122,22 +122,16 @@ contract SecureBotModule {
         owner = _safe; // La Safe est owner
         dailyLimit = _dailyLimit;
 
-        // Autoriser les fonctions essentielles au deploiement
+        // Autoriser uniquement les fonctions recurrentes du bot. En DN, le mint initial et les depots passent
+        // par processDepositPermissionless(), qui ouvre/ajuste le hedge AAVE et applique le post-check dans le
+        // meme chemin. L'ancien chemin multi-tx burn/swap/mint/add n'est donc pas whitelisté par défaut.
         // Fonctions RangeManager
         // configurePriceFeeds (0x6509c2dd) RETIRÉ (audit V1) : repointage oracles = gouvernance Safe.
         // Le bot rafraîchit le cache via refreshPriceCache() (ne change aucune adresse).
         allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
-        // mintInitialPosition() reste nécessaire au flux bot de rebalance multi-tx. En DN, le module
-        // exécute un post-check hedge on-chain après le mint ; un mint non hedgé/mal hedgé revert.
-        allowedFunctions[0x63ccfd0b] = true; // mintInitialPosition()
-        allowedFunctions[0x38ca63bc] = true; // burnPosition (collecte fees + retire liquidite)
-        allowedFunctions[0xb07391c0] = true; // executeSwap (swaps via Uniswap V3)
         allowedFunctions[0x6ecfe0f8] = true; // recordPriceSnapshot() - snapshot de prix (fallback bot si aucun keeper)
         // Setters de stratégie/risk retirés du module: configureRanges, setDynamicRangeEnabled,
         // configureSlippage, configureProtections, configureTolerance.
-        // sendTokenForHedge reste indispensable au solveur DN, mais uniquement pendant un cycle
-        // rebalance/maintenance : hors cycle, il n'y a pas de raison de sortir des tokens du RangeManager.
-        allowedFunctions[0x9be8feaa] = true; // sendTokenForHedge(address,uint256,address)
 
         // Fonctions MultiUserVault
         // processPendingDeposits (0x99dd7ead) RETIRÉ (audit V1) : fonction batch supprimée du Vault.
@@ -147,10 +141,7 @@ contract SecureBotModule {
         // processDepositPermissionless (hedge on-chain via DnDepositLib + post-check). Sélecteur à whitelister
         // sinon le fallback bot revert avant d'atteindre le Vault. Le Vault re-valide tout (paused, plafond, oracle).
         allowedFunctions[0x76919a59] = true; // processDepositPermissionless(uint256[],uint256[],address,address)
-        allowedFunctions[0x4dce7057] = true; // startRebalance()
         allowedFunctions[0x0040718e] = true; // endRebalance()
-        // Sélecteur RangeManager, exécuté via executeRangeManagerFunction (pas via executeVaultFunction).
-        allowedFunctions[0x2a7cf2fe] = true; // addLiquidityToPosition()
         // withdrawReservedCollateral() RETIRÉ (audit) : fonction supprimée du Vault (réserve gérée off-chain)
         // AUDIT M-02 : decreaseLiquidityPartial(uint128) (0x41f60e3c) RETIRÉ de la whitelist — entrée publique DN
         // supprimée (trimming LP indépendant abandonné en DN strict). Plus aucune surface pour une clé bot compromise.
@@ -165,16 +156,10 @@ contract SecureBotModule {
         // (sur-hedge critique). NB : le cooldown on-chain s'applique aussi au bot (pas de bypass) — garde-fou
         // anti-spam légitime. Le sur-hedge non corrigé immédiatement le sera au cycle suivant ou par un keeper.
         allowedFunctions[0x1e694f32] = true; // adjustHedge()
-        // Les appels de solveur (borrow/repay/withdraw/sweeps) restent necessaires au rebalance DN multi-tx,
-        // mais sont bornes au cycle rebalance post-burn/maintenance par _beforeHedgeCall().
-        allowedFunctions[0x9d0bf2e9] = true;
-        allowedFunctions[0xebc9b94d] = true; // repayAndWithdraw(uint256,uint256)
-        allowedFunctions[0x6b09de45] = true; // repayDebt(uint256)
-        allowedFunctions[0x0af504cc] = true; // withdrawCollateral(uint256,address) — destination figée + cycle-gate
+        // Les appels de solveur hedge (borrow/repay/withdraw/sweeps) ne sont plus des actions bot recurrentes.
+        // Ils restent appelables par le Vault/Safe quand le code du Vault en a besoin, pas via ce module.
         // closeAll (0xf6b32008) RETIRÉE (audit V1) : fonction d'URGENCE rare qui envoie TOUT
         // le hedge à un recipient → réservée à la Safe directe (jamais via le bot).
-        allowedFunctions[0xacf31cb1] = true; // sweepWeth(address) — destination figée on-chain (audit V1)
-        allowedFunctions[0x58ea510a] = true; // sweepUsdc(address) — destination figée + cycle-gate
 
         // Fonctions Treasury (bridge Stargate v2 vers staking contract Phase 2)
         allowedFunctions[0xa5599124] = true; // bridgeToStakers(uint256)
@@ -315,6 +300,7 @@ contract SecureBotModule {
     /// @dev En Phase 2, owner devient le timelock mais la Safe immutable reste guardian d'urgence.
     function setPaused(bool _paused) external {
         require(msg.sender == owner || msg.sender == safe, "Only owner");
+        if (msg.sender == safe && msg.sender != owner) require(_paused, "Safe pause only");
         paused = _paused;
         emit Paused(_paused);
     }
@@ -433,15 +419,18 @@ contract SecureBotModule {
                 state == CYCLE_LOCKED || state == CYCLE_REBALANCE_BURNED || state == CYCLE_LOCKED_MAINTENANCE,
                 "Bad cycle"
             );
+            _refreshRangeManagerCache();
             _requireCycleSwapPlan(data);
         } else if (selector == MINT_INITIAL_SELECTOR) {
             require(
                 state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE || state == CYCLE_REBALANCE_BURNED,
                 "Bad cycle"
             );
+            _refreshRangeManagerCache();
             _requireSwapPlanCompleteOrNone();
         } else if (selector == ADD_LIQUIDITY_SELECTOR) {
             require(state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE, "Bad cycle");
+            _refreshRangeManagerCache();
             _requireSwapPlanCompleteOrNone();
         } else if (selector == SEND_TOKEN_FOR_HEDGE_SELECTOR) {
             _requireActiveHedgeCycle(state);
@@ -615,22 +604,10 @@ contract SecureBotModule {
 
     function _isCoreSelector(bytes4 selector) private pure returns (bool) {
         return selector == 0x0be1c372 // refreshPriceCache()
-            || selector == 0x63ccfd0b // mintInitialPosition()
-            || selector == 0x38ca63bc // burnPosition(uint256)
-            || selector == 0xb07391c0 // executeSwap(address,address,uint256,uint256)
             || selector == 0x6ecfe0f8 // recordPriceSnapshot()
-            || selector == 0x9be8feaa // sendTokenForHedge(address,uint256,address)
             || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
-            || selector == 0x4dce7057 // startRebalance()
             || selector == 0x0040718e // endRebalance()
-            || selector == 0x2a7cf2fe // addLiquidityToPosition()
             || selector == 0x1e694f32 // adjustHedge()
-            || selector == 0x9d0bf2e9 // borrowMore(uint256)
-            || selector == 0xebc9b94d // repayAndWithdraw(uint256,uint256)
-            || selector == 0x6b09de45 // repayDebt(uint256)
-            || selector == 0x0af504cc // withdrawCollateral(uint256,address)
-            || selector == 0xacf31cb1 // sweepWeth(address)
-            || selector == 0x58ea510a // sweepUsdc(address)
             || selector == 0xa5599124 // bridgeToStakers(uint256)
             || selector == 0x56a12aca // distributeToStakers(uint256)
             || selector == 0x1dc28748; // collectAndBridge(address,uint24,uint256,uint256)

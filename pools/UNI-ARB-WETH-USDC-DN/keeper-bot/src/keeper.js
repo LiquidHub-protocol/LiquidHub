@@ -200,9 +200,13 @@ async function main() {
             const metricsAmount = treasury ? await treasury.metricsBountyAmount() : 0n;
             await checkBountyFunding('metrics', metricsEnabled, metricsAmount, treasuryAddr, usdc);
             console.log('  -> Snapshot due, recording price on-chain...');
-            const rcpt = await rpcPool.executeTxWithRetry(async (p) => {
-              const rm = rangeManager.connect(wallet.connect(p));
-              return await rm.recordPriceSnapshot();
+            const rcpt = await rpcPool.executeSignedTxWithRetry(async (p) => {
+              const signer = wallet.connect(p);
+              const rm = rangeManager.connect(signer);
+              return {
+                wallet: signer,
+                request: await rm.recordPriceSnapshot.populateTransaction(),
+              };
             }, 'recordPriceSnapshot');
             console.log(`  -> Snapshot recorded: ${rcpt.hash}`);
           }
@@ -276,12 +280,16 @@ async function main() {
           const hedgeAmount = treasury ? await treasury.hedgeBountyAmount() : 0n;
           await checkBountyFunding('hedge', hedgeEnabled, hedgeAmount, treasuryAddr, usdc);
           console.log('  -> Hedge drift above threshold, adjusting on-chain...');
-          const rcpt = await rpcPool.executeTxWithRetry(async (p) => {
-            const hedge = hedgeManager.connect(wallet.connect(p));
+          const rcpt = await rpcPool.executeSignedTxWithRetry(async (p) => {
+            const signer = wallet.connect(p);
+            const hedge = hedgeManager.connect(signer);
             // Static-call first: lets us distinguish "drift below threshold" (revert, normal) from
             // actually sending a tx, so we only pay gas when an adjustment will go through.
             await hedge.adjustHedge.staticCall();
-            return await hedge.adjustHedge();
+            return {
+              wallet: signer,
+              request: await hedge.adjustHedge.populateTransaction(),
+            };
           }, 'adjustHedge');
           console.log(`  -> Hedge adjusted: ${rcpt.hash}`);
         } catch (e) {

@@ -171,9 +171,13 @@ async function main() {
             const metricsAmount = treasury ? await treasury.metricsBountyAmount() : 0n;
             await checkBountyFunding('metrics', metricsEnabled, metricsAmount, treasuryAddr, usdc);
             console.log('  -> Snapshot due, recording price on-chain...');
-            const rcpt = await rpcPool.executeTxWithRetry(async (p) => {
-              const rm = rangeManager.connect(wallet.connect(p));
-              return await rm.recordPriceSnapshot();
+            const rcpt = await rpcPool.executeSignedTxWithRetry(async (p) => {
+              const signer = wallet.connect(p);
+              const rm = rangeManager.connect(signer);
+              return {
+                wallet: signer,
+                request: await rm.recordPriceSnapshot.populateTransaction(),
+              };
             }, 'recordPriceSnapshot');
             console.log(`  -> Snapshot recorded: ${rcpt.hash}`);
           }

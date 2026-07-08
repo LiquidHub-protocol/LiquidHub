@@ -1389,6 +1389,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (dustFloorUsd == 0) revert E18();
         if (refundDelay < 3600 || refundDelay > 30 days) revert E18();
         if (maxDepositUsd == 0) revert E18();
+        uint256 maxByChunks = uint256(rangeManager.initMultiSwapTvl()) * 10 * 1e8;
+        if (maxByChunks > 0 && maxDepositUsd > maxByChunks) revert E18();
         dnPostCheckMaxDriftBps = postCheckMaxDriftBps;
         dnDustFloorUsd = dustFloorUsd;
         dnMaxDepositUsd = maxDepositUsd;
@@ -1429,36 +1431,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (to == address(0)) revert E17();
         IERC20(tokenAddr).safeTransfer(to, amount);
         emit TokenRescued(tokenAddr, to, amount);
-    }
-
-    // ===== DELTA NEUTRAL HEDGE FUNCTIONS =====
-
-    // setHedgeReserveRatio et withdrawReservedCollateral supprimés
-    // Répartition AAVE/LP refondue : hedgeTargetBps + DnDepositLib, sans hedge reserve ratio.
-
-    /**
-     * @notice Retourne le montant de collatéral réservé disponible
-     */
-    // ===== FONCTIONS DE VUE =====
-
-    function getCommissionStats()
-        external
-        view
-        returns (
-            uint256 pendingToken0,
-            uint256 pendingToken1,
-            uint256 totalCollectedToken0,
-            uint256 totalCollectedToken1,
-            uint256 currentRate
-        )
-    {
-        return (
-            0, // plus de pending — commissions envoyees directement au Treasury
-            0,
-            totalCommissionCollectedToken0,
-            totalCommissionCollectedToken1,
-            commissionRate
-        );
     }
 
     // ===== FONCTIONS DE RECUPERATION USER ET TOKENS PERDUS =====

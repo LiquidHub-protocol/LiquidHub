@@ -37,7 +37,7 @@ contract AaveHedgeManager is ReentrancyGuard {
 
     // ===== CONTROLLERS =====
     address private safe; // emergency/pause controller (Safe in Phase 1 and Phase 2)
-    address private governance; // settings owner (Safe in Phase 1, Timelock in Phase 2)
+    address public governance; // settings owner (Safe in Phase 1, Timelock in Phase 2)
     address private botModule; // direct execution module once Phase 2 direct mode is enabled
 
     // ===== IMMUTABLES =====

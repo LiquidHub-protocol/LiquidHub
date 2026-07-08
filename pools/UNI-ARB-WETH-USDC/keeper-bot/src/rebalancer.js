@@ -82,10 +82,14 @@ class Rebalancer {
 
       // 2. Single atomic call — contract does burn → swap(s) → mint → bounty
       console.log('  Executing rebalance() on-chain...');
-      const receipt = await this.rpcPool.executeTxWithRetry(async (provider) => {
-        const rm = this.rangeManager.connect(this.wallet.connect(provider));
+      const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
+        const signer = this.wallet.connect(provider);
+        const rm = this.rangeManager.connect(signer);
         await rm.rebalance.staticCall(swapAmounts, minOuts, tokenIn, tokenOut);
-        return await rm.rebalance(swapAmounts, minOuts, tokenIn, tokenOut);
+        return {
+          wallet: signer,
+          request: await rm.rebalance.populateTransaction(swapAmounts, minOuts, tokenIn, tokenOut),
+        };
       }, 'rebalance');
       console.log(`  Rebalance complete: ${receipt.hash}`);
 
@@ -153,10 +157,14 @@ class Rebalancer {
       }
 
       console.log('  Executing processDepositPermissionless() on-chain...');
-      const receipt = await this.rpcPool.executeTxWithRetry(async (provider) => {
-        const vault = this.vault.connect(this.wallet.connect(provider));
+      const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
+        const signer = this.wallet.connect(provider);
+        const vault = this.vault.connect(signer);
         await vault.processDepositPermissionless.staticCall(swapAmounts, minOuts, tokenIn, tokenOut);
-        return await vault.processDepositPermissionless(swapAmounts, minOuts, tokenIn, tokenOut);
+        return {
+          wallet: signer,
+          request: await vault.processDepositPermissionless.populateTransaction(swapAmounts, minOuts, tokenIn, tokenOut),
+        };
       }, 'processDepositPermissionless');
       console.log(`  Deposit processed: ${receipt.hash}`);
 
@@ -191,9 +199,13 @@ class Rebalancer {
 
     console.log(`  priceCache stale/invalid before ${label}; calling refreshPriceCache()...`);
     try {
-      const receipt = await this.rpcPool.executeTxWithRetry(async (provider) => {
-        const rm = this.rangeManager.connect(this.wallet.connect(provider));
-        return await rm.refreshPriceCache();
+      const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
+        const signer = this.wallet.connect(provider);
+        const rm = this.rangeManager.connect(signer);
+        return {
+          wallet: signer,
+          request: await rm.refreshPriceCache.populateTransaction(),
+        };
       }, 'refreshPriceCache');
       console.log(`  priceCache refreshed: ${receipt.hash}`);
       priceCache = await this.rpcPool.executeWithRetry(async (provider) => {
@@ -214,9 +226,13 @@ class Rebalancer {
 
   async _syncFeesForDepositPlan() {
     try {
-      const receipt = await this.rpcPool.executeTxWithRetry(async (provider) => {
-        const vault = this.vault.connect(this.wallet.connect(provider));
-        return await vault.syncFeesForDeposits();
+      const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
+        const signer = this.wallet.connect(provider);
+        const vault = this.vault.connect(signer);
+        return {
+          wallet: signer,
+          request: await vault.syncFeesForDeposits.populateTransaction(),
+        };
       }, 'syncFeesForDeposits');
       console.log(`  Fees synced before deposit plan: ${receipt.hash}`);
     } catch (error) {
