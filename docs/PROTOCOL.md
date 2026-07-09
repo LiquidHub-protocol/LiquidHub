@@ -75,19 +75,22 @@ The range is computed entirely by `RangeManager` — no off-chain bot or databas
 Large swaps are split into smaller chunks to reduce price impact on the pool:
 
 - Default chunk size: `INIT_MULTI_SWAP_TVL` (~$10k per swap).
-- Each chunk is a separate on-chain transaction via the DEX swap router.
-- A 2-second delay between swaps allows arbitrageurs to reset the pool price.
-- This mechanism ensures minimal slippage even for large TVL pools.
+- Chunks are executed inside the same atomic contract call for deposits/rebalances, with each chunk individually
+  bounded by the Chainlink-derived `minAmountOut` floor.
+- If the plan exceeds on-chain chunk, deposit or oracle limits, the transaction reverts and the bot/keepers retry
+  later with a fresh plan.
+- This mechanism reduces per-swap price impact while keeping the whole position update atomic.
 
 ---
 
 ## Rebalance Flow (Detailed)
 
-1. **`startRebalance()`** — Lock the vault (no deposits or withdrawals allowed during rebalance).
-2. **`burnPosition(tokenId)`** — Remove the current LP position from the DEX, collect accrued fees.
-3. **N x `executeSwap()`** — Execute one or more swaps to rebalance the token ratio for the new range. Uses the multi-swap system for large amounts.
-4. **`mintInitialPosition()`** — Create a new LP position at the range computed on-chain (or the fixed base range when dynamic ranges are disabled).
-5. **`endRebalance()`** — Unlock the vault, pay keeper bounty (if enabled).
+The nominal flow is a single public transaction:
+
+1. **`rebalance(swapAmountsIn, minAmountsOut, tokenIn, tokenOut)`** — refreshes prices, verifies oracle/TWAP,
+   locks the vault, burns the existing NFT, executes the chunked swap plan, mints the new range, unlocks the
+   vault and pays the keeper bounty if enabled.
+2. If any check fails, the whole transaction reverts and the next bot/keeper cycle can retry with a fresh plan.
 
 On DN pools, routine over-hedge corrections are adjusted independently and permissionlessly via `adjustHedge()` (see Hedge Adjustment). Severe under-hedge is handled by the permissionless `rebalance()` path: the LP composition is rebuilt and the transaction includes strict post-checks so a badly hedged result reverts atomically.
 

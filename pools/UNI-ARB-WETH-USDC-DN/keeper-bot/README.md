@@ -45,6 +45,12 @@ All standard keeper variables apply (see the standard pool README), including th
 | `AAVE_HEALTH_DELEVERAGE` | Health factor critical/deleverage threshold | `1.25` |
 | `AAVE_HEALTH_EMERGENCY` | Health factor emergency threshold | `1.15` |
 
+### RPC Trust Model
+
+Community keepers are permissionless and may use any RPC provider they choose. Liquid Hub does not require public keepers to use premium or MEV-protected RPCs. This is intentional: keeper safety is enforced on-chain by oracle/TWAP checks, oracle-floored `minAmountsOut`, cooldowns, caps, and DN hedge post-checks.
+
+A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Configure backup RPCs for reliability.
+
 ## Keeper Bounties
 
 Paid in **USDC** by the Treasury to whoever sends the transaction. The DN pool has four bounties:

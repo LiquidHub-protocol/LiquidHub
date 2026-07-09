@@ -22,13 +22,15 @@ The `SecureBotModule` is a Gnosis Safe module that whitelists specific function 
 
 **Whitelisted operations (high-level):**
 
-- Rebalance steps: burn position, execute swap, mint position, add liquidity
-- Process a single queued deposit
-- Configure ranges, slippage, tolerance, protections, dynamic-range toggle
+- Operational module actions only: queued deposit processing, snapshots, cache refresh, module-mediated cycle
+  recovery, and treasury distribution/bridge calls when enabled.
+- Standard pool legacy primitives may remain available for controlled bot cycles, but the nominal rebalance path is
+  the atomic public `RangeManager.rebalance(...)` entrypoint.
 - Refresh the price cache (`refreshPriceCache`, no address change) — oracle **addresses** themselves can only be
   set by the Safe (`configurePriceFeeds` / `setOracleParams` are Safe-only, not in the module)
 - Record price snapshots (dynamic-range ring buffer; bot fallback when no keeper acts)
-- Delta-Neutral hedge management (AAVE supply/borrow/repay/withdraw, sweeps) — DN pool module only
+- Delta-Neutral routine hedge adjustment uses the public `adjustHedge()` path; broad AAVE sweep/repay/withdraw
+  operations are not part of the public keeper/module allowlist.
 - Treasury bridging to stakers (Phase 2)
 
 **Blocked operations (cannot be called via the module):**
@@ -119,18 +121,22 @@ sandwiched. The premium RPC additionally provides MEV-protected (private) transa
 
 ---
 
-## Failure Protection (circuit breaker)
+## Failure Tracking
 
-`RangeManager` tracks consecutive operation failures. After `MAX_CONSECUTIVE_FAILURES` (5), sensitive operations
-are blocked until a `FAILURE_COOLDOWN` (30 min) elapses, preventing a stuck/looping keeper from repeatedly
-forcing failing actions.
+`RangeManager` emits and stores operation failure counters for monitoring, alerting and bot/keeper backoff.
+These counters are informational and do **not** create a persistent on-chain breaker that blocks future
+permissionless maintenance. Failed rebalances or hedge adjustments are retried by the bot/keepers on later cycles;
+the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 
 ---
 
 ## Emergency controls
 
-- **Module kill-switch**: `SecureBotModule.setPaused(true)` (Safe-only) freezes **all** permissionless bot
-  actions (mint / rebalance / swap / snapshot / permissionless deposit processing).
+- **Module kill-switch**: `SecureBotModule.setPaused(true)` (Safe-only) freezes module-mediated bot execution.
+  Public maintenance entrypoints such as `rebalance()`, `recordPriceSnapshot()` and `adjustHedge()` remain callable
+  by keepers when their own on-chain preconditions are satisfied.
+- **PauseController**: controls user flows. Inflow pause blocks new deposit processing; withdrawal pause also
+  blocks inflows. Position-maintenance actions remain available by design.
 - **Hedge pause** (DN): `AaveHedgeManager.setPaused(true)` (Safe-only) blocks new hedge openings
   (`supplyAndBorrow`) but deliberately leaves risk-reduction and position-maintenance paths available.
 - **ReentrancyGuard** on all state-changing entry points of the vault, RangeManager and hedge manager.

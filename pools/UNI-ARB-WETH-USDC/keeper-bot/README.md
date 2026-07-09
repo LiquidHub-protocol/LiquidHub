@@ -84,6 +84,12 @@ Edit `.env` with the following variables:
 | `CHECK_INTERVAL_MIN` | No | Check interval in minutes (default: 10) |
 | `INIT_MULTI_SWAP_TVL` | No | Max USD value per swap chunk (default: 10000) |
 
+### RPC Trust Model
+
+Community keepers are permissionless and may use any RPC provider they choose. Liquid Hub does not require public keepers to use premium or MEV-protected RPCs. This is intentional: keeper safety is enforced on-chain by oracle/TWAP checks, oracle-floored `minAmountsOut`, cooldowns, caps, and reverts.
+
+A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Configure `RPC_BACKUP_1` and `RPC_BACKUP_2` for reliability.
+
 ### 3. Run the bot
 
 **Active mode** (monitors and executes rebalances):

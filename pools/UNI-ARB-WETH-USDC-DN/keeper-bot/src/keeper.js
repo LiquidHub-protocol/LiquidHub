@@ -302,7 +302,8 @@ async function main() {
         }
       }
 
-      // Public keepers can ONLY call rebalance() — it is the only public function
+      // Public keepers can call the allowed permissionless maintenance paths:
+      // snapshots, queued deposit processing, hedge adjustment and atomic rebalance().
       // on the RangeManager. Other actions (MINT_INITIAL, etc.) are gated on-chain
       // by `onlyAuthorized` and reserved for the protocol bot / Safe, so we just
       // wait silently for the next cycle.

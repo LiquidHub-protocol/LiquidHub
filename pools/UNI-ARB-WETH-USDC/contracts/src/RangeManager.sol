@@ -748,15 +748,20 @@ contract RangeManager is Ownable, ReentrancyGuard {
         bool tokenInIsToken0 = tokenIn == token0;
         if (n > 0) {
             require((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0), "E43");
-            RangeOperations.validateMinOutsAgainstOracle(
+            uint256 totalSwapUsd = RangeOperations.validateMinOutsAgainstOracle(
                 tokenInIsToken0, swapAmountsIn, minAmountsOut, priceCache, config, initMultiSwapTvl
             );
-            for (uint256 i; i < n; ++i) {
-                totalSwapIn += swapAmountsIn[i];
-            }
+            uint256 depositUsd = ((depositAmount0 * uint256(priceCache.price0)) / (10 ** config.token0Decimals))
+                + ((depositAmount1 * uint256(priceCache.price1)) / (10 ** config.token1Decimals));
+            require(totalSwapUsd <= depositUsd, "swap>deposit");
+            for (uint256 i; i < n; ++i) totalSwapIn += swapAmountsIn[i];
         }
         _requireSubmittedSwapPlan(
-            expectedAmountIn, expectedZeroForOne, tokenInIsToken0, totalSwapIn, config.toleranceBps
+            expectedAmountIn,
+            expectedZeroForOne,
+            tokenInIsToken0,
+            totalSwapIn,
+            config.toleranceBps
         );
     }
 
@@ -1039,17 +1044,13 @@ contract RangeManager is Ownable, ReentrancyGuard {
             // Validation (chunk cap + plancher oracle anti-sandwich V4) deportee en library
             // pour rester sous EIP-170. Reverte sur chunk>cap ou minOut<floor. Sans ce plancher,
             // un appelant permissionless pouvait passer minAmountsOut[i] = 0 et se faire sandwicher.
-            RangeOperations.validateMinOutsAgainstOracle(
+            uint256 totalSwapUsd = RangeOperations.validateMinOutsAgainstOracle(
                 tokenIn == token0, swapAmountsIn, minAmountsOut, priceCache, config, initMultiSwapTvl
             );
             // (déviation pool/oracle déjà garantie par _refreshAndRequireValid() en tête de rebalance — V3-H2)
             uint256 maxTotalSwapUsd = _getCurrentPortfolioValue();
-            uint256 totalSwapUsd;
-            uint256 priceInUsd = tokenIn == token0 ? uint256(priceCache.price0) : uint256(priceCache.price1);
-            uint256 decIn = tokenIn == token0 ? config.token0Decimals : config.token1Decimals;
             for (uint256 i; i < n; ++i) {
                 totalSwapIn += swapAmountsIn[i];
-                totalSwapUsd += (swapAmountsIn[i] * priceInUsd) / (10 ** decIn);
             }
             require(totalSwapUsd <= maxTotalSwapUsd, "E92");
         }

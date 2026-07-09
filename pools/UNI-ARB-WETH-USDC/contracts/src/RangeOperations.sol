@@ -1311,7 +1311,7 @@ library RangeOperations {
         PriceCache memory pc,
         RangeConfig memory config,
         uint256 initMultiSwapTvl
-    ) external pure {
+    ) external pure returns (uint256 totalSwapUsd) {
         // V3 : check de déviation pool/oracle retiré d'ici (redondant) — centralisé dans updatePriceCache et
         // garanti par _refreshAndRequireValid() au début de rebalance(). Ne valide plus que minOut + cap. DN-coh.
         uint256 n = swapAmountsIn.length;
@@ -1321,9 +1321,11 @@ library RangeOperations {
         for (uint256 i; i < n; ++i) {
             uint256 amt = swapAmountsIn[i];
             if (amt == 0) continue;
+            uint256 swapUsd = (amt * priceIn) / (10 ** decIn);
             if (initMultiSwapTvl > 0) {
-                require((amt * priceIn) / (10 ** decIn) <= cap, "chunk>cap");
+                require(swapUsd <= cap, "chunk>cap");
             }
+            totalSwapUsd += swapUsd;
             uint256 floor = _oracleMinOut(tokenInIsToken0, amt, pc, config, config.maxSlippageBps);
             require(minAmountsOut[i] >= floor, "minOut<floor");
         }

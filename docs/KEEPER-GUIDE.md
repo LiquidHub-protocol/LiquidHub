@@ -78,6 +78,12 @@ This prints the current pool state, whether a rebalance is needed, and the curre
 | `CHECK_INTERVAL_MIN` | Minutes between checks | 10 |
 | `INIT_MULTI_SWAP_TVL` | Max USD per swap chunk | 10000 |
 
+### RPC Trust Model
+
+Community keepers are permissionless and may use any RPC provider they choose. Liquid Hub does not require public keepers to use premium or MEV-protected RPCs. This is intentional: keeper safety is enforced on-chain by oracle/TWAP checks, oracle-floored `minAmountsOut`, cooldowns, caps, and DN post-checks.
+
+A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Use `RPC_BACKUP_1` and `RPC_BACKUP_2` for reliability.
+
 ### Delta Neutral (DN) Additional Variables
 
 | Variable | Description |
@@ -122,9 +128,10 @@ Community keepers earn bounties in USDC, paid directly from the Treasury contrac
 
 The keeper can only call **public functions** on the contracts:
 
-- `executeSwap()` — Execute a swap during rebalance
-- `mintInitialPosition()` — Mint a new LP position
-- `burnPosition()` — Burn the current LP position
+- `rebalance()` — Execute an atomic rebalance when the position is out of range
+- `processDepositPermissionless()` — Process one queued deposit when contract conditions allow it
+- `recordPriceSnapshot()` — Feed the on-chain dynamic range calculation when a snapshot is due
+- `adjustHedge()` — Delta-Neutral pools only, adjust the AAVE hedge when drift exceeds the on-chain threshold
 
 The keeper **cannot**:
 
