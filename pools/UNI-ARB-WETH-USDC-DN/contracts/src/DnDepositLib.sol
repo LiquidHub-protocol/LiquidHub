@@ -385,7 +385,7 @@ library DnDepositLib {
         if (debtBase == 0 || collateralBase == 0) return 0;
         uint256 liquidationThresholdBps = liveThreshold > 0 ? liveThreshold : fallbackLiqThresholdBps;
         if (liquidationThresholdBps == 0) return 0;
-        uint256 collateralTargetBase = (debtBase * targetHfBps) / liquidationThresholdBps;
+        uint256 collateralTargetBase = (debtBase * targetHfBps + liquidationThresholdBps - 1) / liquidationThresholdBps;
         if (collateralBase <= collateralTargetBase) return 0;
         return _aaveBaseToStable(collateralBase - collateralTargetBase, rangeManager, stableDecimals);
     }

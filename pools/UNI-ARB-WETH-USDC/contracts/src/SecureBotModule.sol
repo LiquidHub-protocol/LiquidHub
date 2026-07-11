@@ -323,20 +323,20 @@ contract SecureBotModule {
         return true;
     }
 
-    function sweepNativeToBot() external onlyBot {
-        require(!paused, "Module paused");
+    function sweepNativeToSafe() external {
+        require(msg.sender == owner || msg.sender == safe, "Only owner");
         uint256 amount = address(this).balance;
         require(amount > 0, "No balance");
-        (bool ok,) = botAddress.call{value: amount}("");
+        (bool ok,) = safe.call{value: amount}("");
         require(ok, "Sweep failed");
         emit ModuleSweep(address(0), amount);
     }
 
-    function sweepTokenToBot(address token) external onlyBot {
-        require(!paused, "Module paused");
+    function sweepTokenToSafe(address token) external {
+        require(msg.sender == owner || msg.sender == safe, "Only owner");
         uint256 amount = IERC20Sweep(token).balanceOf(address(this));
         require(amount > 0, "No balance");
-        require(IERC20Sweep(token).transfer(botAddress, amount), "Sweep failed");
+        require(IERC20Sweep(token).transfer(safe, amount), "Sweep failed");
         emit ModuleSweep(token, amount);
     }
 

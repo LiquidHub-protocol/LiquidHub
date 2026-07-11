@@ -32,6 +32,7 @@ class Rebalancer {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
     try {
+      await this._syncFeesForDepositPlan();
       const priceCache = await this._freshPriceCache('rebalance plan/minOut');
       // 1. Read optimal swap params (what the contract would expect) — REBALANCE = état post-burn (NFT inclus).
       const swapParams = await this.rpcPool.executeWithRetry(async (provider) => {
@@ -234,7 +235,7 @@ class Rebalancer {
           request: await vault.syncFeesForDeposits.populateTransaction(),
         };
       }, 'syncFeesForDeposits');
-      console.log(`  Fees synced before deposit plan: ${receipt.hash}`);
+      console.log(`  Fees synced before action plan: ${receipt.hash}`);
     } catch (error) {
       console.log(`  Fee sync skipped (${(error.reason || error.message || '').slice(0, 90)})`);
     }

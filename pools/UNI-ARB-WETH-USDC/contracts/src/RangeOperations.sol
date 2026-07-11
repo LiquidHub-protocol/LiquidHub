@@ -807,7 +807,7 @@ library RangeOperations {
         IRmDeposit rm = IRmDeposit(rangeManager);
         (uint128 price0, uint128 price1, uint160 sp, int24 tk,, bool valid) = rm.priceCache();
         if (!valid) return (false, 0);
-        (, uint8 dec0, uint8 dec1,,,,,,,) = rm.config();
+        (, uint8 dec0, uint8 dec1,,,,, uint16 rangeUpPercent, uint16 rangeDownPercent,) = rm.config();
 
         uint256 free0 = IERC20(rm.token0()).balanceOf(rangeManager) + depositAmount0;
         uint256 free1 = IERC20(rm.token1()).balanceOf(rangeManager) + depositAmount1;
@@ -822,7 +822,8 @@ library RangeOperations {
             (,,,,, int24 tickLower, int24 tickUpper,,,,,) = rm.positionManager().positions(positions[0]);
             ratioBps = calculateOptimalRatio(tickLower, tickUpper, tk, sp);
         } else {
-            ratioBps = 5000;
+            uint256 totalRange = uint256(rangeUpPercent) + uint256(rangeDownPercent);
+            ratioBps = totalRange == 0 ? 5000 : (uint256(rangeUpPercent) * 10000) / totalRange;
         }
         uint256 targetV0 = (tot * ratioBps) / 10000;
 

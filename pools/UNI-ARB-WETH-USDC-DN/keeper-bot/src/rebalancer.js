@@ -33,6 +33,7 @@ class Rebalancer {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
     try {
+      await this._syncFeesForDepositPlan();
       const priceCache = await this._freshPriceCache('rebalance plan/minOut');
       // 1. AUDIT M-01 : en DN, le plan de swap du rebalance doit viser une composition LP compatible avec la
       // DETTE AAVE FIXE (rebalance() ne touche pas AAVE) : wethInLP ≈ effectiveShort/H. Sinon le post-check DN
@@ -130,6 +131,14 @@ class Rebalancer {
   async processDeposit() {
     console.log('\n=== Processing queued deposit (permissionless) ===');
     try {
+      const [, , needsRebalance, action, reason] = await this.rpcPool.executeWithRetry(async (provider) => {
+        return await this.rangeManager.connect(provider).getBotInstructions();
+      });
+      if (needsRebalance) {
+        console.log(`  DN deposit skipped: ${action || 'REBALANCE'} is required first (${reason || 'on-chain signal'}).`);
+        return { success: false, error: 'rebalance required before DN deposit', txHashes: [] };
+      }
+
       const priceCache = await this._freshPriceCache('deposit plan/minOut');
       await this._syncFeesForDepositPlan();
       // AUDIT H-01 : pour un DÉPÔT, on utilise la vue DÉDIÉE du Vault (état post-transfert du dépôt +
@@ -258,7 +267,7 @@ class Rebalancer {
           request: await vault.syncFeesForDeposits.populateTransaction(),
         };
       }, 'syncFeesForDeposits');
-      console.log(`  Fees synced before deposit plan: ${receipt.hash}`);
+      console.log(`  Fees synced before action plan: ${receipt.hash}`);
     } catch (error) {
       console.log(`  Fee sync skipped (${(error.reason || error.message || '').slice(0, 90)})`);
     }
