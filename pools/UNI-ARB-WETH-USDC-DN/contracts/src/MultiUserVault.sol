@@ -727,13 +727,22 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
 
         // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk
-        uint256 n = swapAmountsIn.length;
-        uint256 swapLossUsd;
-        if (n > 0) {
-            for (uint256 i = 0; i < n; i++) {
-                uint256 amountOut = rangeManager.executeSwap(tokenIn, tokenOut, swapAmountsIn[i], minAmountsOut[i]);
-                swapLossUsd += _swapLossUsd(tokenIn == address(token0), swapAmountsIn[i], amountOut);
-            }
+        (uint256 swapLossUsd, uint256 incumbentLossUsd) = DnDepositLib.executeDepositSwaps(
+            address(rangeManager),
+            address(token0),
+            swapAmountsIn,
+            minAmountsOut,
+            tokenIn,
+            tokenOut,
+            price0,
+            price1,
+            cfg.token0Decimals,
+            cfg.token1Decimals,
+            tokenIn == address(token0) ? pd.amount0 : pd.amount1
+        );
+        if (incumbentLossUsd > 0) {
+            if (incumbentLossUsd >= valueBefore) revert E25();
+            valueBefore -= incumbentLossUsd;
         }
 
         // 7. Ajouter a la position existante, ou minter la position initiale après hedge + swaps.
@@ -1095,23 +1104,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         } catch {
             return 0;
         }
-    }
-
-    function _swapLossUsd(bool tokenInIsToken0, uint256 amountIn, uint256 amountOut) private view returns (uint256) {
-        (uint128 price0, uint128 price1,,,, bool valid) = rangeManager.priceCache();
-        if (!valid) revert E72();
-        RangeOperations.RangeConfig memory config = rangeManager.config();
-
-        uint256 valueIn;
-        uint256 valueOut;
-        if (tokenInIsToken0) {
-            valueIn = (amountIn * uint256(price0)) / (10 ** config.token0Decimals);
-            valueOut = (amountOut * uint256(price1)) / (10 ** config.token1Decimals);
-        } else {
-            valueIn = (amountIn * uint256(price1)) / (10 ** config.token1Decimals);
-            valueOut = (amountOut * uint256(price0)) / (10 ** config.token0Decimals);
-        }
-        return valueIn > valueOut ? valueIn - valueOut : 0;
     }
 
     // ===== VIEW FONCTIONS =====

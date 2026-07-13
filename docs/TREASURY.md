@@ -44,17 +44,18 @@ We believe clarity on what is and isn't decentralized matters more than marketin
 
 ---
 
-## Public Functions (callable by anyone)
-
-These functions are **permissionless** — no authorization required.
+## Treasury Swaps
 
 ### swapToUSDC()
 
-Converts **any ERC-20 token** held by the Treasury to USDC via the DEX router.
-- Parameters: `tokenIn`, `fee` (DEX pool fee tier), `amountIn`, `minAmountOut`.
+Converts a configured ERC-20 token held by the Treasury to USDC via the DEX router. This function is **owner-only** (Safe in Phase 1, Timelock governance in Phase 2).
+- Parameters: `tokenIn`, `fee`, `amountIn`, `minAmountOut`.
+- The deployment/onboarding batch records the approved fee tier for each token from the pool `FEE`. The supplied `fee` must match that on-chain value, so the caller cannot select a different route tier.
 - Fee tiers: 100 (0.01%), 500 (0.05%), 3000 (0.3%), 10000 (1%).
 - USDC remains in the Treasury after the swap.
 - Useful for consolidating revenue from multiple token types into USDC.
+
+`collectAndBridge()` remains permissionless in Phase 2, but it enforces the same approved fee tier and the configured oracle floor before swapping and bridging.
 
 ---
 

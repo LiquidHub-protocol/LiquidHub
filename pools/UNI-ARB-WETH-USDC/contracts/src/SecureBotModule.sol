@@ -249,14 +249,16 @@ contract SecureBotModule {
         require(!paused, "Module paused");
         require(msg.value == value, "Invalid ETH value");
 
+        uint256 nativeBefore = address(this).balance - msg.value;
+        (address refundToken, uint256 tokenBefore) = _treasuryUsdcBalance();
         _execute(treasury, value, data);
-        if (directExecution && address(this).balance > 0) {
-            uint256 refund = address(this).balance;
+        if (directExecution && address(this).balance > nativeBefore) {
+            uint256 refund = address(this).balance - nativeBefore;
             (bool ok,) = botAddress.call{value: refund}("");
             require(ok, "Refund failed");
             emit ModuleSweep(address(0), refund);
         }
-        _sweepTreasuryUsdcToBot();
+        _sweepTreasuryUsdcToBot(refundToken, tokenBefore);
 
         bytes4 selector = bytes4(data[:4]);
         emit FunctionExecuted(selector, dailySpent);
@@ -336,18 +338,29 @@ contract SecureBotModule {
         require(msg.sender == owner || msg.sender == safe, "Only owner");
         uint256 amount = IERC20Sweep(token).balanceOf(address(this));
         require(amount > 0, "No balance");
-        require(IERC20Sweep(token).transfer(safe, amount), "Sweep failed");
+        _safeTransfer(token, safe, amount);
         emit ModuleSweep(token, amount);
     }
 
-    function _sweepTreasuryUsdcToBot() private {
+    function _treasuryUsdcBalance() private view returns (address token, uint256 balance) {
         (bool ok, bytes memory ret) = treasury.staticcall(abi.encodeWithSignature("usdc()"));
-        if (!ok || ret.length < 32) return;
-        address token = abi.decode(ret, (address));
-        uint256 amount = IERC20Sweep(token).balanceOf(address(this));
+        if (!ok || ret.length < 32) return (address(0), 0);
+        token = abi.decode(ret, (address));
+        balance = IERC20Sweep(token).balanceOf(address(this));
+    }
+
+    function _sweepTreasuryUsdcToBot(address token, uint256 balanceBefore) private {
+        if (token == address(0)) return;
+        uint256 balance = IERC20Sweep(token).balanceOf(address(this));
+        uint256 amount = balance > balanceBefore ? balance - balanceBefore : 0;
         if (amount == 0) return;
-        require(IERC20Sweep(token).transfer(botAddress, amount), "Sweep failed");
+        _safeTransfer(token, botAddress, amount);
         emit ModuleSweep(token, amount);
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) private {
+        (bool ok, bytes memory ret) = token.call(abi.encodeWithSelector(IERC20Sweep.transfer.selector, to, amount));
+        require(ok && (ret.length == 0 || (ret.length >= 32 && abi.decode(ret, (bool)))), "Sweep failed");
     }
 
     function _execute(address target, uint256 value, bytes memory data) private {

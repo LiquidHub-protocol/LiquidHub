@@ -20,7 +20,8 @@ import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/Aggrega
 ///      TOKEN1_ORACLE_ADDRESS / NATIVE_ORACLE_ADDRESS sur les wrappers dans le .env (au lieu des feeds bruts).
 ///
 ///      STALENESS : NON géré ici (pass-through pur). Les contrats conservent leur propre check updatedAt
-///      (MAX_AGE0/1 cote RangeManager ; max age configurable cote Treasury/HedgeManager). Pas de double comptage.
+///      (MAX_AGE0/1 cote RangeManager ; max age par token cote Treasury). Le HedgeManager DN reutilise le
+///      priceCache valide du RangeManager. Pas de double comptage.
 contract SequencerCheckedAggregator is AggregatorV3Interface {
     /// @notice Le vrai feed Chainlink (ex: ETH/USD) auquel on délègue les données de prix.
     AggregatorV3Interface public immutable underlyingFeed;

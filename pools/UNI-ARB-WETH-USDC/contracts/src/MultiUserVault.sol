@@ -74,6 +74,14 @@ interface ITreasuryDeposit {
 contract MultiUserVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    error OnlyOperationalExecutor();
+    error OnlyEmergencySafe();
+    error FirstDepositTooSmall();
+    error ProtectedPoolToken();
+    error InvalidRecipient();
+    error NoPositionToBurn();
+    error UserIndexOutOfBounds();
+
     // ===== STRUCTURES =====
 
     struct UserInfo {
@@ -211,12 +219,14 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     modifier onlyBot() {
-        require(msg.sender == owner() || msg.sender == botModule || msg.sender == address(rangeManager), "Only bot");
+        if (msg.sender != owner() && msg.sender != botModule && msg.sender != address(rangeManager)) {
+            revert OnlyOperationalExecutor();
+        }
         _;
     }
 
     modifier onlyEmergencySafe() {
-        require(msg.sender == emergencySafe, "Only emergency safe");
+        if (msg.sender != emergencySafe) revert OnlyEmergencySafe();
         _;
     }
 
@@ -553,7 +563,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             require(currentTotalValue == 0, "E_ORPHAN_VALUE");
             totalShares = 0;
             sharesToMint = creditedValue * 1e10;
-            require(sharesToMint > DEAD_SHARES, "First deposit too small");
+            if (sharesToMint <= DEAD_SHARES) revert FirstDepositTooSmall();
             sharesToMint -= DEAD_SHARES;
             totalShares = DEAD_SHARES;
         } else {
@@ -636,19 +646,30 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk
         uint256 n = swapAmountsIn.length;
-        uint256 swapLossUsd;
+        uint256 totalSwapLossUsd;
+        uint256 totalSwapIn;
         if (n > 0) {
             for (uint256 i = 0; i < n; i++) {
                 uint256 amountOut = rangeManager.executeSwap(tokenIn, tokenOut, swapAmountsIn[i], minAmountsOut[i]);
-                swapLossUsd += _swapLossUsd(tokenIn == address(token0), swapAmountsIn[i], amountOut);
+                totalSwapLossUsd += _swapLossUsd(tokenIn == address(token0), swapAmountsIn[i], amountOut);
+                totalSwapIn += swapAmountsIn[i];
             }
+            uint256 depositTokenIn = tokenIn == address(token0) ? pd.amount0 : pd.amount1;
+            uint256 depositLossUsd = totalSwapLossUsd;
+            if (depositTokenIn < totalSwapIn) {
+                depositLossUsd = (totalSwapLossUsd * depositTokenIn) / totalSwapIn;
+                uint256 incumbentLossUsd = totalSwapLossUsd - depositLossUsd;
+                require(incumbentLossUsd < valueBefore, "E25");
+                valueBefore -= incumbentLossUsd;
+            }
+            totalSwapLossUsd = depositLossUsd;
         }
 
         // 7. Ajouter a la position existante, ou minter la position initiale en atomique bot-only.
         if (hasPosition) rangeManager.addLiquidityToPosition();
         else rangeManager.mintInitialPosition();
 
-        _finalizeProcessedDeposit(pd, depositValue, swapLossUsd, valueBefore, sharesBefore);
+        _finalizeProcessedDeposit(pd, depositValue, totalSwapLossUsd, valueBefore, sharesBefore);
 
         // 8. DEVERROU
         _processingRebalance = false;
@@ -679,11 +700,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function endRebalance() external {
-        require(
-            msg.sender == owner() || msg.sender == botModule || msg.sender == address(rangeManager)
-                || msg.sender == emergencySafe,
-            "Only bot"
-        );
+        if (
+            msg.sender != owner() && msg.sender != botModule && msg.sender != address(rangeManager)
+                && msg.sender != emergencySafe
+        ) revert OnlyOperationalExecutor();
         _processingRebalance = false;
         _rebalanceStartedAt = 0;
     }
@@ -1297,8 +1317,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     /// @param to Recipient address
     /// @param amount Amount to rescue
     function rescueToken(address tokenAddr, address to, uint256 amount) external onlyEmergencySafe {
-        require(tokenAddr != address(token0) && tokenAddr != address(token1), "Protected");
-        require(to != address(0), "Invalid recipient");
+        if (tokenAddr == address(token0) || tokenAddr == address(token1)) revert ProtectedPoolToken();
+        if (to == address(0)) revert InvalidRecipient();
         IERC20(tokenAddr).safeTransfer(to, amount);
         emit TokenRescued(tokenAddr, to, amount);
     }
@@ -1451,9 +1471,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // 1. Recuperer toutes les positions NFT
         uint256[] memory positions = rangeManager.getOwnerPositions();
 
-        if (positions.length == 0) {
-            revert("No positions to burn");
-        }
+        if (positions.length == 0) revert NoPositionToBurn();
 
         // 2. Pour chaque position, retirer la liquidite puis burn le NFT.
         //    Fail-closed : si un burn echoue, toute la transaction revert et aucun succes global trompeur
@@ -1485,7 +1503,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice Retourne l'adresse d'un utilisateur par son index
      */
     function getUserAtIndex(uint256 index) external view returns (address) {
-        require(index < users.length, "Index out of bounds");
+        if (index >= users.length) revert UserIndexOutOfBounds();
         return users[index];
     }
 }

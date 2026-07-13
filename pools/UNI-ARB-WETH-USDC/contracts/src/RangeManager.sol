@@ -365,31 +365,34 @@ contract RangeManager is Ownable, ReentrancyGuard {
         return RangeOperations.isSnapshotDue(dynRangeConfig, uint64(block.timestamp));
     }
 
-    /// @notice Enregistre un snapshot de prix (permissionless). Verse le metrics bounty au keeper.
+    /// @notice Enregistre le ratio oracle token0/token1 normalise en 8 decimales et verse le metrics bounty.
     function recordPriceSnapshot() external nonReentrant {
         require(dynRangeConfig.dynamicRangeEnabled, "E45");
         require(RangeOperations.isSnapshotDue(dynRangeConfig, uint64(block.timestamp)), "E46");
 
         _updatePriceCache();
-        require(priceCache.valid && priceCache.price0 > 0, "E38");
+        require(priceCache.valid && priceCache.price0 > 0 && priceCache.price1 > 0, "E38");
+        uint256 pairPriceRaw = (uint256(priceCache.price0) * 1e8) / uint256(priceCache.price1);
+        require(pairPriceRaw > 0 && pairPriceRaw <= type(uint128).max, "E38");
+        uint128 pairPrice = uint128(pairPriceRaw);
 
         _ringHead = RangeOperations.writeRing(
             _priceRing,
             _ringHead,
             _ringCap,
-            RangeOperations.PriceSnapshot({price: priceCache.price0, timestamp: uint64(block.timestamp)})
+            RangeOperations.PriceSnapshot({price: pairPrice, timestamp: uint64(block.timestamp)})
         );
         dynRangeConfig.lastSnapshotAt = uint64(block.timestamp);
-        _applyDynamicRangeIfDue();
+        _applyDynamicRangeIfDue(pairPrice);
 
         _payBounty(true);
-        emit PriceSnapshotRecorded(priceCache.price0, uint64(block.timestamp), msg.sender);
+        emit PriceSnapshotRecorded(pairPrice, uint64(block.timestamp), msg.sender);
     }
 
     /// @dev Recalcule et applique le range dynamique (calcul + decision delegues a la library).
-    function _applyDynamicRangeIfDue() private {
+    function _applyDynamicRangeIfDue(uint128 pairPrice) private {
         (uint16 halfBps, bool shouldApply) =
-            RangeOperations.evaluateDynamicRange(_priceRing, priceCache.price0, dynRangeConfig, uint64(block.timestamp));
+            RangeOperations.evaluateDynamicRange(_priceRing, pairPrice, dynRangeConfig, uint64(block.timestamp));
         if (!shouldApply) return;
         config.rangeUpPercent = halfBps;
         config.rangeDownPercent = halfBps;

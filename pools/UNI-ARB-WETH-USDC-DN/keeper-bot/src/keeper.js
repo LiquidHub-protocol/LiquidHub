@@ -257,25 +257,9 @@ async function main() {
       // on-chain cooldown (hedgeAdjustCooldown) has not elapsed. A successful (over-hedge) call earns the bounty.
       if (!CHECK_ONLY && hedgeManager && wallet) {
         try {
-          // Pre-tx cooldown check: read the on-chain cooldown + last adjust timestamp and skip BEFORE
-          // any tx (and even before the static-call) when the cooldown window is still open. This is
-          // the single source of truth shared with the protocol bot — no divergence. cooldown=0 = off.
-          const [cooldownSec, lastAdjustAt] = await rpcPool.executeWithRetry(async (p) => {
-            const hedge = hedgeManager.connect(p);
-            return await Promise.all([
-              hedge.hedgeAdjustCooldown(),
-              hedge.lastHedgeAdjustAt(),
-            ]);
-          });
-          const cd = Number(cooldownSec);
-          if (cd > 0) {
-            const nowSec = Math.floor(Date.now() / 1000);
-            const elapsed = nowSec - Number(lastAdjustAt);
-            if (elapsed < cd) {
-              console.log(`  Hedge: cooldown active (${elapsed}s / ${cd}s), skip adjustHedge`);
-              throw { __cooldownSkip: true };
-            }
-          }
+          // Always simulate the on-chain action. adjustHedge() itself applies the normal cooldown, while
+          // its HF-repair branch deliberately bypasses that cooldown. An off-chain cooldown gate here would
+          // therefore suppress a safety repair that the contract is explicitly ready to execute.
           const hedgeEnabled = treasury ? await treasury.hedgeBountyEnabled() : false;
           const hedgeAmount = treasury ? await treasury.hedgeBountyAmount() : 0n;
           await checkBountyFunding('hedge', hedgeEnabled, hedgeAmount, treasuryAddr, usdc);
@@ -293,12 +277,8 @@ async function main() {
           }, 'adjustHedge');
           console.log(`  -> Hedge adjusted: ${rcpt.hash}`);
         } catch (e) {
-          // Cooldown skip already logged above — swallow it silently.
-          if (e && e.__cooldownSkip) { /* already logged */ }
-          else {
-            // Revert is expected here: under-hedge (UnderHedged), drift below dynamic threshold, or cooldown. Not fatal.
-            console.log(`  Hedge: no adjustment (${(e.reason || e.message || '').slice(0, 80)})`);
-          }
+          // Revert is expected here: under-hedge, drift below threshold, or normal cooldown. Not fatal.
+          console.log(`  Hedge: no adjustment (${(e.reason || e.message || '').slice(0, 80)})`);
         }
       }
 

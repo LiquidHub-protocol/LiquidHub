@@ -5,6 +5,7 @@ import "openzeppelin-contracts/contracts/access/Ownable2Step.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
@@ -70,6 +71,7 @@ interface IStargate {
 
 contract Treasury is Ownable2Step {
     using SafeERC20 for IERC20;
+    using Math for uint256;
 
     error BridgeBountyCooldownZero();
     error BridgeBountyMinRatioZero();
@@ -98,6 +100,7 @@ contract Treasury is Ownable2Step {
     mapping(address => uint64) public keeperBountyDay;
     mapping(address => uint256) public keeperBountyDailySpent;
     mapping(address => bool) public authorizedRangeManagers;
+    uint32 public authorizedRangeManagerCount;
 
     // SÉCURITÉ (audit V1) : plancher oracle anti-sandwich pour les swaps de la Treasury.
     // Le Treasury est PARTAGÉ par toutes les pools d'une même chaîne → il peut swapper des tokens
@@ -107,7 +110,7 @@ contract Treasury is Ownable2Step {
     mapping(address => AggregatorV3Interface) public swapFeeds; // tokenIn => feed Chainlink (prix en USD)
     mapping(address => uint32) public swapFeedMaxAges; // tokenIn => heartbeat max accepte pour ce feed
     mapping(address => uint16) public swapFeedSlippageBps; // tokenIn => slippage max tolere pour le floor oracle
-    uint16 public swapSlippageBps; // legacy mirror du dernier slippage configure; utiliser swapFeedSlippageBps[token]
+    mapping(address => uint24) public swapPoolFees; // tokenIn => fee tier Uniswap autorise par le batch de pool
 
     // --- Bridge Bounty (Phase 2) — paid to whoever calls bridgeToStakers / collectAndBridge ---
     // Anti-drain protections (configurable by multisig):
@@ -135,6 +138,7 @@ contract Treasury is Ownable2Step {
     mapping(address => uint64) public hedgeBountyDay;
     mapping(address => uint256) public hedgeBountyDailySpent;
     mapping(address => bool) public authorizedHedgeManagers;
+    uint32 public authorizedHedgeManagerCount;
 
     // --- Deposit Bounty (processDepositPermissionless) — paye au keeper qui traite un depot en file ---
     // Le caller est le Vault (pas le RangeManager) -> autorisation dediee authorizedVaults.
@@ -150,6 +154,7 @@ contract Treasury is Ownable2Step {
     mapping(address => uint64) public depositBountyDay;
     mapping(address => uint256) public depositBountyDailySpent;
     mapping(address => bool) public authorizedVaults;
+    uint32 public authorizedVaultCount;
 
     // --- Bridge (Stargate v2) ---
     bool public bridgeEnabled;
@@ -178,6 +183,7 @@ contract Treasury is Ownable2Step {
     event BridgedToStakers(uint256 amountSent, uint256 amountReceived, uint32 dstEid, bytes32 guid);
     event RangeManagerAuthorized(address indexed rangeManager, bool authorized);
     event SwapFeedConfigured(address indexed token, address feed, uint16 swapSlippageBps, uint32 maxAge);
+    event SwapPoolFeeConfigured(address indexed token, uint24 fee);
     event CollectedAndBridged(address indexed tokenIn, uint256 swappedUSDC, uint256 bridgedUSDC, uint32 dstEid);
     event MetricsBountyPaid(address indexed keeper, uint256 amount);
     event MetricsBountyConfigured(bool enabled, uint256 amount);
@@ -232,6 +238,7 @@ contract Treasury is Ownable2Step {
         returns (uint256 amountOut)
     {
         require(tokenIn != address(usdc), "Already USDC");
+        require(fee == swapPoolFees[tokenIn] && fee != 0, "Unapproved fee");
         require(amountIn > 0, "Zero amount");
         IERC20 token = IERC20(tokenIn);
         require(token.balanceOf(address(this)) >= amountIn, "Insufficient balance");
@@ -337,10 +344,10 @@ contract Treasury is Ownable2Step {
     }
 
     function _bountyReserveUsdc() internal view returns (uint256 reserve) {
-        if (keeperBountyEnabled) reserve += keeperBountyDailyCap > 0 ? keeperBountyDailyCap : keeperBountyAmount;
-        if (metricsBountyEnabled) reserve += metricsBountyAmount;
-        if (hedgeBountyEnabled) reserve += hedgeBountyDailyCap > 0 ? hedgeBountyDailyCap : hedgeBountyAmount;
-        if (depositBountyEnabled) reserve += depositBountyDailyCap > 0 ? depositBountyDailyCap : depositBountyAmount;
+        if (keeperBountyEnabled) reserve += (keeperBountyDailyCap > 0 ? keeperBountyDailyCap : keeperBountyAmount) * authorizedRangeManagerCount;
+        if (metricsBountyEnabled) reserve += metricsBountyAmount * 24 * authorizedRangeManagerCount;
+        if (hedgeBountyEnabled) reserve += (hedgeBountyDailyCap > 0 ? hedgeBountyDailyCap : hedgeBountyAmount) * authorizedHedgeManagerCount;
+        if (depositBountyEnabled) reserve += (depositBountyDailyCap > 0 ? depositBountyDailyCap : depositBountyAmount) * authorizedVaultCount;
         if (bridgeBountyEnabled) reserve += bridgeBountyAmount;
     }
 
@@ -361,6 +368,7 @@ contract Treasury is Ownable2Step {
             _requireDistributableUsdc(amountIn);
         } else {
             require(amountIn > 0, "Zero amount");
+            require(fee == swapPoolFees[tokenIn] && fee != 0, "Unapproved fee");
             IERC20 token = IERC20(tokenIn);
             require(token.balanceOf(address(this)) >= amountIn, "Insufficient balance");
 
@@ -621,6 +629,11 @@ contract Treasury is Ownable2Step {
     }
 
     function authorizeHedgeManager(address _hedgeManager, bool _authorized) external onlyOwner {
+        require(_hedgeManager != address(0), "Invalid address");
+        if (authorizedHedgeManagers[_hedgeManager] != _authorized) {
+            if (_authorized) authorizedHedgeManagerCount++;
+            else authorizedHedgeManagerCount--;
+        }
         authorizedHedgeManagers[_hedgeManager] = _authorized;
         emit HedgeManagerAuthorized(_hedgeManager, _authorized);
     }
@@ -705,6 +718,11 @@ contract Treasury is Ownable2Step {
     }
 
     function authorizeVault(address _vault, bool _authorized) external onlyOwner {
+        require(_vault != address(0), "Invalid address");
+        if (authorizedVaults[_vault] != _authorized) {
+            if (_authorized) authorizedVaultCount++;
+            else authorizedVaultCount--;
+        }
         authorizedVaults[_vault] = _authorized;
         emit VaultAuthorized(_vault, _authorized);
     }
@@ -739,6 +757,11 @@ contract Treasury is Ownable2Step {
     }
 
     function authorizeRangeManager(address _rangeManager, bool _authorized) external onlyOwner {
+        require(_rangeManager != address(0), "Invalid address");
+        if (authorizedRangeManagers[_rangeManager] != _authorized) {
+            if (_authorized) authorizedRangeManagerCount++;
+            else authorizedRangeManagerCount--;
+        }
         authorizedRangeManagers[_rangeManager] = _authorized;
         emit RangeManagerAuthorized(_rangeManager, _authorized);
     }
@@ -746,17 +769,11 @@ contract Treasury is Ownable2Step {
     // --- Swap oracle floor config (onlyOwner = Safe) — audit V1 ---
 
     /// @notice Déclare/maj le feed Chainlink (prix USD) d'un token swappable + le slippage et heartbeat tolérés.
-    /// @dev feed=address(0) retire le token (ses swaps seront alors refusés). Slippage borné [10..1000] bps.
+    /// @dev Utiliser removeSwapFeed(token) pour retirer explicitement une configuration. Slippage borné [10..1000] bps.
     function setSwapFeed(address token, address feed, uint16 _swapSlippageBps, uint32 _maxAge) external onlyOwner {
-        require(token != address(0) && token != address(usdc), "Invalid token");
+        require(token != address(0), "Invalid token");
+        require(feed != address(0), "Invalid feed");
         require(_swapSlippageBps >= 10 && _swapSlippageBps <= 1000, "Invalid slippage");
-        if (feed == address(0)) {
-            delete swapFeeds[token];
-            delete swapFeedMaxAges[token];
-            delete swapFeedSlippageBps[token];
-            emit SwapFeedConfigured(token, feed, _swapSlippageBps, 0);
-            return;
-        }
         require(_maxAge >= 3600 && _maxAge <= 172800, "Invalid max age");
         require(
             IERC20Metadata(token).decimals() <= 18 && usdcDecimals <= 18 && AggregatorV3Interface(feed).decimals() <= 18,
@@ -765,8 +782,23 @@ contract Treasury is Ownable2Step {
         swapFeeds[token] = AggregatorV3Interface(feed);
         swapFeedMaxAges[token] = _maxAge;
         swapFeedSlippageBps[token] = _swapSlippageBps;
-        swapSlippageBps = _swapSlippageBps;
         emit SwapFeedConfigured(token, feed, _swapSlippageBps, _maxAge);
+    }
+
+    function setSwapPoolFee(address token, uint24 fee) external onlyOwner {
+        require(token != address(0) && token != address(usdc), "Invalid token");
+        require(fee == 100 || fee == 500 || fee == 3000 || fee == 10000, "Invalid fee");
+        swapPoolFees[token] = fee;
+        emit SwapPoolFeeConfigured(token, fee);
+    }
+
+    function removeSwapFeed(address token) external onlyOwner {
+        require(token != address(0), "Invalid token");
+        delete swapFeeds[token];
+        delete swapFeedMaxAges[token];
+        delete swapFeedSlippageBps[token];
+        delete swapPoolFees[token];
+        emit SwapFeedConfigured(token, address(0), 0, 0);
     }
 
     /// @dev Plancher anti-sandwich : USDC minimum attendu pour `amountIn` de `tokenIn`, depuis l'oracle
@@ -774,21 +806,35 @@ contract Treasury is Ownable2Step {
     ///      Conversion générique des décimales (token volatil, feed, USDC) — pas de hard-code.
     function _oracleMinUsdcOut(address tokenIn, uint256 amountIn) internal view returns (uint256) {
         AggregatorV3Interface feed = swapFeeds[tokenIn];
+        AggregatorV3Interface usdcFeed = swapFeeds[address(usdc)];
         uint32 maxAge = swapFeedMaxAges[tokenIn];
+        uint32 usdcMaxAge = swapFeedMaxAges[address(usdc)];
         uint16 slippageBps = swapFeedSlippageBps[tokenIn];
-        require(address(feed) != address(0), "No feed for token");
-        require(maxAge != 0, "No max age");
+        require(address(feed) != address(0) && address(usdcFeed) != address(0), "No feed for token");
+        require(maxAge != 0 && usdcMaxAge != 0, "No max age");
         require(slippageBps != 0, "No slippage");
         (uint80 roundId, int256 px,, uint256 updatedAt, uint80 answeredInRound) = feed.latestRoundData();
+        (uint80 usdcRoundId, int256 usdcPx,, uint256 usdcUpdatedAt, uint80 usdcAnsweredInRound) =
+            usdcFeed.latestRoundData();
         require(
             px > 0 && updatedAt != 0 && answeredInRound >= roundId && block.timestamp - updatedAt <= maxAge,
             "Bad oracle"
         );
+        require(
+            usdcPx > 0 && usdcUpdatedAt != 0 && usdcAnsweredInRound >= usdcRoundId
+                && block.timestamp - usdcUpdatedAt <= usdcMaxAge,
+            "Bad USDC oracle"
+        );
         uint8 tokenDec = IERC20Metadata(tokenIn).decimals();
         uint8 feedDec = feed.decimals();
         uint8 usdcDec = IERC20Metadata(address(usdc)).decimals();
-        // valeur_usdc = amountIn * px * 10^usdcDec / (10^tokenDec * 10^feedDec)
-        uint256 theo = (amountIn * uint256(px) * (10 ** usdcDec)) / ((10 ** tokenDec) * (10 ** feedDec));
+        uint8 usdcFeedDec = usdcFeed.decimals();
+        uint256 normalizedUsdcPx = uint256(usdcPx);
+        if (usdcFeedDec < feedDec) normalizedUsdcPx *= 10 ** (feedDec - usdcFeedDec);
+        else if (usdcFeedDec > feedDec) normalizedUsdcPx /= 10 ** (usdcFeedDec - feedDec);
+        require(normalizedUsdcPx > 0, "Bad USDC decimals");
+        uint256 usdValue = Math.mulDiv(amountIn, uint256(px), 10 ** tokenDec);
+        uint256 theo = Math.mulDiv(usdValue, 10 ** usdcDec, normalizedUsdcPx);
         return (theo * (10000 - slippageBps)) / 10000;
     }
 

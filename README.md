@@ -19,7 +19,7 @@ Two pool types:
 | **RangeOperations** | Library for tick/range calculations and the on-chain dynamic-range formula |
 | **SecureBotModule** | Gnosis Safe module whitelisting specific function selectors for automated operations |
 | **Treasury** | Protocol fee collection, keeper / metrics / hedge bounties (+ Phase 2 bridge bounty), admin withdrawals with monthly cap |
-| **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: supply/borrow, permissionless `adjustHedge()` (H_opt + USDC reserve), flash loan settlement, health factor monitoring |
+| **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: governed hedge target, permissionless over-hedge correction, debt-compatible atomic rebalance for under-hedge, proportional flash-loan settlement, health-factor monitoring |
 
 ## Directory Structure
 

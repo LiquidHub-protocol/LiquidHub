@@ -237,7 +237,7 @@ class Rebalancer {
       }, 'syncFeesForDeposits');
       console.log(`  Fees synced before action plan: ${receipt.hash}`);
     } catch (error) {
-      console.log(`  Fee sync skipped (${(error.reason || error.message || '').slice(0, 90)})`);
+      throw new Error(`Fee sync required before recomputing the plan: ${(error.reason || error.message || '').slice(0, 120)}`);
     }
   }
 

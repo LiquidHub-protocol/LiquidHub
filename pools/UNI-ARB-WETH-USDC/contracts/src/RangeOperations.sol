@@ -21,6 +21,7 @@ interface IRmDeposit {
     function token1() external view returns (address);
     function getOwnerPositions() external view returns (uint256[] memory);
     function positionManager() external view returns (INonfungiblePositionManager);
+    function pool() external view returns (IUniswapV3Pool);
     function priceCache() external view returns (uint128 p0, uint128 p1, uint160 sp, int24 tk, uint64 ts, bool v);
     function config()
         external
@@ -101,9 +102,9 @@ library RangeOperations {
 
     // ===== DYNAMIC RANGE (calcul on-chain) =====
 
-    /// @notice Un snapshot de prix horodate (price0 Chainlink, 8 decimales)
+    /// @notice Snapshot horodate du ratio oracle token0/token1, normalise en 8 decimales.
     struct PriceSnapshot {
-        uint128 price; // price0 en 8 decimales (cf. PriceCache.price0)
+        uint128 price; // ratio token0/token1 en 8 decimales
         uint64 timestamp; // unix timestamp du snapshot
     }
 
@@ -822,8 +823,11 @@ library RangeOperations {
             (,,,,, int24 tickLower, int24 tickUpper,,,,,) = rm.positionManager().positions(positions[0]);
             ratioBps = calculateOptimalRatio(tickLower, tickUpper, tk, sp);
         } else {
-            uint256 totalRange = uint256(rangeUpPercent) + uint256(rangeDownPercent);
-            ratioBps = totalRange == 0 ? 5000 : (uint256(rangeUpPercent) * 10000) / totalRange;
+            IUniswapV3Pool lpPool = rm.pool();
+            int24 spacing = lpPool.tickSpacing();
+            int24 lower = _floorToTickSpacing(tk - int24(uint24(rangeDownPercent)), spacing);
+            int24 upper = _ceilToTickSpacing(tk + int24(uint24(rangeUpPercent)), spacing);
+            ratioBps = calculateOptimalRatio(lower, upper, tk, sp);
         }
         uint256 targetV0 = (tot * ratioBps) / 10000;
 

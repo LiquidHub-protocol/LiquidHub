@@ -2,10 +2,12 @@
 pragma solidity ^0.8.19;
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
+import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "./RangeOperations.sol";
 
 /// @dev Interfaces minimales (la library reçoit les adresses en paramètre — aucun accès au storage du Vault).
@@ -55,11 +57,31 @@ interface IRmDep {
         );
     function getOwnerPositions() external view returns (uint256[] memory);
     function positionManager() external view returns (INonfungiblePositionManager);
+    function pool() external view returns (IUniswapV3Pool);
     function initMultiSwapTvl() external view returns (uint256);
+    function executeSwap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut)
+        external
+        returns (uint256 amountOut);
 }
 
 interface IVaultDep {
     function hedgeManager() external view returns (address);
+}
+
+interface IHedgeRepairContext {
+    function pool() external view returns (address);
+    function usdc() external view returns (address);
+    function weth() external view returns (address);
+    function aTokenUsdc() external view returns (address);
+    function variableDebtWeth() external view returns (address);
+    function swapRouter() external view returns (address);
+    function rangeManager() external view returns (address);
+    function swapPoolFee() external view returns (uint24);
+    function liqThresholdBps() external view returns (uint16);
+    function reserveHfTargetBps() external view returns (uint16);
+    function swapSlippageBps() external view returns (uint16);
+    function volatileDecimals() external view returns (uint8);
+    function stableDecimals() external view returns (uint8);
 }
 
 interface IAavePoolDep {
@@ -74,6 +96,9 @@ interface IAavePoolDep {
             uint256 ltv,
             uint256 healthFactor
         );
+
+    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
+    function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128);
 }
 
 /// @title DnDepositLib
@@ -83,6 +108,7 @@ interface IAavePoolDep {
 ///      external-calls sortent donc bien depuis l'adresse du Vault, qui est `onlySafeOrVault` côté HedgeManager).
 ///      Aucun accès storage : tout est passé en paramètres. Calcul pur délégué à RangeOperations.
 library DnDepositLib {
+    using SafeERC20 for IERC20;
     /// @dev Adresses regroupées (anti stack-too-deep).
     struct Addrs {
         address hedgeManager;
@@ -94,6 +120,107 @@ library DnDepositLib {
     error InsufficientCollateral();
     error PreAdjustRequired();
     error InvalidSwapPlan();
+
+    /// @notice Exact debt-token amount to repay through the existing flash-loan path when HF is below target.
+    /// @dev Solves the repay-first equation while accounting for the collateral needed to buy back the flash
+    ///      principal and premium. A small 10 bps HF buffer absorbs Aave/base-unit rounding.
+    function aaveHfRepairAmount() external view returns (uint256 amount) {
+        IHedgeRepairContext context = IHedgeRepairContext(address(this));
+        address aavePool = context.pool();
+        address debtToken = context.variableDebtWeth();
+        uint16 targetHfBps = context.reserveHfTargetBps();
+        uint16 swapSlippageBps = context.swapSlippageBps();
+        (uint256 collateralBase, uint256 debtBase,, uint256 liveThreshold,, uint256 hf) =
+            IAavePoolDep(aavePool).getUserAccountData(address(this));
+        if (debtBase == 0 || collateralBase == 0 || liveThreshold == 0) return 0;
+        uint256 bufferedTarget = uint256(targetHfBps) + 10;
+        if (hf >= bufferedTarget * 1e14) return 0;
+
+        uint256 premiumBps = IAavePoolDep(aavePool).FLASHLOAN_PREMIUM_TOTAL();
+        uint256 costBps = 10000 + uint256(swapSlippageBps) + premiumBps + 5;
+        uint256 collateralCost = Math.mulDiv(uint256(liveThreshold), costBps, 10000, Math.Rounding.Up);
+        if (bufferedTarget <= collateralCost) revert InvalidSwapPlan();
+        uint256 required = bufferedTarget * debtBase;
+        uint256 protectedCollateral = uint256(liveThreshold) * collateralBase;
+        if (required <= protectedCollateral) return 0;
+        uint256 repayBase = Math.mulDiv(
+            required - protectedCollateral, 1, bufferedTarget - collateralCost, Math.Rounding.Up
+        );
+        uint256 debtBalance = IERC20(debtToken).balanceOf(address(this));
+        amount = Math.mulDiv(debtBalance, repayBase, debtBase, Math.Rounding.Up);
+        if (amount > debtBalance) amount = debtBalance;
+    }
+
+    /// @notice Completes an HF repair after the callback has repaid Aave debt with flash-loaned token0.
+    /// @dev Executed by DELEGATECALL in the HedgeManager context. The oracle maximum is funded only from
+    ///      collateral that became safely withdrawable after the repay; no user-facing recipient is involved.
+    function aaveCompleteHfRepair(uint256 flashOwed) external {
+        IHedgeRepairContext context = IHedgeRepairContext(address(this));
+        address aavePool = context.pool();
+        address collateralToken = context.usdc();
+        address aToken = context.aTokenUsdc();
+        address debtToken = context.weth();
+        address router = context.swapRouter();
+        address rangeManager = context.rangeManager();
+        uint16 targetHfBps = context.reserveHfTargetBps();
+        uint16 slippageBps = context.swapSlippageBps();
+        uint256 amountInMaximum =
+            _oracleMaxToken1ForToken0(
+                flashOwed, rangeManager, context.volatileDecimals(), context.stableDecimals(), slippageBps
+            );
+        uint256 currentBudget = IERC20(collateralToken).balanceOf(address(this));
+        (uint256 capped, uint256 toWithdraw) = _hfSafeSwapBudget(
+            currentBudget, amountInMaximum, aavePool, aToken, context.liqThresholdBps(), targetHfBps
+        );
+        if (toWithdraw > 0) IAavePoolDep(aavePool).withdraw(collateralToken, toWithdraw, address(this));
+        if (capped < amountInMaximum || IERC20(collateralToken).balanceOf(address(this)) < amountInMaximum) {
+            revert InsufficientCollateral();
+        }
+        ISwapRouter(router).exactOutputSingle(
+            ISwapRouter.ExactOutputSingleParams({
+                tokenIn: collateralToken,
+                tokenOut: debtToken,
+                fee: context.swapPoolFee(),
+                recipient: address(this),
+                deadline: block.timestamp,
+                amountOut: flashOwed,
+                amountInMaximum: amountInMaximum,
+                sqrtPriceLimitX96: 0
+            })
+        );
+    }
+
+    function executeDepositSwaps(
+        address rangeManager,
+        address token0,
+        uint256[] calldata amountsIn,
+        uint256[] calldata minAmountsOut,
+        address tokenIn,
+        address tokenOut,
+        uint128 price0,
+        uint128 price1,
+        uint8 dec0,
+        uint8 dec1,
+        uint256 depositTokenIn
+    ) external returns (uint256 depositLossUsd, uint256 incumbentLossUsd) {
+        uint256 totalLossUsd;
+        uint256 totalIn;
+        bool zeroForOne = tokenIn == token0;
+        uint256 n = amountsIn.length;
+        for (uint256 i; i < n; i++) {
+            uint256 amountOut =
+                IRmDep(rangeManager).executeSwap(tokenIn, tokenOut, amountsIn[i], minAmountsOut[i]);
+            uint256 valueIn = zeroForOne ? _toUsd(amountsIn[i], price0, dec0) : _toUsd(amountsIn[i], price1, dec1);
+            uint256 valueOut = zeroForOne ? _toUsd(amountOut, price1, dec1) : _toUsd(amountOut, price0, dec0);
+            if (valueIn > valueOut) totalLossUsd += valueIn - valueOut;
+            totalIn += amountsIn[i];
+        }
+        depositLossUsd = totalLossUsd;
+        if (depositTokenIn < totalIn) {
+            depositLossUsd = (totalLossUsd * depositTokenIn) / totalIn;
+            incumbentLossUsd = totalLossUsd - depositLossUsd;
+        }
+    }
 
     /// @notice Ouvre le hedge au dépôt (cible GLOBALE : corrige aussi le drift existant). USD 8 déc.
     /// @param a Adresses (hedge, rm, token0, token1)
@@ -125,6 +252,17 @@ library DnDepositLib {
         (, uint8 dec0, uint8 dec1,,,,,,,) = rm.config();
         valueUsd = _toUsd(hm.getWethBalance(), price0, dec0);
         valueUsd += (hm.getUsdcBalance() * uint256(price1)) / (10 ** dec1);
+    }
+
+    function aaveEffectiveShort(address debtToken, address token0, address rangeManager, uint256 dustFloor)
+        external
+        view
+        returns (uint256 debt, int256 effectiveShort)
+    {
+        debt = IERC20(debtToken).balanceOf(address(this));
+        uint256 idleHm = _dust(IERC20(token0).balanceOf(address(this)), dustFloor);
+        uint256 idleRm = _dust(IERC20(token0).balanceOf(rangeManager), dustFloor);
+        effectiveShort = int256(debt) - int256(idleHm) - int256(idleRm);
     }
 
     /// @dev Calcule (collatéralUsdc, borrowWeth) du hedge au dépôt. Partagé par openDepositHedge (exécution) et
@@ -194,6 +332,11 @@ library DnDepositLib {
 
     function _pc(IRmDep rm) private view returns (RangeOperations.PriceCache memory pc) {
         (uint128 p0, uint128 p1, uint160 sp, int24 tk, uint64 ts, bool v) = rm.priceCache();
+        (bool twapEnabled,,,,,,) = rm.protectionConfig();
+        if (twapEnabled) {
+            tk = RangeOperations.trustedTwapTick(rm.pool());
+            sp = RangeOperations.sqrtRatioAtTickExt(tk);
+        }
         pc = RangeOperations.PriceCache({
             price0: p0,
             price1: p1,
@@ -321,51 +464,49 @@ library DnDepositLib {
         _requireSwapPlan(expectedAmountIn, expectedZeroForOne, tokenInIsToken0, totalSwapIn, toleranceBps);
     }
 
-    function aaveBaseToStable(uint256 baseAmount, address rangeManager, uint8 stableDecimals)
-        external
-        view
-        returns (uint256)
-    {
-        return _aaveBaseToStable(baseAmount, rangeManager, stableDecimals);
-    }
-
-    function _aaveBaseToStable(uint256 baseAmount, address rangeManager, uint8 stableDecimals)
-        private
-        view
-        returns (uint256)
-    {
-        uint256 price1;
-        try IRmDep(rangeManager).priceCache() returns (uint128, uint128 p1, uint160, int24, uint64, bool valid) {
-            if (!valid || p1 == 0) revert InvalidSwapPlan();
-            price1 = uint256(p1);
-        } catch {
-            revert InvalidSwapPlan();
-        }
-        return (baseAmount * (10 ** stableDecimals)) / price1;
-    }
-
     function aaveHfSafeSwapBudget(
         uint256 currentBudget,
         uint256 amountInMaximum,
         address aavePool,
+        address aToken,
         uint256 fallbackLiqThresholdBps,
-        uint256 targetHfBps,
-        address rangeManager,
-        uint8 stableDecimals
+        uint256 targetHfBps
     ) external view returns (uint256 cappedAmountInMaximum, uint256 toWithdraw) {
+        return _hfSafeSwapBudget(
+            currentBudget, amountInMaximum, aavePool, aToken, fallbackLiqThresholdBps, targetHfBps
+        );
+    }
+
+    function _hfSafeSwapBudget(
+        uint256 currentBudget,
+        uint256 amountInMaximum,
+        address aavePool,
+        address aToken,
+        uint256 fallbackLiqThresholdBps,
+        uint256 targetHfBps
+    ) private view returns (uint256 cappedAmountInMaximum, uint256 toWithdraw) {
         cappedAmountInMaximum = amountInMaximum;
         if (currentBudget >= amountInMaximum) return (cappedAmountInMaximum, 0);
 
         (uint256 collateralBase, uint256 debtBase,, uint256 liveThreshold,,) =
             IAavePoolDep(aavePool).getUserAccountData(address(this));
+        if (debtBase == 0) {
+            uint256 needed = amountInMaximum - currentBudget;
+            uint256 collateralBalance = IERC20(aToken).balanceOf(address(this));
+            toWithdraw = needed < collateralBalance ? needed : collateralBalance;
+            uint256 zeroDebtBudget = currentBudget + toWithdraw;
+            if (cappedAmountInMaximum > zeroDebtBudget) cappedAmountInMaximum = zeroDebtBudget;
+            return (cappedAmountInMaximum, toWithdraw);
+        }
         uint256 liquidationThresholdBps = liveThreshold > 0 ? liveThreshold : fallbackLiqThresholdBps;
-        if (collateralBase == 0 || debtBase == 0 || liquidationThresholdBps == 0) {
+        if (collateralBase == 0 || liquidationThresholdBps == 0) {
             cappedAmountInMaximum = currentBudget < amountInMaximum ? currentBudget : amountInMaximum;
             return (cappedAmountInMaximum, 0);
         }
         uint256 minCollateralBase = (debtBase * targetHfBps + liquidationThresholdBps - 1) / liquidationThresholdBps;
         if (collateralBase > minCollateralBase) {
-            uint256 maxWithdraw = _aaveBaseToStable(collateralBase - minCollateralBase, rangeManager, stableDecimals);
+            uint256 collateralBalance = IERC20(aToken).balanceOf(address(this));
+            uint256 maxWithdraw = (collateralBalance * (collateralBase - minCollateralBase)) / collateralBase;
             toWithdraw = amountInMaximum - currentBudget;
             if (toWithdraw > maxWithdraw) toWithdraw = maxWithdraw;
         }
@@ -373,12 +514,57 @@ library DnDepositLib {
         if (cappedAmountInMaximum > budget) cappedAmountInMaximum = budget;
     }
 
+    function aaveCollateralShare(address aToken, uint256 proportionX18) external view returns (uint256) {
+        return (IERC20(aToken).balanceOf(address(this)) * proportionX18) / 1e18;
+    }
+
+    function settleAaveNoDebt(
+        address aavePool,
+        address collateralToken,
+        address aToken,
+        address debtToken,
+        uint256 debtTokenReceived,
+        uint256 proportionX18,
+        bool fullWithdraw,
+        address recipient
+    ) external {
+        if (IERC20(aToken).balanceOf(address(this)) > 0) {
+            uint256 collateralAmount = fullWithdraw
+                ? type(uint256).max
+                : (IERC20(aToken).balanceOf(address(this)) * proportionX18) / 1e18;
+            if (collateralAmount > 0) {
+                IAavePoolDep(aavePool).withdraw(collateralToken, collateralAmount, recipient);
+            }
+        }
+
+        if (fullWithdraw) {
+            uint256 balance = IERC20(debtToken).balanceOf(address(this));
+            if (balance > 0) IERC20(debtToken).safeTransfer(recipient, balance);
+            balance = IERC20(collateralToken).balanceOf(address(this));
+            if (balance > 0) IERC20(collateralToken).safeTransfer(recipient, balance);
+        } else if (debtTokenReceived > 0) {
+            IERC20(debtToken).safeTransfer(recipient, debtTokenReceived);
+        }
+    }
+
+    function aaveHedgeValuesUsd(
+        address aToken,
+        address debtToken,
+        address rangeManager,
+        uint8 stableDecimals,
+        uint8 volatileDecimals
+    ) external view returns (uint256 collateralUsd, uint256 debtUsd) {
+        (uint128 price0, uint128 price1,,,, bool valid) = IRmDep(rangeManager).priceCache();
+        if (!valid || price0 == 0 || price1 == 0) revert InvalidSwapPlan();
+        collateralUsd = (IERC20(aToken).balanceOf(address(this)) * uint256(price1)) / (10 ** stableDecimals);
+        debtUsd = (IERC20(debtToken).balanceOf(address(this)) * uint256(price0)) / (10 ** volatileDecimals);
+    }
+
     function aaveReserveExcessStable(
         address aavePool,
+        address aToken,
         uint256 fallbackLiqThresholdBps,
-        uint256 targetHfBps,
-        address rangeManager,
-        uint8 stableDecimals
+        uint256 targetHfBps
     ) external view returns (uint256 excessStable) {
         (uint256 collateralBase, uint256 debtBase,, uint256 liveThreshold,,) =
             IAavePoolDep(aavePool).getUserAccountData(address(this));
@@ -387,7 +573,7 @@ library DnDepositLib {
         if (liquidationThresholdBps == 0) return 0;
         uint256 collateralTargetBase = (debtBase * targetHfBps + liquidationThresholdBps - 1) / liquidationThresholdBps;
         if (collateralBase <= collateralTargetBase) return 0;
-        return _aaveBaseToStable(collateralBase - collateralTargetBase, rangeManager, stableDecimals);
+        return (IERC20(aToken).balanceOf(address(this)) * (collateralBase - collateralTargetBase)) / collateralBase;
     }
 
     function _requireSwapPlan(
@@ -423,15 +609,13 @@ library DnDepositLib {
         (uint128 price0, uint128 price1,,,, bool valid) = rm.priceCache();
         if (!valid) return (false, 0);
         (, uint8 dec0, uint8 dec1,,,,,,,) = rm.config();
-        address token0 = rm.token0();
-
-        // effectiveShort = dette - token0 idle (HM + RM, filtre dust), en USD 8 dec. C'est le short FIXE a couvrir.
+        // The RM balance is already included in totalBal0 below. Subtracting it here would count the same
+        // token0 twice; only idle token0 held by the HedgeManager reduces the fixed short before reconstruction.
         // Si idle >= dette, la cible token0 LP est 0 : le rebalance doit pouvoir vendre le token0 LP restant
         // vers token1 au lieu de retourner "no swap", sinon le post-check DN resterait impossible a satisfaire.
         uint256 dustTok0 = hm.donationDustToken0();
         uint256 debtUsd = _toUsd(hm.getWethDebt(), price0, dec0);
-        uint256 idleUsd = _toUsd(_dust(hm.getWethBalance(), dustTok0), price0, dec0)
-            + _toUsd(_dust(IERC20(token0).balanceOf(rangeManager), dustTok0), price0, dec0);
+        uint256 idleUsd = _toUsd(_dust(hm.getWethBalance(), dustTok0), price0, dec0);
         uint256 effShortUsd = debtUsd > idleUsd ? debtUsd - idleUsd : 0;
 
         uint256 H = hm.hedgeTargetBps();
@@ -629,7 +813,8 @@ library DnDepositLib {
         (,,,,, tickLower, tickUpper, liquidity,,,,) = lpPositionManager.positions(tokenId);
         if (liquidity == 0) return (0, tickLower, tickUpper);
 
-        (uint160 sqrtPriceX96, int24 currentTick,,,,,) = lpPool.slot0();
+        int24 currentTick = RangeOperations.trustedTwapTick(lpPool);
+        uint160 sqrtPriceX96 = RangeOperations.sqrtRatioAtTickExt(currentTick);
         uint160 sqrtRatioA = RangeOperations.sqrtRatioAtTickExt(tickLower);
         uint160 sqrtRatioB = RangeOperations.sqrtRatioAtTickExt(tickUpper);
 
@@ -669,7 +854,11 @@ library DnDepositLib {
         require((diff * 10000) / oraclePrice <= maxHedgeDeviationBps, "LP price deviation");
 
         (bool twapEnabled,,, uint16 twapBps,,,) = IRmDep(rangeManager).protectionConfig();
-        if (twapEnabled) _requireTwapNotDeviated(lpPool, currentTick, twapBps);
+        if (twapEnabled) {
+            int24 twapTick = RangeOperations.trustedTwapTick(lpPool);
+            int24 tickDiff = currentTick > twapTick ? currentTick - twapTick : twapTick - currentTick;
+            require(uint24(tickDiff) <= uint24(twapBps), "LP TWAP");
+        }
     }
 
     /// @notice Plafond token1 pour acheter `amount0Out` token0 via exactOutput, base sur price0/price1.
@@ -681,28 +870,21 @@ library DnDepositLib {
         uint8 dec1,
         uint16 slippageBps
     ) external view returns (uint256 amountInMaximum) {
+        return _oracleMaxToken1ForToken0(amount0Out, rangeManager, dec0, dec1, slippageBps);
+    }
+
+    function _oracleMaxToken1ForToken0(
+        uint256 amount0Out,
+        address rangeManager,
+        uint8 dec0,
+        uint8 dec1,
+        uint16 slippageBps
+    ) private view returns (uint256 amountInMaximum) {
         (uint128 price0, uint128 price1,,,, bool valid) = IRmDep(rangeManager).priceCache();
         require(valid && price0 > 0 && price1 > 0, "Bad oracle");
         uint256 theoretical = Math.mulDiv(amount0Out, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0));
         amountInMaximum = Math.mulDiv(theoretical, 10000 + uint256(slippageBps), 10000);
         require(amountInMaximum > 0, "Bad oracle");
-    }
-
-    function _requireTwapNotDeviated(IUniswapV3Pool pool, int24 spotTick, uint16 maxTwapDeviationBps) private view {
-        uint32[] memory secondsAgos = new uint32[](2);
-        secondsAgos[0] = 300;
-        try pool.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
-            int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
-            int24 twapTick = int24(tickDelta / int56(uint56(300)));
-            if (tickDelta < 0 && tickDelta % int56(uint56(300)) != 0) twapTick--;
-            int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
-            require(uint24(diff) <= uint24(maxTwapDeviationBps), "LP TWAP");
-        } catch {
-            // Same policy as RangeOperations: fail-open only while the pool has not written enough
-            // observations for a 300s TWAP. After warm-up, unavailable TWAP is unsafe for hedge actions.
-            (,,, uint16 observationCardinality,,,) = pool.slot0();
-            require(observationCardinality < 2, "LP TWAP unavailable");
-        }
     }
 
     // ===== helpers internes (inlinés dans la library) =====

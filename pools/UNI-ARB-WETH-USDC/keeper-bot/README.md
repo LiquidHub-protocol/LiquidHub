@@ -140,7 +140,7 @@ The keeper bot is fully permissionless and operates with no special privileges:
 keeper-bot/
   src/
     keeper.js          # Main entry point and check loop
-    rebalancer.js      # Rebalance execution logic (multi-step flow)
+    rebalancer.js      # Atomic rebalance and queued-deposit execution logic
     utils/
       contracts.js     # Contract ABIs and factory
       rpc.js           # RPC provider pool with failover

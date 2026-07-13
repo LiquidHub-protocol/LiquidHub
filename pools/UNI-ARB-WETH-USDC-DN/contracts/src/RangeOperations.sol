@@ -89,9 +89,9 @@ library RangeOperations {
 
     // ===== DYNAMIC RANGE (calcul on-chain) =====
 
-    /// @notice Un snapshot de prix horodate (price0 Chainlink, 8 decimales)
+    /// @notice Snapshot horodate du ratio oracle token0/token1, normalise en 8 decimales.
     struct PriceSnapshot {
-        uint128 price; // price0 en 8 decimales (cf. PriceCache.price0)
+        uint128 price; // ratio token0/token1 en 8 decimales
         uint64 timestamp; // unix timestamp du snapshot
     }
 
@@ -178,19 +178,27 @@ library RangeOperations {
         view
         returns (bool)
     {
+        int24 twapTick = _trustedTwapTick(pool);
+        int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
+        return uint24(diff) > uint24(maxTwapDeviationBps);
+    }
+
+    /// @notice Shared 5-minute TWAP tick for DN safety checks.
+    function trustedTwapTick(IUniswapV3Pool pool) external view returns (int24) {
+        return _trustedTwapTick(pool);
+    }
+
+    function _trustedTwapTick(IUniswapV3Pool pool) private view returns (int24 twapTick) {
+        (, int24 spotTick,,, uint16 observationCardinality,,) = pool.slot0();
         uint32[] memory secondsAgos = new uint32[](2);
         secondsAgos[0] = 300;
         try pool.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
             int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
-            int24 twapTick = int24(tickDelta / int56(uint56(300)));
+            twapTick = int24(tickDelta / int56(uint56(300)));
             if (tickDelta < 0 && tickDelta % int56(uint56(300)) != 0) twapTick--;
-            int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
-            return uint24(diff) > uint24(maxTwapDeviationBps);
         } catch {
-            // Warm-up only: bypass if Uniswap has not written enough observations yet. Once at least two
-            // observations exist, an observe(300s) failure is treated as unsafe and invalidates the cache.
-            (,,, uint16 observationCardinality,,,) = pool.slot0();
-            return observationCardinality > 1;
+            require(observationCardinality < 2, "TWAP unavailable");
+            twapTick = spotTick;
         }
     }
 

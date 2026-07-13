@@ -132,9 +132,10 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 
 ## Emergency controls
 
-- **Module kill-switch**: `SecureBotModule.setPaused(true)` (Safe-only) freezes module-mediated bot execution.
-  Public maintenance entrypoints such as `rebalance()`, `recordPriceSnapshot()` and `adjustHedge()` remain callable
-  by keepers when their own on-chain preconditions are satisfied.
+- **Targeted module pause**: `SecureBotModule.setPaused(true)` (Safe-only) stops bot-mediated inflow processing
+  and Treasury distribution, while preserving bot and keeper maintenance such as `rebalance()`,
+  `recordPriceSnapshot()`, `refreshPriceCache()` and `adjustHedge()` under their on-chain guards. If the bot key
+  itself is compromised, the Safe can separately revoke/disable the module.
 - **PauseController**: controls user flows. Inflow pause blocks new deposit processing; withdrawal pause also
   blocks inflows. Position-maintenance actions remain available by design.
 - **Hedge pause** (DN): `AaveHedgeManager.setPaused(true)` (Safe-only) blocks new hedge openings
@@ -163,7 +164,7 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 
 | Function | Access | Description |
 |----------|--------|-------------|
-| `swapToUSDC()` | `onlyOwner` (Safe / governance owner) | Converts ERC-20 tokens to USDC; tokens stay in Treasury |
+| `swapToUSDC()` | `onlyOwner` (Safe / governance owner) | Converts configured ERC-20 tokens to USDC; the fee tier is fixed on-chain by the pool batch |
 | `adminWithdraw()` | `onlyOwner` (Safe) | Monthly cap enforced |
 | `payKeeperBounty()` | Authorized RangeManagers only | Called automatically after rebalance |
 | `disableAdminWithdraw()` | `onlyOwner` | **IRREVERSIBLE** |

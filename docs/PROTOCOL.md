@@ -35,7 +35,7 @@ It reverts if the queue is empty, the required position state is missing, or the
 
 The range is computed entirely by `RangeManager` — no off-chain bot or database is involved in the math, so any keeper can reproduce it.
 
-- `RangeManager` keeps a ring buffer of price snapshots. `recordPriceSnapshot()` is **permissionless** and stores a Chainlink price; the contract spaces snapshots regularly (`24h / maxSnapshotsPerDay`) and reverts if one is not yet due.
+- `RangeManager` keeps a ring buffer of token0/token1 oracle-ratio snapshots. `recordPriceSnapshot()` is **permissionless** and stores `token0/USD ÷ token1/USD`, normalized to 8 decimals; this remains correct when token1 is not a stablecoin. The contract spaces snapshots regularly (`24h / maxSnapshotsPerDay`) and reverts if one is not yet due.
 - On each mint/rebalance, the contract takes the pure high/low amplitude over the last `volatMoyDay` days — `(highest − lowest) / current price`, the real dispersion of the window independent of the instantaneous price — (trimming the `volatTrimDay` most extreme days), scales it by a governance multiplier `RANGE_MULTIPLICATOR`, and produces a symmetric range rounded up to the nearest `RANGE_STEP_BPS`. The final half-range is bounded per side by `RANGE_MIN_BPS` and `RANGE_MAX_BPS` (for example `100` means at least -1%/+1%, not 1% total width). The freshly computed range is applied on every rebalance (the position is recreated regardless), so it always tracks current volatility while staying within governance bounds.
 - When `DYNAMIC_RANGE_ENABLED` is `false` (e.g. stablecoin pools), the range stays fixed at `RANGE_UP_BASE` / `RANGE_DOWN_BASE` (in basis points), configured by the multisig.
 
@@ -72,14 +72,17 @@ The range is computed entirely by `RangeManager` — no off-chain bot or databas
 
 ## Multi-Swap System
 
-Large swaps are split into smaller chunks to reduce price impact on the pool:
+Large swap plans are split into bounded chunks for deterministic on-chain validation and gas control:
 
 - Default chunk size: `INIT_MULTI_SWAP_TVL` (~$10k per swap).
 - Chunks are executed inside the same atomic contract call for deposits/rebalances, with each chunk individually
   bounded by the Chainlink-derived `minAmountOut` floor.
 - If the plan exceeds on-chain chunk, deposit or oracle limits, the transaction reverts and the bot/keepers retry
   later with a fresh plan.
-- This mechanism reduces per-swap price impact while keeping the whole position update atomic.
+- All chunks remain in one atomic transaction, so the pool does not recover between chunks. Chunking is not
+  presented as a substitute for market liquidity. The oracle/TWAP floors protect funds; when current liquidity
+  cannot execute the complete plan safely, the atomic transaction reverts and the queued deposit or rebalance is
+  retried in a later cycle instead of accepting extra slippage.
 
 ---
 
@@ -100,5 +103,5 @@ On DN pools, routine over-hedge corrections are adjusted independently and permi
 
 - **LP commissions** are collected on each rebalance (`TAUX_PRELEV_BPS`, default `1000` bps = 10% of earned fees).
 - Commissions are sent to the Treasury contract in WETH + USDC.
-- Treasury can convert any ERC-20 token to USDC via `swapToUSDC(tokenIn, fee, amountIn, minAmountOut)`.
+- Treasury can convert configured ERC-20 tokens to USDC via `swapToUSDC(tokenIn, fee, amountIn, minAmountOut)`. The owner-only pool batch records the approved fee tier on-chain from the pool `FEE`; callers cannot substitute another tier.
 - **Frontend swap commission**: a partner fee (`PARTNER_FEE_BPS=3`, i.e. 0.03%) is applied on frontend swaps and sent directly to the Treasury. The Treasury accepts any token received from these swaps.
