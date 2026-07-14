@@ -72,7 +72,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
     // ===== SWAP & TREASURY =====
     ISwapRouter public immutable swapRouter;
     address public treasuryAddress;
-    uint16 public swapFeeBps;
     uint256 public initMultiSwapTvl;
 
     // ===== POST-CHECK DN AU REBALANCE (refonte DN) =====
@@ -133,7 +132,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
     event ToleranceUpdated(uint16 oldToleranceBps, uint16 newToleranceBps);
     event TreasuryAddressUpdated(address indexed oldTreasury, address indexed newTreasury); // audit LOW-5
     event InitMultiSwapTvlUpdated(uint256 oldValue, uint256 newValue);
-    event SwapFeeBpsUpdated(uint16 oldValue, uint16 newValue);
     event LiquidityAdded(uint256 indexed tokenId, uint256 amount0, uint256 amount1, uint128 liquidity);
 
     // ===== NOUVEAUX MODIFIERS =====
@@ -199,7 +197,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint8 _token1Decimals,
         address _swapRouter,
         address _treasuryAddress,
-        uint16 _swapFeeBps,
         uint256 _initMultiSwapTvl,
         uint16 _rangeUpPercent,
         uint16 _rangeDownPercent
@@ -217,7 +214,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // Validation des ranges (mêmes limites que configureRanges)
         require(_rangeUpPercent >= 10 && _rangeUpPercent <= 5000, "E17");
         require(_rangeDownPercent >= 10 && _rangeDownPercent <= 5000, "E18");
-        require(_swapFeeBps == 0, "E99");
         require(_initMultiSwapTvl > 0 && _initMultiSwapTvl <= 1_000_000, "E97");
 
         positionManager = INonfungiblePositionManager(_positionManager);
@@ -259,7 +255,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         require(_treasuryAddress != address(0), "E98");
         swapRouter = ISwapRouter(_swapRouter);
         treasuryAddress = _treasuryAddress;
-        swapFeeBps = _swapFeeBps;
         initMultiSwapTvl = _initMultiSwapTvl;
 
         // Approve SwapRouter for both tokens
@@ -511,6 +506,17 @@ contract RangeManager is Ownable, ReentrancyGuard {
         _updatePriceCache();
     }
 
+    /// @notice Prepare atomiquement une decision de hedge: oracle live puis cristallisation des fees LP.
+    /// @dev Appel strictement reserve au HedgeManager enregistre dans le Vault; aucun role executor additionnel.
+    function prepareHedgeAdjustment() external returns (uint256 tokenId) {
+        address hm = IMultiUserVault(vault).hedgeManager();
+        require(hm != address(0) && msg.sender == hm, "E95");
+        _refreshAndRequireValid();
+        if (positionCount == 0) return 0;
+        tokenId = indexToPosition[0];
+        _collectPositionFees(tokenId);
+    }
+
     /**
      * @notice Send token0 or token1 to the hedge manager for debt repayment
      * @dev Used by DN bot after rebalance when ETH exposure decreased
@@ -593,7 +599,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         // Minter la nouvelle position avec les balances actuelles
         (tokenId, liquidity) = RangeOperations.mintNewPosition(
-            token0, token1, config, tickLower, tickUpper, positionManager, address(this)
+            token0, token1, config, tickLower, tickUpper, positionManager, priceCache.poolSqrtPriceX96
         );
 
         _addPosition(tokenId);
@@ -655,8 +661,12 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint256[] memory positions = getOwnerPositions();
         if (positions.length == 0) return (0, 0);
 
+        return _collectPositionFees(positions[0]);
+    }
+
+    function _collectPositionFees(uint256 tokenId) private returns (uint256 fees0, uint256 fees1) {
         (fees0, fees1) = RangeOperations.collectFeesForVaultCore(
-            positions[0], token0, token1, address(this), treasuryAddress, vault, positionManager
+            tokenId, token0, token1, address(this), treasuryAddress, vault, positionManager
         );
         if (fees0 > 0 || fees1 > 0) emit FeesCollectedForVault(fees0, fees1);
     }
@@ -674,7 +684,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint256 tokenId = _refreshAndFirstPosition();
         require(!RangeOperations.isPositionOutOfRange(tokenId, positionManager, priceCache), "E32");
         (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) = RangeOperations.addLiquidityWithoutSwap(
-            token0, token1, tokenId, positionManager, config.maxSlippageBps, address(this)
+            token0, token1, tokenId, positionManager, config.maxSlippageBps, priceCache.poolSqrtPriceX96
         );
         emit LiquidityAdded(tokenId, amount0Added, amount1Added, liquidity);
     }
@@ -995,10 +1005,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
             amountIn,
             minAmountOut,
             config.fee,
-            swapFeeBps,
-            treasuryAddress,
             address(this),
-            swapRouter
+            swapRouter,
+            _swapSqrtPriceLimit(tokenInIsToken0)
         );
         emit SwapExecuted(tokenIn, tokenOut, amountIn, amountOut);
         return amountOut;
@@ -1044,6 +1053,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // uniquement un besoin de range). Le rebalance reconstruit alors la composition LP pour viser la cible,
         // et le post-check DN (étape 4b) garantit que le résultat est dans la tolérance (sinon toute la tx revert).
         (bool hasPosition, uint256 tokenId, bool _needsRebalance,,) = _botInstructions();
+        // collect() pousse le feeGrowth latent avant le drift et le plan DN. Si la decision refuse le
+        // rebalance, le revert annule aussi cette collecte: aucun refresh de fees isole n'est requis.
+        if (hasPosition) _collectPositionFees(tokenId);
         bool dnDriftCritical = DnDepositLib.dnHedgeDriftExceeds(
             address(this),
             token0,
@@ -1087,21 +1099,12 @@ contract RangeManager is Ownable, ReentrancyGuard {
             _burnTrackedPosition(tokenId);
         }
 
+        uint160 sqrtPriceLimitX96 = n > 0 ? _swapSqrtPriceLimit(tokenInIsToken0) : 0;
         for (uint256 i; i < n; ++i) {
             uint256 amt = swapAmountsIn[i];
             if (amt == 0) continue;
-            require(IERC20(tokenIn).balanceOf(address(this)) >= amt, "E46");
-            swapRouter.exactInputSingle(
-                ISwapRouter.ExactInputSingleParams({
-                    tokenIn: tokenIn,
-                    tokenOut: tokenOut,
-                    fee: config.fee,
-                    recipient: address(this),
-                    deadline: block.timestamp,
-                    amountIn: amt,
-                    amountOutMinimum: minAmountsOut[i],
-                    sqrtPriceLimitX96: 0
-                })
+            RangeOperations.executeSwapCore(
+                tokenIn, tokenOut, amt, minAmountsOut[i], config.fee, address(this), swapRouter, sqrtPriceLimitX96
             );
         }
 
@@ -1130,6 +1133,13 @@ contract RangeManager is Ownable, ReentrancyGuard {
         _payBounty(false);
     }
 
+    /// @dev Bounds one swap to roughly config.maxSlippageBps of price movement from the validated live pool price.
+    function _swapSqrtPriceLimit(bool zeroForOne) private view returns (uint160) {
+        uint256 sqrtP = priceCache.poolSqrtPriceX96;
+        uint256 bps = config.maxSlippageBps;
+        return uint160((sqrtP * (zeroForOne ? 20000 - bps : 20000 + bps)) / 20000);
+    }
+
     function _requireSubmittedSwapPlan(
         uint256 expectedAmountIn,
         bool expectedZeroForOne,
@@ -1154,12 +1164,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         require(_initMultiSwapTvl > 0 && _initMultiSwapTvl <= 1_000_000, "E97");
         emit InitMultiSwapTvlUpdated(initMultiSwapTvl, _initMultiSwapTvl);
         initMultiSwapTvl = _initMultiSwapTvl;
-    }
-
-    function setSwapFeeBps(uint16 _swapFeeBps) external onlyVaultOwner {
-        require(_swapFeeBps == 0, "E99");
-        emit SwapFeeBpsUpdated(swapFeeBps, _swapFeeBps);
-        swapFeeBps = _swapFeeBps;
     }
 
     function setTreasuryAddress(address _treasuryAddress) external onlyVaultOwner {

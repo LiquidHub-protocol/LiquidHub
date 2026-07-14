@@ -123,7 +123,8 @@ class RPCPool {
       const tx = await sendFn(provider);
       txHash = tx.hash;
       try {
-        const receipt = await tx.wait();
+        const receipt = await provider.waitForTransaction(txHash, 1, 60_000);
+        if (!receipt) throw new Error(`${label} receipt pending after broadcast: ${txHash}`);
         if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
         return receipt;
       } catch (error) {
@@ -175,7 +176,8 @@ class RPCPool {
       if (prepared.log) prepared.log(txHash);
       const tx = await provider.broadcastTransaction(signedTx);
       try {
-        const receipt = await tx.wait();
+        const receipt = await provider.waitForTransaction(txHash, 1, 60_000);
+        if (!receipt) throw new Error(`${label} receipt pending after signed broadcast: ${txHash}`);
         if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
         return receipt;
       } catch (error) {

@@ -29,6 +29,10 @@ class Rebalancer {
     this.rpcPool = rpcPool;
   }
 
+  async ensureFreshPriceCacheForDecision() {
+    return await this._freshPriceCache('keeper decision');
+  }
+
   async executeRebalance(tokenId) {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
@@ -131,6 +135,7 @@ class Rebalancer {
   async processDeposit() {
     console.log('\n=== Processing queued deposit (permissionless) ===');
     try {
+      const priceCache = await this._freshPriceCache('deposit pre-check/plan');
       const [, , needsRebalance, action, reason] = await this.rpcPool.executeWithRetry(async (provider) => {
         return await this.rangeManager.connect(provider).getBotInstructions();
       });
@@ -139,7 +144,6 @@ class Rebalancer {
         return { success: false, error: 'rebalance required before DN deposit', txHashes: [] };
       }
 
-      const priceCache = await this._freshPriceCache('deposit plan/minOut');
       await this._syncFeesForDepositPlan();
       // AUDIT H-01 : pour un DÉPÔT, on utilise la vue DÉDIÉE du Vault (état post-transfert du dépôt +
       // post-ouverture du hedge), PAS rangeManager.getOptimalSwapParams (qui reflète l état rebalance/post-burn

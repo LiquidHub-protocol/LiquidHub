@@ -70,7 +70,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
     // ===== SWAP & TREASURY =====
     ISwapRouter public immutable swapRouter;
     address public treasuryAddress;
-    uint16 public swapFeeBps;
     uint256 public initMultiSwapTvl;
 
     // ===== VARIABLES D'ETAT (utilisant les structs de la library) =====
@@ -122,7 +121,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
     event ToleranceUpdated(uint16 oldToleranceBps, uint16 newToleranceBps);
     event TreasuryAddressUpdated(address indexed oldTreasury, address indexed newTreasury); // audit LOW-5
     event InitMultiSwapTvlUpdated(uint256 oldValue, uint256 newValue);
-    event SwapFeeBpsUpdated(uint16 oldValue, uint16 newValue);
     event LiquidityAdded(uint256 indexed tokenId, uint256 amount0, uint256 amount1, uint128 liquidity);
 
     // ===== NOUVEAUX MODIFIERS =====
@@ -188,7 +186,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint8 _token1Decimals,
         address _swapRouter,
         address _treasuryAddress,
-        uint16 _swapFeeBps,
         uint256 _initMultiSwapTvl,
         uint16 _rangeUpPercent,
         uint16 _rangeDownPercent
@@ -206,7 +203,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // Validation des ranges (mêmes limites que configureRanges)
         require(_rangeUpPercent >= 10 && _rangeUpPercent <= 5000, "E17");
         require(_rangeDownPercent >= 10 && _rangeDownPercent <= 5000, "E18");
-        require(_swapFeeBps == 0, "E99");
         require(_initMultiSwapTvl > 0 && _initMultiSwapTvl <= 1_000_000, "E97");
 
         positionManager = INonfungiblePositionManager(_positionManager);
@@ -248,7 +244,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         require(_treasuryAddress != address(0), "E98");
         swapRouter = ISwapRouter(_swapRouter);
         treasuryAddress = _treasuryAddress;
-        swapFeeBps = _swapFeeBps;
         initMultiSwapTvl = _initMultiSwapTvl;
 
         // Approve SwapRouter for both tokens
@@ -431,11 +426,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     /// @notice (audit V1 — V3-M1) Paramètres oracle : seuil de déviation pool/oracle + heartbeats par feed.
-    /// @dev Gouvernance via Vault owner (Safe phase 1, Timelock phase 2). Bornes dures : déviation <=10%,
-    ///      heartbeats 1h-48h. _maxOracleDeviationBps=0
-    ///      désactive le check (mode dégradé volontaire). Aiguille tous les _updatePriceCache() en aval. DN-coh.
+    /// @dev Gouvernance via Vault owner (Safe phase 1, Timelock phase 2). Le garde pool/oracle ne peut pas être
+    ///      désactivé : la NAV oracle du BotModule utilise le sqrt spot borné comme seed. Heartbeats 1h-48h.
     function setOracleParams(uint16 _maxOracleDeviationBps, uint32 _maxAge0, uint32 _maxAge1) external onlyVaultOwner {
-        require(_maxOracleDeviationBps <= 1000, "E21"); // déviation <=10%
+        require(_maxOracleDeviationBps > 0 && _maxOracleDeviationBps <= 1000, "E21"); // 0 < déviation <=10%
         require(_maxAge0 >= 3600 && _maxAge0 <= 172800 && _maxAge1 >= 3600 && _maxAge1 <= 172800, "E20"); // 1h-48h
         protectionConfig.maxOracleDeviationBps = _maxOracleDeviationBps;
         protectionConfig.maxAge0 = _maxAge0;
@@ -546,7 +540,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         // Minter la nouvelle position avec les balances actuelles
         (tokenId, liquidity) = RangeOperations.mintNewPosition(
-            token0, token1, config, tickLower, tickUpper, positionManager, address(this)
+            token0, token1, config, tickLower, tickUpper, positionManager, priceCache.poolSqrtPriceX96, address(this)
         );
 
         _addPosition(tokenId);
@@ -607,8 +601,12 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint256[] memory positions = getOwnerPositions();
         if (positions.length == 0) return (0, 0);
 
+        return _collectFeesForVault(positions[0]);
+    }
+
+    function _collectFeesForVault(uint256 tokenId) private returns (uint256 fees0, uint256 fees1) {
         (fees0, fees1) = RangeOperations.collectFeesForVaultCore(
-            positions[0], token0, token1, address(this), treasuryAddress, vault, positionManager
+            tokenId, token0, token1, address(this), treasuryAddress, vault, positionManager
         );
         if (fees0 > 0 || fees1 > 0) emit FeesCollectedForVault(fees0, fees1);
     }
@@ -628,7 +626,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         // Déléguer à la library SANS SWAP (les swaps sont faits avant via executeSwap)
         (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) = RangeOperations.addLiquidityWithoutSwap(
-            token0, token1, tokenId, positionManager, config.maxSlippageBps, address(this)
+            token0, token1, tokenId, positionManager, priceCache.poolSqrtPriceX96, config.maxSlippageBps, address(this)
         );
 
         emit LiquidityAdded(tokenId, amount0Added, amount1Added, liquidity);
@@ -757,14 +755,13 @@ contract RangeManager is Ownable, ReentrancyGuard {
             uint256 depositUsd = ((depositAmount0 * uint256(priceCache.price0)) / (10 ** config.token0Decimals))
                 + ((depositAmount1 * uint256(priceCache.price1)) / (10 ** config.token1Decimals));
             require(totalSwapUsd <= depositUsd, "swap>deposit");
-            for (uint256 i; i < n; ++i) totalSwapIn += swapAmountsIn[i];
+            for (uint256 i; i < n; ++i) {
+                totalSwapIn += swapAmountsIn[i];
+            }
+            require(totalSwapIn <= (tokenInIsToken0 ? depositAmount0 : depositAmount1), "swap>input");
         }
         _requireSubmittedSwapPlan(
-            expectedAmountIn,
-            expectedZeroForOne,
-            tokenInIsToken0,
-            totalSwapIn,
-            config.toleranceBps
+            expectedAmountIn, expectedZeroForOne, tokenInIsToken0, totalSwapIn, config.toleranceBps
         );
     }
 
@@ -993,20 +990,16 @@ contract RangeManager is Ownable, ReentrancyGuard {
             amountIn,
             minAmountOut,
             config.fee,
-            swapFeeBps,
-            treasuryAddress,
             address(this),
-            swapRouter
+            swapRouter,
+            _swapSqrtPriceLimit(tokenInIsToken0)
         );
         emit SwapExecuted(tokenIn, tokenOut, amountIn, amountOut);
         return amountOut;
     }
 
-    /// @notice Check if the current position needs rebalancing
-    function needsRebalance() external view returns (bool) {
-        (,, bool _needsRebalance,,) = _botInstructions();
-        return _needsRebalance;
-    }
+    // needsRebalance() wrapper removed: every active consumer reads getBotInstructions(), which
+    // returns the same boolean together with the tokenId/action/reason needed to act safely.
 
     /// @notice Atomic rebalance: burn → N swaps → mint → pay keeper bounty. Permissionless.
     /// @dev Each swap chunk must be ≤ initMultiSwapTvl in USD. Pass empty arrays if no swap needed.
@@ -1037,6 +1030,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // Verify rebalance is needed
         (bool hasPosition, uint256 tokenId, bool _needsRebalance,,) = _botInstructions();
         require(hasPosition && _needsRebalance, "E90");
+
+        // Crystallise les fees avant de figer le plan. Toute la sequence reste atomique : une validation,
+        // un swap ou un mint qui revert annule aussi collect, commission et accounting Vault.
+        _collectFeesForVault(tokenId);
         RangeOperations.OptimalSwapParams memory expectedPlan = this.getOptimalSwapParams();
 
         uint256 n = swapAmountsIn.length;
@@ -1073,21 +1070,12 @@ contract RangeManager is Ownable, ReentrancyGuard {
             _burnTrackedPosition(tokenId);
         }
 
+        uint160 sqrtPriceLimitX96 = n > 0 ? _swapSqrtPriceLimit(tokenInIsToken0) : 0;
         for (uint256 i; i < n; ++i) {
             uint256 amt = swapAmountsIn[i];
             if (amt == 0) continue;
-            require(IERC20(tokenIn).balanceOf(address(this)) >= amt, "E46");
-            swapRouter.exactInputSingle(
-                ISwapRouter.ExactInputSingleParams({
-                    tokenIn: tokenIn,
-                    tokenOut: tokenOut,
-                    fee: config.fee,
-                    recipient: address(this),
-                    deadline: block.timestamp,
-                    amountIn: amt,
-                    amountOutMinimum: minAmountsOut[i],
-                    sqrtPriceLimitX96: 0
-                })
+            RangeOperations.executeSwapCore(
+                tokenIn, tokenOut, amt, minAmountsOut[i], config.fee, address(this), swapRouter, sqrtPriceLimitX96
             );
         }
 
@@ -1100,6 +1088,13 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         // 6. Pay keeper bounty (silent - don't revert if bounty fails)
         _payBounty(false);
+    }
+
+    /// @dev Bounds one swap to roughly config.maxSlippageBps of price movement from the validated live pool price.
+    function _swapSqrtPriceLimit(bool zeroForOne) private view returns (uint160) {
+        uint256 sqrtP = priceCache.poolSqrtPriceX96;
+        uint256 bps = config.maxSlippageBps;
+        return uint160((sqrtP * (zeroForOne ? 20000 - bps : 20000 + bps)) / 20000);
     }
 
     function _requireSubmittedSwapPlan(
@@ -1126,12 +1121,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         require(_initMultiSwapTvl > 0 && _initMultiSwapTvl <= 1_000_000, "E97");
         emit InitMultiSwapTvlUpdated(initMultiSwapTvl, _initMultiSwapTvl);
         initMultiSwapTvl = _initMultiSwapTvl;
-    }
-
-    function setSwapFeeBps(uint16 _swapFeeBps) external onlyVaultOwner {
-        require(_swapFeeBps == 0, "E99");
-        emit SwapFeeBpsUpdated(swapFeeBps, _swapFeeBps);
-        swapFeeBps = _swapFeeBps;
     }
 
     function setTreasuryAddress(address _treasuryAddress) external onlyVaultOwner {

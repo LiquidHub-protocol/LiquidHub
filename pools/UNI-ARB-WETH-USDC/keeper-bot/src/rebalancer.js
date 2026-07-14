@@ -28,6 +28,10 @@ class Rebalancer {
     this.rpcPool = rpcPool;
   }
 
+  async ensureFreshPriceCacheForDecision() {
+    return await this._freshPriceCache('keeper decision');
+  }
+
   async executeRebalance(tokenId) {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 

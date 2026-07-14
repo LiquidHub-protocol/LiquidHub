@@ -3,6 +3,8 @@ pragma solidity ^0.8.19;
 
 import "./RangeOperations.sol";
 import "./DnDepositLib.sol";
+import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
+import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 
 interface ISafe {
     function execTransactionFromModule(address to, uint256 value, bytes calldata data, uint8 operation)
@@ -17,8 +19,11 @@ interface IERC20Sweep {
 
 interface IRangeManagerPostCheck {
     function token0() external view returns (address);
+    function token1() external view returns (address);
     function priceCache() external view returns (uint128, uint128, uint160, int24, uint64, bool);
     function config() external view returns (RangeOperations.RangeConfig memory);
+    function getOwnerPositions() external view returns (uint256[] memory);
+    function positionManager() external view returns (INonfungiblePositionManager);
     function getBotInstructions()
         external
         view
@@ -59,8 +64,8 @@ contract SecureBotModule {
     // Audit V3 (Point 2) : endRebalance() est EXEMPTE de la limite quotidienne dans executeVaultFunction.
     // C'est un DEVERROUILLAGE (il ne deplace aucun fonds, il libere depots/retraits) : si la limite est
     // atteinte un jour de forte activite, le vault ne doit JAMAIS rester verrouille. startRebalance()
-    // (qui verrouille) reste lui soumis a la limite. La pause module bloque les flux non-maintenance,
-    // pas les actions vitales de position (rebalance/swap/snapshot/hedge/deverrouillage).
+    // (qui verrouille) reste lui soumis a la limite. Le kill-switch du module est distinct du PauseController:
+    // il coupe le relais privilegie du bot, sans bloquer les entrees permissionless directes des keepers.
     bytes4 private constant END_REBALANCE_SELECTOR = 0x0040718e; // endRebalance()
     bytes4 private constant START_REBALANCE_SELECTOR = 0x4dce7057; // startRebalance()
     bytes4 private constant REFRESH_PRICE_SELECTOR = 0x0be1c372; // refreshPriceCache()
@@ -169,8 +174,67 @@ contract SecureBotModule {
 
     receive() external payable {}
 
+    /// @notice LP/free RangeManager NAV reconstructed at the Chainlink token ratio (USD, 8 decimals).
+    /// @dev Read-only and unaffected by the module kill-switch. The valuation sqrt is derived exclusively
+    ///      from oracle prices; it remains exact and spot-independent even when the spot deviation guard is zero.
+    function getOracleLpValueUsd() external view returns (uint256 valueUsd) {
+        IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
+        (uint128 price0, uint128 price1,,,, bool valid) = rm.priceCache();
+        require(valid && price0 > 0 && price1 > 0, "E_NAV");
+        RangeOperations.RangeConfig memory cfg = rm.config();
+        uint160 oracleSqrt = _oracleSqrtPrice(price0, price1, cfg.token0Decimals, cfg.token1Decimals);
+        (uint256 balance0, uint256 balance1) = _balancesAtPrice(rm, oracleSqrt);
+        valueUsd = Math.mulDiv(balance0, price0, 10 ** cfg.token0Decimals)
+            + Math.mulDiv(balance1, price1, 10 ** cfg.token1Decimals);
+    }
+
+    function _oracleSqrtPrice(uint128 price0, uint128 price1, uint8 dec0, uint8 dec1) private pure returns (uint160) {
+        uint256 ratioX192 =
+            Math.mulDiv(uint256(price0) * (10 ** dec1), uint256(1) << 192, uint256(price1) * (10 ** dec0));
+        uint256 sqrtPriceX96 = Math.sqrt(ratioX192);
+        require(sqrtPriceX96 > 0 && sqrtPriceX96 <= type(uint160).max, "E_RATIO");
+        return uint160(sqrtPriceX96);
+    }
+
+    function _balancesAtPrice(IRangeManagerPostCheck rm, uint160 sqrtPriceX96)
+        private
+        view
+        returns (uint256 balance0, uint256 balance1)
+    {
+        balance0 = IERC20Sweep(rm.token0()).balanceOf(rangeManager);
+        balance1 = IERC20Sweep(rm.token1()).balanceOf(rangeManager);
+        uint256[] memory positions = rm.getOwnerPositions();
+        require(positions.length <= 1, "E_POS");
+        if (positions.length == 0) return (balance0, balance1);
+
+        (,,,,, int24 tickLower, int24 tickUpper, uint128 liquidity,,, uint128 owed0, uint128 owed1) =
+            rm.positionManager().positions(positions[0]);
+        (uint256 amount0, uint256 amount1) = _liquidityAmounts(liquidity, tickLower, tickUpper, sqrtPriceX96);
+        return (balance0 + amount0 + owed0, balance1 + amount1 + owed1);
+    }
+
+    function _liquidityAmounts(uint128 liquidity, int24 tickLower, int24 tickUpper, uint160 sqrtPriceX96)
+        private
+        pure
+        returns (uint256 amount0, uint256 amount1)
+    {
+        if (liquidity == 0) return (0, 0);
+        uint160 sqrtA = RangeOperations.sqrtRatioAtTickExt(tickLower);
+        uint160 sqrtB = RangeOperations.sqrtRatioAtTickExt(tickUpper);
+        uint256 numerator = uint256(liquidity) << 96;
+        if (sqrtPriceX96 <= sqrtA) {
+            amount0 = numerator / sqrtA - numerator / sqrtB;
+        } else if (sqrtPriceX96 >= sqrtB) {
+            amount1 = Math.mulDiv(liquidity, sqrtB - sqrtA, uint256(1) << 96);
+        } else {
+            amount0 = numerator / sqrtPriceX96 - numerator / sqrtB;
+            amount1 = Math.mulDiv(liquidity, sqrtPriceX96 - sqrtA, uint256(1) << 96);
+        }
+    }
+
     modifier onlyBot() {
         require(msg.sender == botAddress, "Only bot allowed");
+        require(!paused, "Module paused");
         _;
     }
 

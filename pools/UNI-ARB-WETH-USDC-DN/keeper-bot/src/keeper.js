@@ -26,19 +26,25 @@ async function logPriceCacheBeforeDecision(rangeManager, rpcPool) {
   console.log('  priceCache stale/invalid before keeper decision — action paths refresh it atomically before use');
 }
 
+async function readContract(rpcPool, contract, method, ...args) {
+  return await rpcPool.executeWithRetry(async (provider) => {
+    return await contract.connect(provider)[method](...args);
+  });
+}
+
 /**
  * Resolves the Treasury contract. Prefers TREASURY_ADDRESS from .env (lets the keeper read
  * the USDC balance and warn when underfunded); falls back to vault.treasuryAddress() on-chain.
  * Returns { treasury, treasuryAddr, usdc } or nulls if unavailable.
  */
-async function resolveTreasury(provider, vault) {
+async function resolveTreasury(rpcPool, vault) {
   try {
-    const treasuryAddr = process.env.TREASURY_ADDRESS || await vault.treasuryAddress();
-    const treasury = new ethers.Contract(treasuryAddr, TREASURY_ABI, provider);
+    const treasuryAddr = process.env.TREASURY_ADDRESS || await readContract(rpcPool, vault, 'treasuryAddress');
+    const treasury = new ethers.Contract(treasuryAddr, TREASURY_ABI, rpcPool.getProvider());
     let usdc = null;
     try {
-      const usdcAddr = await treasury.usdc();
-      usdc = new ethers.Contract(usdcAddr, ERC20_ABI, provider);
+      const usdcAddr = await readContract(rpcPool, treasury, 'usdc');
+      usdc = new ethers.Contract(usdcAddr, ERC20_ABI, rpcPool.getProvider());
     } catch (_) { /* older Treasury without usdc() getter — balance check skipped */ }
     return { treasury, treasuryAddr, usdc };
   } catch (e) {
@@ -51,10 +57,10 @@ async function resolveTreasury(provider, vault) {
  * always succeeds on-chain (the contract wraps the payout in try/catch) — only the bounty is
  * skipped silently when the Treasury is empty. Returns true if the bounty looks payable.
  */
-async function checkBountyFunding(label, enabled, amount, treasuryAddr, usdc) {
+async function checkBountyFunding(label, enabled, amount, treasuryAddr, usdc, rpcPool) {
   if (!enabled || !usdc || !treasuryAddr) return true;
   try {
-    const bal = await usdc.balanceOf(treasuryAddr);
+    const bal = await readContract(rpcPool, usdc, 'balanceOf', treasuryAddr);
     if (bal < amount) {
       console.log(`  ⚠️  Treasury insufficiently funded for ${label} bounty (` +
         `${ethers.formatUnits(bal, 6)} < ${ethers.formatUnits(amount, 6)} USDC) — ` +
@@ -73,7 +79,7 @@ async function main() {
   console.log(`Check interval: ${CHECK_INTERVAL_MS / 60000} minutes`);
   console.log(`Mode: ${CHECK_ONLY ? 'CHECK ONLY' : 'ACTIVE'}\n`);
 
-  const required = ['RPC_URL', 'RANGEMANAGER_ADDRESS', 'VAULT_ADDRESS', 'TOKEN0_ADDRESS', 'TOKEN1_ADDRESS'];
+  const required = ['RPC_URL', 'RANGEMANAGER_ADDRESS', 'VAULT_ADDRESS', 'AAVE_HEDGE_MANAGER_ADDRESS', 'TOKEN0_ADDRESS', 'TOKEN1_ADDRESS'];
   if (!CHECK_ONLY) required.push('KEEPER_PRIVATE_KEY');
   for (const key of required) {
     if (!process.env[key]) {
@@ -87,24 +93,24 @@ async function main() {
   const { rangeManager, vault, hedgeManager, pauseController } = createContracts(provider);
 
   // Resolve Treasury + bounty info
-  const { treasury, treasuryAddr, usdc } = await resolveTreasury(provider, vault);
+  const { treasury, treasuryAddr, usdc } = await resolveTreasury(rpcPool, vault);
   if (treasury) {
     try {
-      const keeperEnabled = await treasury.keeperBountyEnabled();
-      const keeperAmount = await treasury.keeperBountyAmount();
-      const metricsEnabled = await treasury.metricsBountyEnabled();
-      const metricsAmount = await treasury.metricsBountyAmount();
-      const hedgeEnabled = await treasury.hedgeBountyEnabled();
-      const hedgeAmount = await treasury.hedgeBountyAmount();
-      const depositEnabled = await treasury.depositBountyEnabled();
-      const depositAmount = await treasury.depositBountyAmount();
+      const keeperEnabled = await readContract(rpcPool, treasury, 'keeperBountyEnabled');
+      const keeperAmount = await readContract(rpcPool, treasury, 'keeperBountyAmount');
+      const metricsEnabled = await readContract(rpcPool, treasury, 'metricsBountyEnabled');
+      const metricsAmount = await readContract(rpcPool, treasury, 'metricsBountyAmount');
+      const hedgeEnabled = await readContract(rpcPool, treasury, 'hedgeBountyEnabled');
+      const hedgeAmount = await readContract(rpcPool, treasury, 'hedgeBountyAmount');
+      const depositEnabled = await readContract(rpcPool, treasury, 'depositBountyEnabled');
+      const depositAmount = await readContract(rpcPool, treasury, 'depositBountyAmount');
       console.log(`Treasury: ${treasuryAddr}`);
       console.log(`Keeper bounty (rebalance): ${keeperEnabled ? ethers.formatUnits(keeperAmount, 6) + ' USDC' : 'disabled'}`);
       console.log(`Metrics bounty (snapshot): ${metricsEnabled ? ethers.formatUnits(metricsAmount, 6) + ' USDC' : 'disabled'}`);
       console.log(`Hedge bounty (adjustHedge): ${hedgeEnabled ? ethers.formatUnits(hedgeAmount, 6) + ' USDC' : 'disabled'}`);
       console.log(`Deposit bounty (process): ${depositEnabled ? ethers.formatUnits(depositAmount, 6) + ' USDC' : 'disabled'}`);
       if (usdc) {
-        const bal = await usdc.balanceOf(treasuryAddr);
+        const bal = await readContract(rpcPool, usdc, 'balanceOf', treasuryAddr);
         console.log(`Treasury USDC balance: ${ethers.formatUnits(bal, 6)} USDC\n`);
       } else {
         console.log('');
@@ -127,7 +133,11 @@ async function main() {
     try {
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
 
-      await logPriceCacheBeforeDecision(rangeManager, rpcPool);
+      if (CHECK_ONLY) {
+        await logPriceCacheBeforeDecision(rangeManager, rpcPool);
+      } else {
+        await rebalancer.ensureFreshPriceCacheForDecision();
+      }
 
       const [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
         async (p) => {
@@ -196,9 +206,9 @@ async function main() {
             return await rangeManager.connect(p).isSnapshotDue();
           });
           if (due) {
-            const metricsEnabled = treasury ? await treasury.metricsBountyEnabled() : false;
-            const metricsAmount = treasury ? await treasury.metricsBountyAmount() : 0n;
-            await checkBountyFunding('metrics', metricsEnabled, metricsAmount, treasuryAddr, usdc);
+            const metricsEnabled = treasury ? await readContract(rpcPool, treasury, 'metricsBountyEnabled') : false;
+            const metricsAmount = treasury ? await readContract(rpcPool, treasury, 'metricsBountyAmount') : 0n;
+            await checkBountyFunding('metrics', metricsEnabled, metricsAmount, treasuryAddr, usdc, rpcPool);
             console.log('  -> Snapshot due, recording price on-chain...');
             const rcpt = await rpcPool.executeSignedTxWithRetry(async (p) => {
               const signer = wallet.connect(p);
@@ -236,9 +246,9 @@ async function main() {
             ]);
           });
           if (pending > 0n && positions.length > 0 && !isRebalancing) {
-            const depEnabled = treasury ? await treasury.depositBountyEnabled() : false;
-            const depAmount = treasury ? await treasury.depositBountyAmount() : 0n;
-            await checkBountyFunding('deposit', depEnabled, depAmount, treasuryAddr, usdc);
+            const depEnabled = treasury ? await readContract(rpcPool, treasury, 'depositBountyEnabled') : false;
+            const depAmount = treasury ? await readContract(rpcPool, treasury, 'depositBountyAmount') : 0n;
+            await checkBountyFunding('deposit', depEnabled, depAmount, treasuryAddr, usdc, rpcPool);
             console.log(`  -> ${pending.toString()} deposit(s) pending, processing one on-chain...`);
             const result = await rebalancer.processDeposit();
             if (result.success) console.log(`  -> Deposit processed (${result.txHashes.length} tx)`);
@@ -260,9 +270,9 @@ async function main() {
           // Always simulate the on-chain action. adjustHedge() itself applies the normal cooldown, while
           // its HF-repair branch deliberately bypasses that cooldown. An off-chain cooldown gate here would
           // therefore suppress a safety repair that the contract is explicitly ready to execute.
-          const hedgeEnabled = treasury ? await treasury.hedgeBountyEnabled() : false;
-          const hedgeAmount = treasury ? await treasury.hedgeBountyAmount() : 0n;
-          await checkBountyFunding('hedge', hedgeEnabled, hedgeAmount, treasuryAddr, usdc);
+          const hedgeEnabled = treasury ? await readContract(rpcPool, treasury, 'hedgeBountyEnabled') : false;
+          const hedgeAmount = treasury ? await readContract(rpcPool, treasury, 'hedgeBountyAmount') : 0n;
+          await checkBountyFunding('hedge', hedgeEnabled, hedgeAmount, treasuryAddr, usdc, rpcPool);
           console.log('  -> Hedge drift above threshold, adjusting on-chain...');
           const rcpt = await rpcPool.executeSignedTxWithRetry(async (p) => {
             const signer = wallet.connect(p);
@@ -306,9 +316,9 @@ async function main() {
       } else if (CHECK_ONLY) {
         console.log(`  -> Rebalance needed (${dnDriftRebalance && !needsRebalance ? 'DN drift in-range' : 'range'}, check-only, skipping)\n`);
       } else {
-        const keeperEnabled = treasury ? await treasury.keeperBountyEnabled() : false;
-        const keeperAmount = treasury ? await treasury.keeperBountyAmount() : 0n;
-        await checkBountyFunding('rebalance', keeperEnabled, keeperAmount, treasuryAddr, usdc);
+        const keeperEnabled = treasury ? await readContract(rpcPool, treasury, 'keeperBountyEnabled') : false;
+        const keeperAmount = treasury ? await readContract(rpcPool, treasury, 'keeperBountyAmount') : 0n;
+        await checkBountyFunding('rebalance', keeperEnabled, keeperAmount, treasuryAddr, usdc, rpcPool);
         console.log(`  -> Executing REBALANCE (${dnDriftRebalance && !needsRebalance ? 'DN drift in-range' : 'range'})...`);
         const result = await rebalancer.executeRebalance(tokenId);
         if (result.success) {

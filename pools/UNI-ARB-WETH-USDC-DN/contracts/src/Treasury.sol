@@ -2,6 +2,7 @@
 pragma solidity 0.8.19;
 
 import "openzeppelin-contracts/contracts/access/Ownable2Step.sol";
+import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -69,7 +70,7 @@ interface IStargate {
         returns (MessagingReceipt memory, OFTReceipt memory, Ticket memory);
 }
 
-contract Treasury is Ownable2Step {
+contract Treasury is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using Math for uint256;
 
@@ -78,6 +79,8 @@ contract Treasury is Ownable2Step {
 
     uint256 private constant USD_SCALE = 1e8;
     uint16 private constant DEPOSIT_BOUNTY_MIN_RATIO = 100;
+    uint160 private constant MIN_SQRT_RATIO = 4295128739;
+    uint160 private constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
 
     // --- Immutables ---
     IERC20 public immutable usdc;
@@ -127,6 +130,9 @@ contract Treasury is Ownable2Step {
     // Anti-spam assure on-chain par le timing regulier (maxSnapshotsPerDay) cote RangeManager.
     bool public metricsBountyEnabled;
     uint256 public metricsBountyAmount;
+    uint256 public metricsBountyDailyCap; // max snapshot bounties paid per UTC day per RangeManager
+    mapping(address => uint64) public metricsBountyDay;
+    mapping(address => uint256) public metricsBountyDailySpent;
 
     // --- Hedge Bounty (adjustHedge, pools DN) — paye au keeper qui reajuste le hedge ---
     // Anti-drain: adjustHedge() est deja borne cote AaveHedgeManager par drift+cooldown, et le Treasury ajoute
@@ -187,6 +193,7 @@ contract Treasury is Ownable2Step {
     event CollectedAndBridged(address indexed tokenIn, uint256 swappedUSDC, uint256 bridgedUSDC, uint32 dstEid);
     event MetricsBountyPaid(address indexed keeper, uint256 amount);
     event MetricsBountyConfigured(bool enabled, uint256 amount);
+    event MetricsBountyDailyCapConfigured(uint256 dailyCap);
     event HedgeBountyPaid(address indexed keeper, uint256 amount);
     event HedgeBountyConfigured(bool enabled, uint256 amount);
     event HedgeManagerAuthorized(address indexed hedgeManager, bool authorized);
@@ -213,6 +220,10 @@ contract Treasury is Ownable2Step {
         adminWithdrawEnabled = true;
         rescueSafe = msg.sender;
         currentMonthStart = block.timestamp;
+        if (_keeperBountyEnabled) {
+            require(_keeperBountyAmount > 0 && _keeperBountyAmount <= _monthlyCap, "Invalid bounty");
+            keeperBountyDailyCap = _keeperBountyAmount;
+        }
         keeperBountyEnabled = _keeperBountyEnabled;
         keeperBountyAmount = _keeperBountyAmount;
         stargatePool = IStargate(_stargatePool);
@@ -235,14 +246,17 @@ contract Treasury is Ownable2Step {
     function swapToUSDC(address tokenIn, uint24 fee, uint256 amountIn, uint256 minAmountOut)
         external
         onlyOwner
+        nonReentrant
         returns (uint256 amountOut)
     {
         require(tokenIn != address(usdc), "Already USDC");
         require(fee == swapPoolFees[tokenIn] && fee != 0, "Unapproved fee");
         require(amountIn > 0, "Zero amount");
         IERC20 token = IERC20(tokenIn);
-        require(token.balanceOf(address(this)) >= amountIn, "Insufficient balance");
-        require(minAmountOut >= _oracleMinUsdcOut(tokenIn, amountIn), "minOut<oracle");
+        uint256 balanceBefore = token.balanceOf(address(this));
+        require(balanceBefore >= amountIn, "Insufficient balance");
+        (uint256 oracleFloor, uint160 sqrtPriceLimitX96) = _oracleSwapBounds(tokenIn, amountIn);
+        require(minAmountOut >= oracleFloor, "minOut<oracle");
 
         // Approve swap router for this token (safe pattern: reset then set)
         token.safeApprove(address(swapRouter), 0);
@@ -256,16 +270,17 @@ contract Treasury is Ownable2Step {
             deadline: block.timestamp,
             amountIn: amountIn,
             amountOutMinimum: minAmountOut,
-            sqrtPriceLimitX96: 0
+            sqrtPriceLimitX96: sqrtPriceLimitX96
         });
 
         amountOut = swapRouter.exactInputSingle(params);
+        require(balanceBefore - token.balanceOf(address(this)) == amountIn, "Partial fill");
         emit SwappedToUSDC(tokenIn, fee, amountIn, amountOut);
     }
 
     /// @notice Bridge USDC to staking contract on destination chain via Stargate v2. Callable by anyone.
     /// @dev Uses Taxi mode (immediate delivery). Caller pays native gas for cross-chain fees via msg.value.
-    function bridgeToStakers(uint256 amount) external payable {
+    function bridgeToStakers(uint256 amount) external payable nonReentrant {
         require(bridgeEnabled, "Bridge disabled");
         require(amount > 0, "Zero amount");
         require(bridgeDestinationAddress != address(0), "Destination not set");
@@ -338,16 +353,32 @@ contract Treasury is Ownable2Step {
 
     /// @dev Phase 2: permissionless bridge/distribution cannot drain bounty float.
     function _requireDistributableUsdc(uint256 amount) internal view {
+        require(amount > 0 && amount <= _distributableUsdc(), "Bounty reserve");
+    }
+
+    function _distributableUsdc() internal view returns (uint256) {
         uint256 balance = usdc.balanceOf(address(this));
         uint256 reserve = _bountyReserveUsdc();
-        require(balance > reserve && amount <= balance - reserve, "Bounty reserve");
+        return balance > reserve ? balance - reserve : 0;
+    }
+
+    /// @notice Exact USDC balance available for permissionless distribution after every active bounty reserve.
+    function bridgeableUsdc() external view returns (uint256) {
+        return _distributableUsdc();
     }
 
     function _bountyReserveUsdc() internal view returns (uint256 reserve) {
-        if (keeperBountyEnabled) reserve += (keeperBountyDailyCap > 0 ? keeperBountyDailyCap : keeperBountyAmount) * authorizedRangeManagerCount;
-        if (metricsBountyEnabled) reserve += metricsBountyAmount * 24 * authorizedRangeManagerCount;
-        if (hedgeBountyEnabled) reserve += (hedgeBountyDailyCap > 0 ? hedgeBountyDailyCap : hedgeBountyAmount) * authorizedHedgeManagerCount;
-        if (depositBountyEnabled) reserve += (depositBountyDailyCap > 0 ? depositBountyDailyCap : depositBountyAmount) * authorizedVaultCount;
+        if (keeperBountyEnabled) {
+            reserve +=
+                (keeperBountyDailyCap > 0 ? keeperBountyDailyCap : keeperBountyAmount) * authorizedRangeManagerCount;
+        }
+        if (metricsBountyEnabled) reserve += metricsBountyDailyCap * authorizedRangeManagerCount;
+        if (hedgeBountyEnabled) {
+            reserve += (hedgeBountyDailyCap > 0 ? hedgeBountyDailyCap : hedgeBountyAmount) * authorizedHedgeManagerCount;
+        }
+        if (depositBountyEnabled) {
+            reserve += (depositBountyDailyCap > 0 ? depositBountyDailyCap : depositBountyAmount) * authorizedVaultCount;
+        }
         if (bridgeBountyEnabled) reserve += bridgeBountyAmount;
     }
 
@@ -356,10 +387,12 @@ contract Treasury is Ownable2Step {
     function collectAndBridge(address tokenIn, uint24 fee, uint256 amountIn, uint256 minSwapOut)
         external
         payable
+        nonReentrant
         returns (uint256 usdcBridged)
     {
         require(bridgeEnabled, "Bridge disabled");
         require(bridgeDestinationAddress != address(0), "Destination not set");
+        require(amountIn > 0, "Zero amount");
 
         // Step 1: Swap to USDC (if not already USDC)
         uint256 usdcAmount;
@@ -367,10 +400,10 @@ contract Treasury is Ownable2Step {
             usdcAmount = amountIn;
             _requireDistributableUsdc(amountIn);
         } else {
-            require(amountIn > 0, "Zero amount");
             require(fee == swapPoolFees[tokenIn] && fee != 0, "Unapproved fee");
             IERC20 token = IERC20(tokenIn);
-            require(token.balanceOf(address(this)) >= amountIn, "Insufficient balance");
+            uint256 balanceBefore = token.balanceOf(address(this));
+            require(balanceBefore >= amountIn, "Insufficient balance");
 
             token.safeApprove(address(swapRouter), 0);
             token.safeApprove(address(swapRouter), amountIn);
@@ -378,7 +411,7 @@ contract Treasury is Ownable2Step {
             // SÉCURITÉ (audit V1) : collectAndBridge est PERMISSIONLESS (décentralisation). On impose donc
             // un plancher oracle anti-sandwich : amountOutMinimum = max(minSwapOut fourni, plancher oracle).
             // Le plancher revert si aucun feed n'est configuré pour tokenIn → pas de swap d'un token non oraclé.
-            uint256 floor = _oracleMinUsdcOut(tokenIn, amountIn);
+            (uint256 floor, uint160 sqrtPriceLimitX96) = _oracleSwapBounds(tokenIn, amountIn);
             uint256 minOut = minSwapOut > floor ? minSwapOut : floor;
 
             ISwapRouter.ExactInputSingleParams memory swapParams = ISwapRouter.ExactInputSingleParams({
@@ -389,12 +422,15 @@ contract Treasury is Ownable2Step {
                 deadline: block.timestamp,
                 amountIn: amountIn,
                 amountOutMinimum: minOut,
-                sqrtPriceLimitX96: 0
+                sqrtPriceLimitX96: sqrtPriceLimitX96
             });
 
             usdcAmount = swapRouter.exactInputSingle(swapParams);
+            require(balanceBefore - token.balanceOf(address(this)) == amountIn, "Partial fill");
             emit SwappedToUSDC(tokenIn, fee, amountIn, usdcAmount);
-            _requireDistributableUsdc(usdcAmount);
+            uint256 distributable = _distributableUsdc();
+            require(distributable > 0, "Bounty reserve");
+            if (usdcAmount > distributable) usdcAmount = distributable;
         }
 
         // Step 2: Bridge all swapped USDC via Stargate
@@ -458,7 +494,7 @@ contract Treasury is Ownable2Step {
     function adminWithdraw(uint256 amount, address to) external onlyOwner {
         require(adminWithdrawEnabled, "Admin withdraw disabled");
         require(to != address(0), "Invalid recipient");
-        require(amount > 0, "Zero amount");
+        _requireDistributableUsdc(amount);
 
         if (block.timestamp >= currentMonthStart + 30 days) {
             currentMonthStart = block.timestamp;
@@ -531,8 +567,8 @@ contract Treasury is Ownable2Step {
     }
 
     function setKeeperBounty(bool _enabled, uint256 _amount) external onlyOwner {
-        if (_enabled && keeperBountyDailyCap > 0) {
-            require(_amount <= keeperBountyDailyCap, "Bounty > daily cap");
+        if (_enabled) {
+            require(_amount > 0 && keeperBountyDailyCap >= _amount, "Bounty cap missing");
         }
         keeperBountyEnabled = _enabled;
         keeperBountyAmount = _amount;
@@ -553,9 +589,8 @@ contract Treasury is Ownable2Step {
     }
 
     function setKeeperBountyDailyCap(uint256 _dailyCap) external onlyOwner {
-        if (_dailyCap > 0) {
-            require(_dailyCap >= keeperBountyAmount, "Cap < bounty");
-        }
+        require(_dailyCap == 0 || _validMonthlyCap(_dailyCap), "Invalid cap");
+        if (keeperBountyEnabled) require(_dailyCap >= keeperBountyAmount, "Cap < bounty");
         keeperBountyDailyCap = _dailyCap;
         emit KeeperBountyDailyCapConfigured(_dailyCap);
     }
@@ -564,22 +599,45 @@ contract Treasury is Ownable2Step {
 
     /// @notice Pay bounty to keeper who recorded a price snapshot. Called by authorized RangeManager.
     /// @dev Appele en try/catch cote RangeManager => ne bloque jamais le snapshot si revert ici.
-    ///      Pas de daily cap Treasury dedie : la cadence est bornee on-chain par RangeManager.maxSnapshotsPerDay.
+    ///      Le RangeManager borne aussi la cadence; ce cap Treasury limite en plus chaque RM autorise.
     function payMetricsBounty(address keeper) external {
         require(keeper != address(0), "Invalid keeper");
         require(authorizedRangeManagers[msg.sender], "Not authorized");
         require(metricsBountyEnabled, "Bounty disabled");
         require(metricsBountyAmount > 0, "Bounty is zero");
         require(usdc.balanceOf(address(this)) >= metricsBountyAmount, "Insufficient USDC");
+        _consumeMetricsBountyLimit(msg.sender);
 
         usdc.safeTransfer(keeper, metricsBountyAmount);
         emit MetricsBountyPaid(keeper, metricsBountyAmount);
     }
 
     function setMetricsBounty(bool _enabled, uint256 _amount) external onlyOwner {
+        if (_enabled) {
+            require(_amount > 0, "Bounty is zero");
+            require(metricsBountyDailyCap >= _amount, "Metrics cap missing");
+        }
         metricsBountyEnabled = _enabled;
         metricsBountyAmount = _amount;
         emit MetricsBountyConfigured(_enabled, _amount);
+    }
+
+    function _consumeMetricsBountyLimit(address rangeManager) internal {
+        uint64 day = uint64(block.timestamp / 1 days);
+        if (metricsBountyDay[rangeManager] != day) {
+            metricsBountyDay[rangeManager] = day;
+            metricsBountyDailySpent[rangeManager] = 0;
+        }
+        uint256 newSpent = metricsBountyDailySpent[rangeManager] + metricsBountyAmount;
+        require(newSpent <= metricsBountyDailyCap, "Metrics bounty daily cap");
+        metricsBountyDailySpent[rangeManager] = newSpent;
+    }
+
+    function setMetricsBountyDailyCap(uint256 _dailyCap) external onlyOwner {
+        require(_dailyCap == 0 || _validMonthlyCap(_dailyCap), "Invalid cap");
+        if (metricsBountyEnabled || _dailyCap > 0) require(_dailyCap >= metricsBountyAmount, "Cap < bounty");
+        metricsBountyDailyCap = _dailyCap;
+        emit MetricsBountyDailyCapConfigured(_dailyCap);
     }
 
     // --- Hedge Bounty Functions (adjustHedge, pools DN) ---
@@ -599,8 +657,8 @@ contract Treasury is Ownable2Step {
     }
 
     function setHedgeBounty(bool _enabled, uint256 _amount) external onlyOwner {
-        if (_enabled && hedgeBountyDailyCap > 0) {
-            require(_amount <= hedgeBountyDailyCap, "Bounty > daily cap");
+        if (_enabled) {
+            require(_amount > 0 && hedgeBountyDailyCap >= _amount, "Bounty cap missing");
         }
         hedgeBountyEnabled = _enabled;
         hedgeBountyAmount = _amount;
@@ -621,9 +679,8 @@ contract Treasury is Ownable2Step {
     }
 
     function setHedgeBountyDailyCap(uint256 _dailyCap) external onlyOwner {
-        if (_dailyCap > 0) {
-            require(_dailyCap >= hedgeBountyAmount, "Cap < bounty");
-        }
+        require(_dailyCap == 0 || _validMonthlyCap(_dailyCap), "Invalid cap");
+        if (hedgeBountyEnabled) require(_dailyCap >= hedgeBountyAmount, "Cap < bounty");
         hedgeBountyDailyCap = _dailyCap;
         emit HedgeBountyDailyCapConfigured(_dailyCap);
     }
@@ -695,7 +752,9 @@ contract Treasury is Ownable2Step {
     }
 
     function setDepositBounty(bool _enabled, uint256 _amount) external onlyOwner {
-        if (_enabled && depositBountyDailyCap > 0) {
+        if (_enabled) {
+            require(_amount > 0, "Bounty is zero");
+            require(depositBountyCooldown > 0 && depositBountyKeeperCooldown > 0, "Cooldown missing");
             require(_amount <= depositBountyDailyCap, "Bounty > daily cap");
         }
         depositBountyEnabled = _enabled;
@@ -708,9 +767,9 @@ contract Treasury is Ownable2Step {
         onlyOwner
     {
         require(_vaultCooldown <= 1 days && _keeperCooldown <= 7 days, "Invalid cooldown");
-        if (_dailyCap > 0) {
-            require(_dailyCap >= depositBountyAmount, "Cap < bounty");
-        }
+        if (depositBountyEnabled) require(_vaultCooldown > 0 && _keeperCooldown > 0, "Cooldown missing");
+        require(_dailyCap == 0 || _validMonthlyCap(_dailyCap), "Invalid cap");
+        if (depositBountyEnabled) require(_dailyCap >= depositBountyAmount, "Cap < bounty");
         depositBountyCooldown = _vaultCooldown;
         depositBountyKeeperCooldown = _keeperCooldown;
         depositBountyDailyCap = _dailyCap;
@@ -731,6 +790,7 @@ contract Treasury is Ownable2Step {
     function setBridgeBounty(bool _enabled, uint256 _amount) external onlyOwner {
         if (_enabled && _amount > 0 && bridgeBountyCooldown == 0) revert BridgeBountyCooldownZero();
         if (_enabled && _amount > 0 && bridgeBountyMinRatio == 0) revert BridgeBountyMinRatioZero();
+        if (_enabled) require(_amount > 0 && _amount <= monthlyCap, "Invalid bridge bounty");
         bridgeBountyEnabled = _enabled;
         bridgeBountyAmount = _amount;
         emit BridgeBountyConfigured(_enabled, _amount);
@@ -741,6 +801,8 @@ contract Treasury is Ownable2Step {
     /// @param _minRatio Minimum ratio of bridged amount over bounty amount (e.g. 50 means
     ///        you must bridge at least 50× the bounty value to earn it). 0 disables bounty payment.
     function setBridgeBountyCooldown(uint64 _cooldown, uint16 _minRatio) external onlyOwner {
+        require(_cooldown == 0 || (_cooldown >= 1 hours && _cooldown <= 30 days), "Invalid bridge cooldown");
+        require(_minRatio == 0 || (_minRatio >= 10 && _minRatio <= 10000), "Invalid bridge ratio");
         if (bridgeBountyEnabled && bridgeBountyAmount > 0 && _cooldown == 0) revert BridgeBountyCooldownZero();
         if (bridgeBountyEnabled && bridgeBountyAmount > 0 && _minRatio == 0) revert BridgeBountyMinRatioZero();
         bridgeBountyCooldown = _cooldown;
@@ -804,7 +866,11 @@ contract Treasury is Ownable2Step {
     /// @dev Plancher anti-sandwich : USDC minimum attendu pour `amountIn` de `tokenIn`, depuis l'oracle
     ///      Chainlink (prix USD du token), minoré du slippage. Revert si aucun feed n'est configuré.
     ///      Conversion générique des décimales (token volatil, feed, USDC) — pas de hard-code.
-    function _oracleMinUsdcOut(address tokenIn, uint256 amountIn) internal view returns (uint256) {
+    function _oracleSwapBounds(address tokenIn, uint256 amountIn)
+        internal
+        view
+        returns (uint256 minUsdcOut, uint160 sqrtPriceLimitX96)
+    {
         AggregatorV3Interface feed = swapFeeds[tokenIn];
         AggregatorV3Interface usdcFeed = swapFeeds[address(usdc)];
         uint32 maxAge = swapFeedMaxAges[tokenIn];
@@ -835,7 +901,18 @@ contract Treasury is Ownable2Step {
         require(normalizedUsdcPx > 0, "Bad USDC decimals");
         uint256 usdValue = Math.mulDiv(amountIn, uint256(px), 10 ** tokenDec);
         uint256 theo = Math.mulDiv(usdValue, 10 ** usdcDec, normalizedUsdcPx);
-        return (theo * (10000 - slippageBps)) / 10000;
+        minUsdcOut = (theo * (10000 - slippageBps)) / 10000;
+
+        bool zeroForOne = tokenIn < address(usdc);
+        uint256 numerator = zeroForOne ? uint256(px) * (10 ** usdcDec) : normalizedUsdcPx * (10 ** tokenDec);
+        uint256 denominator = zeroForOne ? normalizedUsdcPx * (10 ** tokenDec) : uint256(px) * (10 ** usdcDec);
+        uint256 oracleSqrtPriceX96 = Math.sqrt(Math.mulDiv(numerator, uint256(1) << 192, denominator));
+        require(oracleSqrtPriceX96 > MIN_SQRT_RATIO && oracleSqrtPriceX96 < MAX_SQRT_RATIO, "Bad swap price");
+        uint256 factor = zeroForOne ? 20000 - slippageBps : 20000 + slippageBps;
+        uint256 limit = (oracleSqrtPriceX96 * factor) / 20000;
+        if (limit <= MIN_SQRT_RATIO) limit = MIN_SQRT_RATIO + 1;
+        if (limit >= MAX_SQRT_RATIO) limit = MAX_SQRT_RATIO - 1;
+        sqrtPriceLimitX96 = uint160(limit);
     }
 
     function _validMonthlyCap(uint256 cap) internal view returns (bool) {
@@ -847,6 +924,7 @@ contract Treasury is Ownable2Step {
     function setBridgeConfig(bool _enabled, uint32 _dstEid, address _destination) external onlyOwner {
         if (_enabled) {
             require(_dstEid != 0 && _destination != address(0), "Invalid bridge");
+            require(bridgeMinReceivedBps >= 9000, "Bridge min not configured");
         }
         bridgeEnabled = _enabled;
         bridgeDestinationEid = _dstEid;
@@ -869,7 +947,7 @@ contract Treasury is Ownable2Step {
     }
 
     /// @notice Distribute USDC to local staking contract (same chain). Callable by anyone.
-    function distributeToStakers(uint256 amount) external {
+    function distributeToStakers(uint256 amount) external nonReentrant {
         require(stakingRewardsAddress != address(0), "Staking not configured");
         _requireDistributableUsdc(amount);
         usdc.safeTransfer(stakingRewardsAddress, amount);

@@ -150,14 +150,13 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 
 | Function | Access | Description |
 |----------|--------|-------------|
-| `rebalance()` | Public (permissionless) | Atomic burn → swaps → mint; protected by the refresh + deviation guard, oracle-bounded `minAmountsOut`, and `needsRebalance` check |
+| `rebalance()` | Public (permissionless) | Atomic burn → swaps → mint; protected by the refresh + deviation guard, oracle-bounded `minAmountsOut`, exact-input consumption checks, and the on-chain rebalance-needed condition |
 | `executeSwap()` | `onlyAuthorized` | Operational executor/module only; refreshes the cache + enforces the oracle floor |
 | `mintInitialPosition()` | `onlyAuthorized` | Operational executor/module only; refreshes the cache + deviation guard before minting |
 | `burnPosition()` | `onlyVaultOrAuthorized` | Vault or operational executor/module; tokens stay in the protocol flow |
 | `configurePriceFeeds()` / `setOracleParams()` | Vault owner relay | Governance settings via `MultiUserVault.executeRangeManagerGovernance(bytes)`: Safe in phase 1, Timelock in phase 2 |
 | `refreshPriceCache()` | Public | Refreshes the price cache (no address change) |
 | `configureRanges()` | Vault owner relay | Governance setting via Safe/Timelock relay, not the bot module |
-| `setSwapFeeBps()` | Vault owner relay | Governance setting via Safe/Timelock relay |
 | `setTreasuryAddress()` | Vault owner relay | Governance setting via Safe/Timelock relay |
 
 ### Treasury

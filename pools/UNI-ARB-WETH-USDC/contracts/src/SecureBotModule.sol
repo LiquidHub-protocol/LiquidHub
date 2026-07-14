@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
+import "./RangeOperations.sol";
+import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
+import "openzeppelin-contracts/contracts/utils/math/Math.sol";
+
 interface ISafe {
     function execTransactionFromModule(address to, uint256 value, bytes calldata data, uint8 operation)
         external
@@ -14,6 +18,13 @@ interface IERC20Sweep {
 
 interface IRangeManagerBotState {
     function token0() external view returns (address);
+    function token1() external view returns (address);
+    function priceCache()
+        external
+        view
+        returns (uint128 price0, uint128 price1, uint160 sqrtP, int24 tick, uint64 timestamp, bool valid);
+    function getOwnerPositions() external view returns (uint256[] memory);
+    function positionManager() external view returns (INonfungiblePositionManager);
 
     function config()
         external
@@ -78,8 +89,8 @@ contract SecureBotModule {
     // Audit V3 (Point 2) : endRebalance() est EXEMPTE de la limite quotidienne dans executeVaultFunction.
     // C'est un DEVERROUILLAGE (il ne deplace aucun fonds, il libere depots/retraits) : si la limite est
     // atteinte un jour de forte activite, le vault ne doit JAMAIS rester verrouille. startRebalance()
-    // (qui verrouille) reste lui soumis a la limite. La pause module bloque les flux non-maintenance,
-    // pas les actions vitales de position (rebalance/swap/snapshot/deverrouillage).
+    // (qui verrouille) reste lui soumis a la limite. Le kill-switch module reste distinct : quand il est
+    // active, aucun relais privilegie bot ne passe ; la maintenance permissionless reste appelable en direct.
     bytes4 private constant END_REBALANCE_SELECTOR = 0x0040718e; // endRebalance()
     bytes4 private constant START_REBALANCE_SELECTOR = 0x4dce7057; // startRebalance()
     bytes4 private constant MINT_INITIAL_SELECTOR = 0x63ccfd0b; // mintInitialPosition()
@@ -161,8 +172,73 @@ contract SecureBotModule {
 
     receive() external payable {}
 
+    /// @notice LP/free RangeManager NAV reconstructed at the Chainlink token ratio (USD, 8 decimals).
+    /// @dev Read-only and unaffected by the module kill-switch. Two Newton steps start from a spot sqrt price
+    ///      bounded by the mandatory RangeManager oracle-deviation guard, removing meaningful flash-slot0
+    ///      influence from share minting without constraining bot or keeper execution paths.
+    function getOracleLpValueUsd() external view returns (uint256 valueUsd) {
+        IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
+        (uint128 price0, uint128 price1, uint160 cachedSqrt,,, bool valid) = rm.priceCache();
+        require(valid && price0 > 0 && price1 > 0 && cachedSqrt > 0, "E_NAV");
+        (, uint8 dec0, uint8 dec1,,,,,,,) = rm.config();
+        uint160 oracleSqrt = _oracleSqrtPrice(price0, price1, cachedSqrt, dec0, dec1);
+        (uint256 balance0, uint256 balance1) = _balancesAtPrice(rm, oracleSqrt);
+        valueUsd = Math.mulDiv(balance0, price0, 10 ** dec0) + Math.mulDiv(balance1, price1, 10 ** dec1);
+    }
+
+    function _oracleSqrtPrice(uint128 price0, uint128 price1, uint160 seed, uint8 dec0, uint8 dec1)
+        private
+        pure
+        returns (uint160)
+    {
+        uint256 ratioX192 =
+            Math.mulDiv(uint256(price0) * (10 ** dec1), uint256(1) << 192, uint256(price1) * (10 ** dec0));
+        uint256 guess = seed;
+        guess = (guess + ratioX192 / guess) >> 1;
+        guess = (guess + ratioX192 / guess) >> 1;
+        require(guess > 0 && guess <= type(uint160).max, "E_RATIO");
+        return uint160(guess);
+    }
+
+    function _balancesAtPrice(IRangeManagerBotState rm, uint160 sqrtPriceX96)
+        private
+        view
+        returns (uint256 balance0, uint256 balance1)
+    {
+        balance0 = IERC20Sweep(rm.token0()).balanceOf(rangeManager);
+        balance1 = IERC20Sweep(rm.token1()).balanceOf(rangeManager);
+        uint256[] memory positions = rm.getOwnerPositions();
+        require(positions.length <= 1, "E_POS");
+        if (positions.length == 0) return (balance0, balance1);
+
+        (,,,,, int24 tickLower, int24 tickUpper, uint128 liquidity,,, uint128 owed0, uint128 owed1) =
+            rm.positionManager().positions(positions[0]);
+        (uint256 amount0, uint256 amount1) = _liquidityAmounts(liquidity, tickLower, tickUpper, sqrtPriceX96);
+        return (balance0 + amount0 + owed0, balance1 + amount1 + owed1);
+    }
+
+    function _liquidityAmounts(uint128 liquidity, int24 tickLower, int24 tickUpper, uint160 sqrtPriceX96)
+        private
+        pure
+        returns (uint256 amount0, uint256 amount1)
+    {
+        if (liquidity == 0) return (0, 0);
+        uint160 sqrtA = RangeOperations.sqrtRatioAtTickExt(tickLower);
+        uint160 sqrtB = RangeOperations.sqrtRatioAtTickExt(tickUpper);
+        uint256 numerator = uint256(liquidity) << 96;
+        if (sqrtPriceX96 <= sqrtA) {
+            amount0 = numerator / sqrtA - numerator / sqrtB;
+        } else if (sqrtPriceX96 >= sqrtB) {
+            amount1 = Math.mulDiv(liquidity, sqrtB - sqrtA, uint256(1) << 96);
+        } else {
+            amount0 = numerator / sqrtPriceX96 - numerator / sqrtB;
+            amount1 = Math.mulDiv(liquidity, sqrtPriceX96 - sqrtA, uint256(1) << 96);
+        }
+    }
+
     modifier onlyBot() {
         require(msg.sender == botAddress, "Only bot allowed");
+        require(!paused, "Module paused");
         _;
     }
 
@@ -230,7 +306,6 @@ contract SecureBotModule {
 
     /// @notice Execute a Treasury function (bridge operations only, per whitelist)
     function executeTreasuryFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) withinDailyLimit {
-        require(!paused, "Module paused");
         _execute(treasury, 0, data);
 
         bytes4 selector = bytes4(data[:4]);
@@ -246,7 +321,6 @@ contract SecureBotModule {
         onlyAllowedFunction(data)
         withinDailyLimit
     {
-        require(!paused, "Module paused");
         require(msg.value == value, "Invalid ETH value");
 
         uint256 nativeBefore = address(this).balance - msg.value;
@@ -540,7 +614,6 @@ contract SecureBotModule {
         if (
             selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
         ) {
-            require(!paused, "Module paused");
             address controller = pauseController;
             // Yul shl order is shl(shift, value): left-align requireInflowsActive().
             assembly ("memory-safe") {

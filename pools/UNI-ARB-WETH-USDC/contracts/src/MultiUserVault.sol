@@ -71,6 +71,10 @@ interface ITreasuryDeposit {
     function payDepositBounty(address keeper, uint256 depositValueUsd) external;
 }
 
+interface IBotNav {
+    function getOracleLpValueUsd() external view returns (uint256);
+}
+
 contract MultiUserVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -145,11 +149,39 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // (O(1)) au lieu de décaler tout le tableau (O(n) → O(n²) pour vider la file). La file est "vide"
     // quand _pendingHead >= pendingDeposits.length ; on compacte (delete + reset) une fois vidée.
     uint256 private _pendingHead;
+    mapping(address => uint256) private _pendingIndexPlusOne;
+    uint256 private _pendingTotal0;
+    uint256 private _pendingTotal1;
 
     /// @dev Nombre de dépôts EN ATTENTE (non encore traités) = longueur - tête.
     function _pendingCount() internal view returns (uint256) {
         uint256 len = pendingDeposits.length;
         return len > _pendingHead ? len - _pendingHead : 0;
+    }
+
+    function _removePending(uint256 index, PendingDeposit memory pd) private {
+        hasPendingDeposit[pd.user] = false;
+        delete _pendingIndexPlusOne[pd.user];
+        _pendingTotal0 -= pd.amount0;
+        _pendingTotal1 -= pd.amount1;
+
+        uint256 head = _pendingHead;
+        uint256 last = pendingDeposits.length - 1;
+        if (index == head) {
+            _pendingHead = head + 1;
+        } else {
+            if (index != last) {
+                PendingDeposit memory moved = pendingDeposits[last];
+                pendingDeposits[index] = moved;
+                _pendingIndexPlusOne[moved.user] = index + 1;
+            }
+            pendingDeposits.pop();
+        }
+
+        if (_pendingHead >= pendingDeposits.length) {
+            delete pendingDeposits;
+            _pendingHead = 0;
+        }
     }
 
     uint256 public totalShares;
@@ -340,7 +372,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             || selector == bytes4(keccak256("setOracleParams(uint16,uint32,uint32)"))
             || selector == bytes4(keccak256("configurePriceFeeds(address,address,address)"))
             || selector == bytes4(keccak256("setInitMultiSwapTvl(uint256)"))
-            || selector == bytes4(keccak256("setSwapFeeBps(uint16)"))
             || selector == bytes4(keccak256("setTreasuryAddress(address)"))
             || selector == bytes4(keccak256("setSafeAddress(address)"))
             || selector == bytes4(keccak256("setAuthorizedExecutor(address,bool)"));
@@ -397,6 +428,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         );
 
         hasPendingDeposit[msg.sender] = true;
+        _pendingIndexPlusOne[msg.sender] = pendingDeposits.length;
+        _pendingTotal0 += amount0;
+        _pendingTotal1 += amount1;
 
         emit PendingDepositAdded(msg.sender, amount0, amount1);
     }
@@ -408,12 +442,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         PendingDeposit memory pd = pendingDeposits[_pendingHead];
         require(block.timestamp >= pd.timestamp + depositRefundDelay, "E_NOT_REFUNDABLE");
 
-        hasPendingDeposit[pd.user] = false;
-        _pendingHead++;
-        if (_pendingHead >= pendingDeposits.length) {
-            delete pendingDeposits;
-            _pendingHead = 0;
-        }
+        _removePending(_pendingHead, pd);
 
         if (pd.amount0 > 0) token0.safeTransfer(pd.user, pd.amount0);
         if (pd.amount1 > 0) token1.safeTransfer(pd.user, pd.amount1);
@@ -454,16 +483,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         return (pd.user, pd.amount0, pd.amount1, pd.timestamp, true);
     }
 
-    /// @notice AUDIT H-01/H-03 : plan de swap correct pour le PROCHAIN dépôt (pool standard). État FUTUR =
-    ///         soldes libres du RM + le dépôt en tête (PAS getOptimalSwapParams, qui reflète l'état rebalance/
-    ///         post-burn incluant le NFT). Ratio cible = celui du NFT EXISTANT (addLiquidityToPosition ajoute à
-    ///         CE range), pas le range cible dynamique. À utiliser par les keepers/bot pour processDepositPermissionless.
+    /// @notice Plan de swap du PROCHAIN dépôt (pool standard), isolé des donations, dust et fees historiques.
+    ///         Ratio cible = celui du NFT EXISTANT (addLiquidityToPosition ajoute à CE range), pas le range cible
+    ///         dynamique. À utiliser par les keepers/bot pour processDepositPermissionless.
     /// @return zeroForOne true si swap token0→token1 ; amountIn en unités natives (0 = pas de swap).
     function getDepositSwapParams() external view returns (bool zeroForOne, uint256 amountIn) {
         if (_pendingCount() == 0) return (false, 0);
         PendingDeposit memory pd = pendingDeposits[_pendingHead];
         // Calcul déporté en library (EIP-170 — le Vault std est serré). La library lit priceCache/config/ratio
-        // NFT du RangeManager et ajoute le dépôt aux soldes libres pour refléter l'état futur de la tx.
+        // NFT du RangeManager et ne dimensionne le swap que sur l'apport courant.
         return RangeOperations.depositSwapParams(address(rangeManager), pd.amount0, pd.amount1);
     }
 
@@ -538,13 +566,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
 
         // Retirer ce dépôt de la queue : avancer la tête (O(1), audit V1 — DoS gas A) au lieu du shift O(n).
-        hasPendingDeposit[pd.user] = false;
-        _pendingHead++;
-        // Compactage : si la file est entièrement traitée, libérer le storage et réinitialiser la tête.
-        if (_pendingHead >= pendingDeposits.length) {
-            delete pendingDeposits;
-            _pendingHead = 0;
-        }
+        _removePending(_pendingHead, pd);
 
         return (pd, depositValue, currentTotalValue, totalSharesBefore);
     }
@@ -560,9 +582,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         require(creditedValue > 0, "E_ZERO_VALUE");
 
         if (totalSharesBefore <= DEAD_SHARES) {
-            require(currentTotalValue == 0, "E_ORPHAN_VALUE");
             totalShares = 0;
-            sharesToMint = creditedValue * 1e10;
+            // Include any pre-mint protocol value in the initial share base. With no live user shares,
+            // this preserves the initial share price and prevents dust from freezing the first mint.
+            sharesToMint = (creditedValue + currentTotalValue) * 1e10;
             if (sharesToMint <= DEAD_SHARES) revert FirstDepositTooSmall();
             sharesToMint -= DEAD_SHARES;
             totalShares = DEAD_SHARES;
@@ -647,22 +670,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk
         uint256 n = swapAmountsIn.length;
         uint256 totalSwapLossUsd;
-        uint256 totalSwapIn;
         if (n > 0) {
             for (uint256 i = 0; i < n; i++) {
                 uint256 amountOut = rangeManager.executeSwap(tokenIn, tokenOut, swapAmountsIn[i], minAmountsOut[i]);
                 totalSwapLossUsd += _swapLossUsd(tokenIn == address(token0), swapAmountsIn[i], amountOut);
-                totalSwapIn += swapAmountsIn[i];
             }
-            uint256 depositTokenIn = tokenIn == address(token0) ? pd.amount0 : pd.amount1;
-            uint256 depositLossUsd = totalSwapLossUsd;
-            if (depositTokenIn < totalSwapIn) {
-                depositLossUsd = (totalSwapLossUsd * depositTokenIn) / totalSwapIn;
-                uint256 incumbentLossUsd = totalSwapLossUsd - depositLossUsd;
-                require(incumbentLossUsd < valueBefore, "E25");
-                valueBefore -= incumbentLossUsd;
-            }
-            totalSwapLossUsd = depositLossUsd;
         }
 
         // 7. Ajouter a la position existante, ou minter la position initiale en atomique bot-only.
@@ -900,21 +912,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function getCurrentPortfolioValue() public view returns (uint256) {
-        try rangeManager.getCurrentBalances() returns (uint256 bal0, uint256 bal1) {
-            try rangeManager.priceCache() returns (uint128 price0, uint128 price1, uint160, int24, uint64, bool valid) {
-                if (!valid) return 0;
-
-                // Decimales depuis RangeManager pour generaliser a toutes les paires
-                // (anciennement 1e18 / 1e6 hardcodes pour WETH/USDC).
-                RangeOperations.RangeConfig memory config = rangeManager.config();
-
-                uint256 value0 = (bal0 * uint256(price0)) / (10 ** config.token0Decimals);
-                uint256 value1 = (bal1 * uint256(price1)) / (10 ** config.token1Decimals);
-
-                return value0 + value1;
-            } catch {
-                return 0;
-            }
+        address module = botModule;
+        if (module == address(0)) return 0;
+        try IBotNav(module).getOracleLpValueUsd() returns (uint256 valueUsd) {
+            return valueUsd;
         } catch {
             return 0;
         }
@@ -1085,7 +1086,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 } else {
                     // Retirer un pourcentage de liquidité proportionnel aux shares
                     liquidityToRemove = (totalLiquidity * shareAmount) / totalSharesBefore;
-                    require(liquidityToRemove > 0, "E_ZERO_LIQ");
+                    // Une unité est le plafond d'arrondi sûr : les transferts restent bornés aux montants
+                    // proportionnels principal0/principal1, donc l'excédent éventuel demeure au RangeManager.
+                    if (liquidityToRemove == 0) liquidityToRemove = 1;
                 }
             }
         }
@@ -1102,6 +1105,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (liquidityToRemove > 0 && tokenId > 0) {
             rangeManager.removeLiquidityForWithdraw(tokenId, uint128(liquidityToRemove));
         }
+
+        // Une fois le dernier utilisateur sorti, le NFT vide doit aussi quitter le PositionManager et le
+        // tracking RangeManager. Le prochain dépôt repassera ainsi par un mint initial propre.
+        if (isFullWithdraw && tokenId > 0) rangeManager.burnPosition(tokenId);
 
         // ===== ETAPE 3 : TRANSFERER DEPUIS RANGEMANAGER VERS VAULT =====
         // SÉCURITÉ (audit V1) : on n'envoie QUE le principal proportionnel du user, borné par
@@ -1329,12 +1336,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice Recupere les fonds d'un utilisateur depuis RangeManager ou le Vault
      * @notice Precision : Les tokens de pool ne peuvent etre recuperes que par le depositaire
      * @param userAddress L'adresse de l'utilisateur a recuperer
-     * @dev audit V1 (M3-B-fix5, retour Codex — Low gas) : ce chemin Safe-only ITERE sur la file des depots EN
-     *      ATTENTE (pendingDeposits, de _pendingHead a la fin). Cout O(taille file). En pratique la file est
-     *      drainee a chaque cycle bot (~10 min) donc elle reste petite ; mais si elle devait devenir tres
-     *      grande, DRAINER la file (processSingleDeposit/processDepositPermissionless) AVANT d'appeler cette
-     *      fonction d'urgence. Non bloquant (pas le chemin normal), pas optimise on-chain pour ne pas alourdir
-     *      le bytecode du vault (contrainte EIP-170).
+     * @dev Les totaux pending et l'index utilisateur rendent ce chemin O(1), y compris avec une longue file.
      */
     function EmergencyRecoverUser(address userAddress) external onlyEmergencySafe nonReentrant {
         require(userAddress != address(0), "E43");
@@ -1360,20 +1362,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             // proportionnel, sinon un user récupérerait une part d'un total gonflé par les pending
             // d'autrui (même classe de bug que le sweep balanceOf au withdraw). Les pending du user
             // lui-même sont ajoutés séparément à l'étape 3.
-            uint256 pendingTotal0 = 0;
-            uint256 pendingTotal1 = 0;
-            // Itérer sur les dépôts EN ATTENTE uniquement (de _pendingHead à la fin) — audit V1 DoS gas A.
-            uint256 pendingLen = pendingDeposits.length;
-            for (uint256 i = _pendingHead; i < pendingLen; i++) {
-                pendingTotal0 += pendingDeposits[i].amount0;
-                pendingTotal1 += pendingDeposits[i].amount1;
-            }
-
             // Recuperer les balances totales (Vault HORS pending + RangeManager)
             uint256 rawVault0 = token0.balanceOf(address(this));
             uint256 rawVault1 = token1.balanceOf(address(this));
-            vaultBalance0 = rawVault0 > pendingTotal0 ? rawVault0 - pendingTotal0 : 0;
-            vaultBalance1 = rawVault1 > pendingTotal1 ? rawVault1 - pendingTotal1 : 0;
+            vaultBalance0 = rawVault0 > _pendingTotal0 ? rawVault0 - _pendingTotal0 : 0;
+            vaultBalance1 = rawVault1 > _pendingTotal1 ? rawVault1 - _pendingTotal1 : 0;
 
             uint256 rangeBalance0 = token0.balanceOf(address(rangeManager));
             uint256 rangeBalance1 = token1.balanceOf(address(rangeManager));
@@ -1413,23 +1406,16 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             require(received0 == neededFromRange0 && received1 == neededFromRange1, "E47");
         }
 
-        // 4. GeRER LES DePoTS EN ATTENTE (de _pendingHead à la fin — audit V1 DoS gas A)
+        // 4. GeRER LE DePoT EN ATTENTE PAR INDEX (O(1))
         if (hasPendingDeposit[userAddress]) {
-            uint256 len = pendingDeposits.length;
-            for (uint256 i = _pendingHead; i < len; i++) {
-                if (pendingDeposits[i].user == userAddress) {
-                    userAmount0 += pendingDeposits[i].amount0;
-                    userAmount1 += pendingDeposits[i].amount1;
-
-                    // Swap-and-pop avec le DERNIER élément (toujours dans la zone active [head, len)).
-                    if (i < len - 1) {
-                        pendingDeposits[i] = pendingDeposits[len - 1];
-                    }
-                    pendingDeposits.pop();
-                    break;
-                }
-            }
-            hasPendingDeposit[userAddress] = false;
+            uint256 indexPlusOne = _pendingIndexPlusOne[userAddress];
+            require(indexPlusOne > _pendingHead && indexPlusOne <= pendingDeposits.length, "E48");
+            uint256 index = indexPlusOne - 1;
+            PendingDeposit memory pd = pendingDeposits[index];
+            require(pd.user == userAddress, "E48");
+            userAmount0 += pd.amount0;
+            userAmount1 += pd.amount1;
+            _removePending(index, pd);
             delete userFeeDebtToken0[userAddress];
             delete userFeeDebtToken1[userAddress];
         }

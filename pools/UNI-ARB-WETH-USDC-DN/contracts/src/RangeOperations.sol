@@ -22,8 +22,15 @@ interface IRangeVaultComm {
 library RangeOperations {
     using SafeERC20 for IERC20;
 
+    error PartialFill();
+    error LiquidityCheck();
+
     int24 private constant MIN_TICK = -887272;
     int24 private constant MAX_TICK = 887272;
+
+    function mulDivUp(uint256 x, uint256 y, uint256 denominator) external pure returns (uint256) {
+        return Math.mulDiv(x, y, denominator, Math.Rounding.Up);
+    }
 
     // ===== STRUCTS (partages) =====
 
@@ -307,42 +314,6 @@ library RangeOperations {
     }
 
     /**
-     * @notice Ajoute de la liquidite a une position existante SANS faire de swap
-     * @dev Les swaps doivent etre faits AVANT via Velora (multi-swap)
-     * @param token0 Adresse du token0
-     * @param token1 Adresse du token1
-     * @param tokenId ID de la position
-     * @param positionManager Le gestionnaire de positions
-     * @param contractAddress Adresse du contrat (RangeManager)
-     * @return liquidity Liquidite ajoutee
-     * @return amount0Added Montant de token0 ajoute
-     * @return amount1Added Montant de token1 ajoute
-     * @dev SECURITY NOTE: This is a library function called via delegatecall from RangeManager.
-     *      Access control is enforced by the calling contract (RangeManager) via onlyAuthorized modifier.
-     *      Libraries cannot have their own access control modifiers since they execute in the
-     *      caller's context. This function only operates on tokens already held by the contract
-     *      and cannot transfer funds to arbitrary addresses - it adds liquidity to existing positions.
-     */
-    function addLiquidityWithoutSwap(
-        address token0,
-        address token1,
-        uint256 tokenId,
-        INonfungiblePositionManager positionManager,
-        uint24 maxSlippageBps,
-        address contractAddress
-    ) external returns (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) {
-        // Récupérer et valider les balances
-        (uint256 balance0, uint256 balance1) = _getBalances(token0, token1, contractAddress);
-        require(balance0 > 0 || balance1 > 0, "No funds to add");
-
-        // Approuver et ajouter la liquidité (PAS DE SWAP - fait avant via Velora)
-        (uint256 newBalance0, uint256 newBalance1) =
-            _approveAndGetBalances(token0, token1, positionManager, contractAddress);
-
-        return _increaseLiquidity(tokenId, newBalance0, newBalance1, positionManager, maxSlippageBps);
-    }
-
-    /**
      * @notice Fournit les instructions pour le bot
      * @param positionCount Nombre de positions actives
      * @param maxPositions Limite max de positions
@@ -467,63 +438,6 @@ library RangeOperations {
             balance0 += pos0;
             balance1 += pos1;
         }
-    }
-
-    /**
-     * @notice Cree une nouvelle position Uniswap V3
-     * @dev SECURITY NOTE: This is a library function called via delegatecall from RangeManager.
-     *      Access control is enforced by the calling contract (RangeManager) via onlyAuthorized modifier.
-     *      Libraries cannot have their own access control modifiers since they execute in the
-     *      caller's context. This function only uses tokens already held by the contract
-     *      and mints a new position with recipient set to contractAddress (the calling contract).
-     *
-     *      FUND REDIRECTION RISK MITIGATION: The contractAddress parameter MUST be address(this)
-     *      from the caller's perspective. In RangeManager._mintInternal(), this function is called
-     *      with `address(this)` hardcoded - never from user input. The library requires this parameter
-     *      because libraries execute via delegatecall and need the caller's address passed explicitly.
-     *      The calling contract (RangeManager) is responsible for always passing address(this).
-     */
-    function mintNewPosition(
-        address token0,
-        address token1,
-        RangeConfig memory config,
-        int24 tickLower,
-        int24 tickUpper,
-        INonfungiblePositionManager positionManager,
-        address contractAddress
-    ) external returns (uint256 tokenId, uint128 liquidity) {
-        uint256 balance0 = IERC20(token0).balanceOf(contractAddress);
-        uint256 balance1 = IERC20(token1).balanceOf(contractAddress);
-        require(balance0 > 0 || balance1 > 0, "No tokens");
-
-        // Reset allowances a zero d'abord
-        IERC20(token0).safeApprove(address(positionManager), 0);
-        IERC20(token1).safeApprove(address(positionManager), 0);
-
-        // Puis set les nouvelles allowances
-        IERC20(token0).safeApprove(address(positionManager), balance0);
-        IERC20(token1).safeApprove(address(positionManager), balance1);
-
-        // DN rebalances may intentionally leave a token idle so the LP composition matches the fixed AAVE debt.
-        // Swap minOuts, oracle/pool/TWAP checks and the DN post-check still bound MEV and hedge drift.
-        INonfungiblePositionManager.MintParams memory mintParams = INonfungiblePositionManager.MintParams({
-            token0: token0,
-            token1: token1,
-            fee: config.fee,
-            tickLower: tickLower,
-            tickUpper: tickUpper,
-            amount0Desired: balance0,
-            amount1Desired: balance1,
-            amount0Min: 0,
-            amount1Min: 0,
-            recipient: contractAddress,
-            deadline: block.timestamp + 300
-        });
-
-        (tokenId, liquidity,,) = positionManager.mint(mintParams);
-
-        IERC20(token0).safeApprove(address(positionManager), 0);
-        IERC20(token1).safeApprove(address(positionManager), 0);
     }
 
     // audit V1 (M3-B-fix3, retour Codex) : collectAndRemoveLiquidity() SUPPRIMEE — helper externe mort (aucun
@@ -662,13 +576,13 @@ library RangeOperations {
         uint256 amountIn,
         uint256 minAmountOut,
         uint24 fee,
-        uint16 swapFeeBps,
-        address treasuryAddress,
         address contractAddress,
-        ISwapRouter swapRouter
+        ISwapRouter swapRouter,
+        uint160 sqrtPriceLimitX96
     ) external returns (uint256 amountOut) {
         require(amountIn > 0, "E45");
-        require(IERC20(tokenIn).balanceOf(contractAddress) >= amountIn, "E46");
+        uint256 balanceBefore = IERC20(tokenIn).balanceOf(contractAddress);
+        require(balanceBefore >= amountIn, "E46");
 
         amountOut = swapRouter.exactInputSingle(
             ISwapRouter.ExactInputSingleParams({
@@ -679,17 +593,12 @@ library RangeOperations {
                 deadline: block.timestamp,
                 amountIn: amountIn,
                 amountOutMinimum: minAmountOut,
-                sqrtPriceLimitX96: 0
+                sqrtPriceLimitX96: sqrtPriceLimitX96
             })
         );
-
-        if (swapFeeBps > 0 && treasuryAddress != address(0)) {
-            uint256 feeAmount = (amountOut * swapFeeBps) / 10000;
-            if (feeAmount > 0) {
-                IERC20(tokenOut).safeTransfer(treasuryAddress, feeAmount);
-                amountOut -= feeAmount;
-            }
-        }
+        // A non-zero sqrt limit can make an exact-input Uniswap swap stop early. Never let
+        // accounting or a rebalance continue as if the whole requested input was consumed.
+        if (balanceBefore - IERC20(tokenIn).balanceOf(contractAddress) != amountIn) revert PartialFill();
     }
 
     /// @notice Retrait partiel de liquidite + collecte vers le contrat (deplace depuis RangeManager).
@@ -835,6 +744,102 @@ library RangeOperations {
         return getSqrtRatioAtTick(tick);
     }
 
+    function _expectedLiquidityAmounts(
+        uint160 sqrtPriceX96,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amount0Desired,
+        uint256 amount1Desired
+    ) private pure returns (uint256 expected0, uint256 expected1) {
+        uint160 sqrtA = getSqrtRatioAtTick(tickLower);
+        uint160 sqrtB = getSqrtRatioAtTick(tickUpper);
+        uint256 liquidity;
+        if (sqrtPriceX96 <= sqrtA) {
+            uint256 intermediate = Math.mulDiv(sqrtA, sqrtB, 1 << 96);
+            liquidity = Math.mulDiv(amount0Desired, intermediate, sqrtB - sqrtA);
+        } else if (sqrtPriceX96 < sqrtB) {
+            uint256 intermediate = Math.mulDiv(sqrtPriceX96, sqrtB, 1 << 96);
+            uint256 liquidity0 = Math.mulDiv(amount0Desired, intermediate, sqrtB - sqrtPriceX96);
+            uint256 liquidity1 = Math.mulDiv(amount1Desired, 1 << 96, sqrtPriceX96 - sqrtA);
+            liquidity = liquidity0 < liquidity1 ? liquidity0 : liquidity1;
+        } else {
+            liquidity = Math.mulDiv(amount1Desired, 1 << 96, sqrtB - sqrtA);
+        }
+        if (liquidity > type(uint128).max) revert LiquidityCheck();
+        uint128 liquidity128 = uint128(liquidity);
+        if (sqrtPriceX96 <= sqrtA) {
+            expected0 = getAmount0ForLiquidity(sqrtA, sqrtB, liquidity128);
+        } else if (sqrtPriceX96 < sqrtB) {
+            expected0 = getAmount0ForLiquidity(sqrtPriceX96, sqrtB, liquidity128);
+            expected1 = getAmount1ForLiquidity(sqrtA, sqrtPriceX96, liquidity128);
+        } else {
+            expected1 = getAmount1ForLiquidity(sqrtA, sqrtB, liquidity128);
+        }
+    }
+
+    /// @dev Desired amounts include all free balances; minima only cover the amounts consumable by the range.
+    ///      An unmatched historical balance remains idle and cannot make mint/increase fail its own minimum.
+    function addLiquidityWithoutSwap(
+        address token0,
+        address token1,
+        uint256 tokenId,
+        INonfungiblePositionManager positionManager,
+        uint24 maxSlippageBps,
+        uint160 sqrtPriceX96
+    ) external returns (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) {
+        uint256 amount0Desired = IERC20(token0).balanceOf(address(this));
+        uint256 amount1Desired = IERC20(token1).balanceOf(address(this));
+        if (amount0Desired == 0 && amount1Desired == 0) revert LiquidityCheck();
+        (,,,,, int24 tickLower, int24 tickUpper,,,,,) = positionManager.positions(tokenId);
+        (uint256 amount0Min, uint256 amount1Min) =
+            _liquidityMins(sqrtPriceX96, tickLower, tickUpper, amount0Desired, amount1Desired, maxSlippageBps);
+        _approveLiquidity(token0, token1, address(positionManager), amount0Desired, amount1Desired);
+        (liquidity, amount0Added, amount1Added) = positionManager.increaseLiquidity(
+            INonfungiblePositionManager.IncreaseLiquidityParams({
+                tokenId: tokenId,
+                amount0Desired: amount0Desired,
+                amount1Desired: amount1Desired,
+                amount0Min: amount0Min,
+                amount1Min: amount1Min,
+                deadline: block.timestamp + 300
+            })
+        );
+        _approveLiquidity(token0, token1, address(positionManager), 0, 0);
+    }
+
+    function mintNewPosition(
+        address token0,
+        address token1,
+        RangeConfig calldata config,
+        int24 tickLower,
+        int24 tickUpper,
+        INonfungiblePositionManager positionManager,
+        uint160 sqrtPriceX96
+    ) external returns (uint256 tokenId, uint128 liquidity) {
+        uint256 amount0Desired = IERC20(token0).balanceOf(address(this));
+        uint256 amount1Desired = IERC20(token1).balanceOf(address(this));
+        if (amount0Desired == 0 && amount1Desired == 0) revert LiquidityCheck();
+        (uint256 amount0Min, uint256 amount1Min) =
+            _liquidityMins(sqrtPriceX96, tickLower, tickUpper, amount0Desired, amount1Desired, config.maxSlippageBps);
+        _approveLiquidity(token0, token1, address(positionManager), amount0Desired, amount1Desired);
+        (tokenId, liquidity,,) = positionManager.mint(
+            INonfungiblePositionManager.MintParams({
+                token0: token0,
+                token1: token1,
+                fee: config.fee,
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                amount0Desired: amount0Desired,
+                amount1Desired: amount1Desired,
+                amount0Min: amount0Min,
+                amount1Min: amount1Min,
+                recipient: address(this),
+                deadline: block.timestamp + 300
+            })
+        );
+        _approveLiquidity(token0, token1, address(positionManager), 0, 0);
+    }
+
     // Remplace TickMath.getSqrtRatioAtTick
     function getSqrtRatioAtTick(int24 tick) internal pure returns (uint160 sqrtPriceX96) {
         uint256 absTick = tick < 0 ? uint256(-int256(tick)) : uint256(int256(tick));
@@ -925,72 +930,36 @@ library RangeOperations {
         }
     }
 
-    /**
-     * @notice Helper pour récupérer les balances de deux tokens
-     */
-    function _getBalances(address token0, address token1, address contractAddress)
-        private
-        view
-        returns (uint256 balance0, uint256 balance1)
-    {
-        balance0 = IERC20(token0).balanceOf(contractAddress);
-        balance1 = IERC20(token1).balanceOf(contractAddress);
-    }
-
-    /**
-     * @notice Helper pour approuver et récupérer les nouvelles balances
-     */
-    function _approveAndGetBalances(
-        address token0,
-        address token1,
-        INonfungiblePositionManager positionManager,
-        address contractAddress
-    ) private returns (uint256 newBalance0, uint256 newBalance1) {
-        newBalance0 = IERC20(token0).balanceOf(contractAddress);
-        newBalance1 = IERC20(token1).balanceOf(contractAddress);
-
-        if (newBalance0 > 0) {
-            IERC20(token0).safeApprove(address(positionManager), 0);
-            IERC20(token0).safeApprove(address(positionManager), newBalance0);
-        }
-        if (newBalance1 > 0) {
-            IERC20(token1).safeApprove(address(positionManager), 0);
-            IERC20(token1).safeApprove(address(positionManager), newBalance1);
-        }
-    }
-
-    /**
-     * @notice Helper pour augmenter la liquidité d'une position
-     */
-    function _increaseLiquidity(
-        uint256 tokenId,
-        uint256 amount0Desired,
-        uint256 amount1Desired,
-        INonfungiblePositionManager positionManager,
-        uint24 maxSlippageBps
-    ) private returns (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) {
-        (liquidity, amount0Added, amount1Added) = positionManager.increaseLiquidity(
-            INonfungiblePositionManager.IncreaseLiquidityParams({
-                tokenId: tokenId,
-                amount0Desired: amount0Desired,
-                amount1Desired: amount1Desired,
-                amount0Min: _minWithSlippage(amount0Desired, maxSlippageBps),
-                amount1Min: _minWithSlippage(amount1Desired, maxSlippageBps),
-                deadline: block.timestamp + 300
-            })
-        );
-        address token0Addr;
-        address token1Addr;
-        (,, token0Addr, token1Addr,,,,,,,,) = positionManager.positions(tokenId);
-        IERC20(token0Addr).safeApprove(address(positionManager), 0);
-        IERC20(token1Addr).safeApprove(address(positionManager), 0);
-    }
-
     function _minWithSlippage(uint256 amount, uint24 slippageBps) private pure returns (uint256) {
         if (amount == 0) return 0;
-        require(slippageBps < 10000, "bad slippage");
+        if (slippageBps >= 10000) revert LiquidityCheck();
         uint256 slip = uint256(slippageBps);
-        return (amount * (10000 - slip)) / 10000;
+        uint256 minimum = (amount * (10000 - slip)) / 10000;
+        return minimum == 0 ? 1 : minimum;
+    }
+
+    function _liquidityMins(
+        uint160 sqrtPriceX96,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amount0Desired,
+        uint256 amount1Desired,
+        uint24 slippageBps
+    ) private pure returns (uint256 amount0Min, uint256 amount1Min) {
+        if (sqrtPriceX96 == 0) revert LiquidityCheck();
+        (uint256 expected0, uint256 expected1) =
+            _expectedLiquidityAmounts(sqrtPriceX96, tickLower, tickUpper, amount0Desired, amount1Desired);
+        amount0Min = _minWithSlippage(expected0, slippageBps);
+        amount1Min = _minWithSlippage(expected1, slippageBps);
+    }
+
+    function _approveLiquidity(address token0, address token1, address spender, uint256 amount0, uint256 amount1)
+        private
+    {
+        IERC20(token0).safeApprove(spender, 0);
+        IERC20(token1).safeApprove(spender, 0);
+        if (amount0 > 0) IERC20(token0).safeApprove(spender, amount0);
+        if (amount1 > 0) IERC20(token1).safeApprove(spender, amount1);
     }
 
     function _burnMinAmounts(
@@ -1070,7 +1039,8 @@ library RangeOperations {
      * @dev Gere correctement les nombres negatifs (ex: -196327 avec spacing 10 -> -196330)
      */
     function _floorToTickSpacing(int24 tick, int24 tickSpacing) private pure returns (int24) {
-        if (tick <= MIN_TICK) return MIN_TICK;
+        int24 minUsableTick = (MIN_TICK / tickSpacing) * tickSpacing;
+        if (tick <= minUsableTick) return minUsableTick;
         int24 remainder = tick % tickSpacing;
         if (remainder == 0) {
             return tick;
@@ -1083,7 +1053,7 @@ library RangeOperations {
         } else {
             rounded = tick - remainder;
         }
-        return rounded < MIN_TICK ? MIN_TICK : rounded;
+        return rounded < minUsableTick ? minUsableTick : rounded;
     }
 
     /**
@@ -1091,7 +1061,8 @@ library RangeOperations {
      * @dev Gere correctement les nombres negatifs (ex: -196323 avec spacing 10 -> -196320)
      */
     function _ceilToTickSpacing(int24 tick, int24 tickSpacing) private pure returns (int24) {
-        if (tick >= MAX_TICK) return MAX_TICK;
+        int24 maxUsableTick = (MAX_TICK / tickSpacing) * tickSpacing;
+        if (tick >= maxUsableTick) return maxUsableTick;
         int24 remainder = tick % tickSpacing;
         if (remainder == 0) {
             return tick;
@@ -1103,7 +1074,7 @@ library RangeOperations {
         } else {
             rounded = tick - remainder + tickSpacing;
         }
-        return rounded > MAX_TICK ? MAX_TICK : rounded;
+        return rounded > maxUsableTick ? maxUsableTick : rounded;
     }
 
     /**

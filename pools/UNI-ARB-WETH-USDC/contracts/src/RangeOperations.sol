@@ -36,6 +36,8 @@ interface IRmDeposit {
 library RangeOperations {
     using SafeERC20 for IERC20;
 
+    error PartialFill();
+
     int24 private constant MIN_TICK = -887272;
     int24 private constant MAX_TICK = 887272;
 
@@ -330,18 +332,16 @@ library RangeOperations {
         address token1,
         uint256 tokenId,
         INonfungiblePositionManager positionManager,
+        uint160 sqrtPriceX96,
         uint24 maxSlippageBps,
         address contractAddress
     ) external returns (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) {
-        // Récupérer et valider les balances
-        (uint256 balance0, uint256 balance1) = _getBalances(token0, token1, contractAddress);
-        require(balance0 > 0 || balance1 > 0, "No funds to add");
-
         // Approuver et ajouter la liquidité (PAS DE SWAP - fait avant via Velora)
         (uint256 newBalance0, uint256 newBalance1) =
             _approveAndGetBalances(token0, token1, positionManager, contractAddress);
+        require(newBalance0 > 0 || newBalance1 > 0, "No funds to add");
 
-        return _increaseLiquidity(tokenId, newBalance0, newBalance1, positionManager, maxSlippageBps);
+        return _increaseLiquidity(tokenId, newBalance0, newBalance1, positionManager, sqrtPriceX96, maxSlippageBps);
     }
 
     /**
@@ -448,9 +448,10 @@ library RangeOperations {
     ) external view returns (uint256 balance0, uint256 balance1) {
         balance0 = IERC20(token0).balanceOf(contractAddress);
         balance1 = IERC20(token1).balanceOf(contractAddress);
+        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
 
         for (uint256 i = 0; i < positions.length; i++) {
-            (uint256 pos0, uint256 pos1) = _getPositionBalance(positions[i], positionManager, pool);
+            (uint256 pos0, uint256 pos1) = _getPositionBalance(positions[i], positionManager, sqrtPriceX96);
             balance0 += pos0;
             balance1 += pos1;
         }
@@ -477,6 +478,7 @@ library RangeOperations {
         int24 tickLower,
         int24 tickUpper,
         INonfungiblePositionManager positionManager,
+        uint160 sqrtPriceX96,
         address contractAddress
     ) external returns (uint256 tokenId, uint128 liquidity) {
         uint256 balance0 = IERC20(token0).balanceOf(contractAddress);
@@ -491,6 +493,8 @@ library RangeOperations {
         IERC20(token0).safeApprove(address(positionManager), balance0);
         IERC20(token1).safeApprove(address(positionManager), balance1);
 
+        (uint256 amount0Min, uint256 amount1Min) =
+            _liquidityMins(tickLower, tickUpper, sqrtPriceX96, balance0, balance1, config.maxSlippageBps);
         INonfungiblePositionManager.MintParams memory mintParams = INonfungiblePositionManager.MintParams({
             token0: token0,
             token1: token1,
@@ -499,8 +503,8 @@ library RangeOperations {
             tickUpper: tickUpper,
             amount0Desired: balance0,
             amount1Desired: balance1,
-            amount0Min: _minWithSlippage(balance0, config.maxSlippageBps),
-            amount1Min: _minWithSlippage(balance1, config.maxSlippageBps),
+            amount0Min: amount0Min,
+            amount1Min: amount1Min,
             recipient: contractAddress,
             deadline: block.timestamp + 300
         });
@@ -647,13 +651,13 @@ library RangeOperations {
         uint256 amountIn,
         uint256 minAmountOut,
         uint24 fee,
-        uint16 swapFeeBps,
-        address treasuryAddress,
         address contractAddress,
-        ISwapRouter swapRouter
+        ISwapRouter swapRouter,
+        uint160 sqrtPriceLimitX96
     ) external returns (uint256 amountOut) {
         require(amountIn > 0, "E45");
-        require(IERC20(tokenIn).balanceOf(contractAddress) >= amountIn, "E46");
+        uint256 balanceBefore = IERC20(tokenIn).balanceOf(contractAddress);
+        require(balanceBefore >= amountIn, "E46");
 
         amountOut = swapRouter.exactInputSingle(
             ISwapRouter.ExactInputSingleParams({
@@ -664,17 +668,12 @@ library RangeOperations {
                 deadline: block.timestamp,
                 amountIn: amountIn,
                 amountOutMinimum: minAmountOut,
-                sqrtPriceLimitX96: 0
+                sqrtPriceLimitX96: sqrtPriceLimitX96
             })
         );
-
-        if (swapFeeBps > 0 && treasuryAddress != address(0)) {
-            uint256 feeAmount = (amountOut * swapFeeBps) / 10000;
-            if (feeAmount > 0) {
-                IERC20(tokenOut).safeTransfer(treasuryAddress, feeAmount);
-                amountOut -= feeAmount;
-            }
-        }
+        // A non-zero sqrt limit can make an exact-input Uniswap swap stop early. Never let
+        // accounting or a rebalance continue as if the whole requested input was consumed.
+        if (balanceBefore - IERC20(tokenIn).balanceOf(contractAddress) != amountIn) revert PartialFill();
     }
 
     /// @notice Retrait partiel de liquidite + collecte vers le contrat (deplace depuis RangeManager).
@@ -797,9 +796,9 @@ library RangeOperations {
         return ratio0;
     }
 
-    /// @notice AUDIT H-01/H-03 (pool standard) : plan de swap du PROCHAIN dépôt. État FUTUR = soldes LIBRES du
-    ///         RM + le dépôt ; ratio cible = NFT EXISTANT au prix courant (addLiquidityToPosition ajoute à CE
-    ///         range). PAS getOptimalSwapParams (état rebalance/post-burn). Renvoie (zeroForOne, amountIn natif).
+    /// @notice Plan de swap du PROCHAIN dépôt, isolé des soldes libres historiques du RangeManager.
+    /// @dev Seul l'apport courant finance le swap. Les donations, dust et fees déjà détenus par le RangeManager
+    ///      restent attribués aux shares existantes et ne peuvent ni bloquer la FIFO ni être dépensés par le keeper.
     function depositSwapParams(address rangeManager, uint256 depositAmount0, uint256 depositAmount1)
         external
         view
@@ -810,10 +809,8 @@ library RangeOperations {
         if (!valid) return (false, 0);
         (, uint8 dec0, uint8 dec1,,,,, uint16 rangeUpPercent, uint16 rangeDownPercent,) = rm.config();
 
-        uint256 free0 = IERC20(rm.token0()).balanceOf(rangeManager) + depositAmount0;
-        uint256 free1 = IERC20(rm.token1()).balanceOf(rangeManager) + depositAmount1;
-        uint256 v0 = (free0 * uint256(price0)) / (10 ** dec0);
-        uint256 v1 = (free1 * uint256(price1)) / (10 ** dec1);
+        uint256 v0 = (depositAmount0 * uint256(price0)) / (10 ** dec0);
+        uint256 v1 = (depositAmount1 * uint256(price1)) / (10 ** dec1);
         uint256 tot = v0 + v1;
         if (tot == 0) return (false, 0);
 
@@ -839,6 +836,11 @@ library RangeOperations {
             return (false, amountIn);
         }
         return (false, 0);
+    }
+
+    /// @notice Compact external TickMath wrapper used by the pool's SecureBotModule NAV view.
+    function sqrtRatioAtTickExt(int24 tick) external pure returns (uint160) {
+        return getSqrtRatioAtTick(tick);
     }
 
     // Remplace TickMath.getSqrtRatioAtTick
@@ -881,11 +883,7 @@ library RangeOperations {
 
         require(sqrtRatioAX96 > 0, "sqrtRatioA cannot be 0");
 
-        uint256 numerator = uint256(liquidity) << 96; // L * 2^96
-        uint256 part1 = numerator / sqrtRatioAX96;
-        uint256 part2 = numerator / sqrtRatioBX96;
-
-        return part1 - part2;
+        return Math.mulDiv(uint256(liquidity) << 96, sqrtRatioBX96 - sqrtRatioAX96, sqrtRatioBX96) / sqrtRatioAX96;
     }
 
     function getAmount1ForLiquidity(uint160 sqrtRatioAX96, uint160 sqrtRatioBX96, uint128 liquidity)
@@ -895,7 +893,7 @@ library RangeOperations {
     {
         if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
 
-        return uint256(liquidity) * (sqrtRatioBX96 - sqrtRatioAX96) >> 96;
+        return Math.mulDiv(liquidity, sqrtRatioBX96 - sqrtRatioAX96, uint256(1) << 96);
     }
 
     // ===== FONCTIONS PRIVEES =====
@@ -932,18 +930,6 @@ library RangeOperations {
     }
 
     /**
-     * @notice Helper pour récupérer les balances de deux tokens
-     */
-    function _getBalances(address token0, address token1, address contractAddress)
-        private
-        view
-        returns (uint256 balance0, uint256 balance1)
-    {
-        balance0 = IERC20(token0).balanceOf(contractAddress);
-        balance1 = IERC20(token1).balanceOf(contractAddress);
-    }
-
-    /**
      * @notice Helper pour approuver et récupérer les nouvelles balances
      */
     function _approveAndGetBalances(
@@ -973,23 +959,28 @@ library RangeOperations {
         uint256 amount0Desired,
         uint256 amount1Desired,
         INonfungiblePositionManager positionManager,
+        uint160 sqrtPriceX96,
         uint24 maxSlippageBps
     ) private returns (uint128 liquidity, uint256 amount0Added, uint256 amount1Added) {
+        address token0Addr;
+        address token1Addr;
+        int24 tickLower;
+        int24 tickUpper;
+        (,, token0Addr, token1Addr,, tickLower, tickUpper,,,,,) = positionManager.positions(tokenId);
+        (uint256 amount0Min, uint256 amount1Min) =
+            _liquidityMins(tickLower, tickUpper, sqrtPriceX96, amount0Desired, amount1Desired, maxSlippageBps);
         (liquidity, amount0Added, amount1Added) = positionManager.increaseLiquidity(
             INonfungiblePositionManager.IncreaseLiquidityParams({
                 tokenId: tokenId,
                 amount0Desired: amount0Desired,
                 amount1Desired: amount1Desired,
-                amount0Min: _minWithSlippage(amount0Desired, maxSlippageBps),
-                amount1Min: _minWithSlippage(amount1Desired, maxSlippageBps),
+                amount0Min: amount0Min,
+                amount1Min: amount1Min,
                 deadline: block.timestamp + 300
             })
         );
         // Clear any unused approval left after Uniswap consumed less than desired.
         // This keeps repeated LP operations safe without changing bot/keeper flows.
-        address token0Addr;
-        address token1Addr;
-        (,, token0Addr, token1Addr,,,,,,,,) = positionManager.positions(tokenId);
         IERC20(token0Addr).safeApprove(address(positionManager), 0);
         IERC20(token1Addr).safeApprove(address(positionManager), 0);
     }
@@ -998,7 +989,41 @@ library RangeOperations {
         if (amount == 0) return 0;
         require(slippageBps < 10000, "bad slippage");
         uint256 slip = uint256(slippageBps);
-        return (amount * (10000 - slip)) / 10000;
+        uint256 minAmount = Math.mulDiv(amount, 10000 - slip, 10000);
+        return minAmount == 0 ? 1 : minAmount;
+    }
+
+    /// @dev Mirrors Uniswap periphery's liquidity quote, then applies slippage to the amounts the
+    ///      position can actually consume. Unrelated one-sided balances remain free instead of
+    ///      making amountMin impossible to satisfy.
+    function _liquidityMins(
+        int24 tickLower,
+        int24 tickUpper,
+        uint160 sqrtPriceX96,
+        uint256 amount0Desired,
+        uint256 amount1Desired,
+        uint24 maxSlippageBps
+    ) private pure returns (uint256 amount0Min, uint256 amount1Min) {
+        uint160 sqrtA = getSqrtRatioAtTick(tickLower);
+        uint160 sqrtB = getSqrtRatioAtTick(tickUpper);
+        uint256 q96 = uint256(1) << 96;
+        uint256 liquidity;
+
+        if (sqrtPriceX96 <= sqrtA) {
+            liquidity = Math.mulDiv(amount0Desired, Math.mulDiv(sqrtA, sqrtB, q96), sqrtB - sqrtA);
+        } else if (sqrtPriceX96 < sqrtB) {
+            uint256 liquidity0 =
+                Math.mulDiv(amount0Desired, Math.mulDiv(sqrtPriceX96, sqrtB, q96), sqrtB - sqrtPriceX96);
+            uint256 liquidity1 = Math.mulDiv(amount1Desired, q96, sqrtPriceX96 - sqrtA);
+            liquidity = liquidity0 < liquidity1 ? liquidity0 : liquidity1;
+        } else {
+            liquidity = Math.mulDiv(amount1Desired, q96, sqrtB - sqrtA);
+        }
+
+        (uint256 expected0, uint256 expected1) =
+            _calculateLiquidityAmountsAtSqrt(tickLower, tickUpper, _safeUint128(liquidity), sqrtPriceX96);
+        amount0Min = _minWithSlippage(expected0, maxSlippageBps);
+        amount1Min = _minWithSlippage(expected1, maxSlippageBps);
     }
 
     function _burnMinAmounts(
@@ -1017,7 +1042,7 @@ library RangeOperations {
     /**
      * @notice Helper pour récupérer les balances d'une position
      */
-    function _getPositionBalance(uint256 tokenId, INonfungiblePositionManager positionManager, IUniswapV3Pool pool)
+    function _getPositionBalance(uint256 tokenId, INonfungiblePositionManager positionManager, uint160 sqrtPriceX96)
         private
         view
         returns (uint256 balance0, uint256 balance1)
@@ -1026,7 +1051,7 @@ library RangeOperations {
             positionManager.positions(tokenId);
 
         if (liquidity > 0) {
-            (balance0, balance1) = _calculateLiquidityAmounts(tickLower, tickUpper, liquidity, pool);
+            (balance0, balance1) = _calculateLiquidityAmountsAtSqrt(tickLower, tickUpper, liquidity, sqrtPriceX96);
         }
 
         balance0 += uint256(tokensOwed0);
@@ -1041,20 +1066,22 @@ library RangeOperations {
         view
         returns (uint256 amount0, uint256 amount1)
     {
-        (, int24 currentTick,,,,,) = pool.slot0();
+        (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
+        return _calculateLiquidityAmountsAtSqrt(tickLower, tickUpper, liquidity, sqrtPriceX96);
+    }
 
-        if (currentTick < tickLower) {
-            uint160 sqrtRatioAX96 = getSqrtRatioAtTick(tickLower);
-            uint160 sqrtRatioBX96 = getSqrtRatioAtTick(tickUpper);
+    function _calculateLiquidityAmountsAtSqrt(int24 tickLower, int24 tickUpper, uint128 liquidity, uint160 sqrtPriceX96)
+        private
+        pure
+        returns (uint256 amount0, uint256 amount1)
+    {
+        uint160 sqrtRatioAX96 = getSqrtRatioAtTick(tickLower);
+        uint160 sqrtRatioBX96 = getSqrtRatioAtTick(tickUpper);
+        if (sqrtPriceX96 <= sqrtRatioAX96) {
             return (getAmount0ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity), 0);
-        } else if (currentTick >= tickUpper) {
-            uint160 sqrtRatioAX96 = getSqrtRatioAtTick(tickLower);
-            uint160 sqrtRatioBX96 = getSqrtRatioAtTick(tickUpper);
+        } else if (sqrtPriceX96 >= sqrtRatioBX96) {
             return (0, getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity));
         } else {
-            (uint160 sqrtPriceX96,,,,,,) = pool.slot0();
-            uint160 sqrtRatioAX96 = getSqrtRatioAtTick(tickLower);
-            uint160 sqrtRatioBX96 = getSqrtRatioAtTick(tickUpper);
             return (
                 getAmount0ForLiquidity(sqrtPriceX96, sqrtRatioBX96, liquidity),
                 getAmount1ForLiquidity(sqrtRatioAX96, sqrtPriceX96, liquidity)
@@ -1078,7 +1105,8 @@ library RangeOperations {
      * @dev Gere correctement les nombres negatifs (ex: -196327 avec spacing 10 -> -196330)
      */
     function _floorToTickSpacing(int24 tick, int24 tickSpacing) private pure returns (int24) {
-        if (tick <= MIN_TICK) return MIN_TICK;
+        int24 minUsableTick = (MIN_TICK / tickSpacing) * tickSpacing;
+        if (tick <= minUsableTick) return minUsableTick;
         int24 remainder = tick % tickSpacing;
         if (remainder == 0) {
             return tick;
@@ -1091,7 +1119,7 @@ library RangeOperations {
         } else {
             rounded = tick - remainder;
         }
-        return rounded < MIN_TICK ? MIN_TICK : rounded;
+        return rounded < minUsableTick ? minUsableTick : rounded;
     }
 
     /**
@@ -1099,7 +1127,8 @@ library RangeOperations {
      * @dev Gere correctement les nombres negatifs (ex: -196323 avec spacing 10 -> -196320)
      */
     function _ceilToTickSpacing(int24 tick, int24 tickSpacing) private pure returns (int24) {
-        if (tick >= MAX_TICK) return MAX_TICK;
+        int24 maxUsableTick = (MAX_TICK / tickSpacing) * tickSpacing;
+        if (tick >= maxUsableTick) return maxUsableTick;
         int24 remainder = tick % tickSpacing;
         if (remainder == 0) {
             return tick;
@@ -1111,7 +1140,7 @@ library RangeOperations {
         } else {
             rounded = tick - remainder + tickSpacing;
         }
-        return rounded > MAX_TICK ? MAX_TICK : rounded;
+        return rounded > maxUsableTick ? maxUsableTick : rounded;
     }
 
     /**

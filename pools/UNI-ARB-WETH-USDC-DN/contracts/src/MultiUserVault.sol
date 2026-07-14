@@ -96,6 +96,10 @@ interface ITreasuryDeposit {
     function payDepositBounty(address keeper, uint256 depositValueUsd) external;
 }
 
+interface IBotNav {
+    function getOracleLpValueUsd() external view returns (uint256);
+}
+
 contract MultiUserVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -204,10 +208,38 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // SÉCURITÉ (audit V1 — DoS gas A) : pointeur de tête de file (O(1) par dépôt, cf. std). File vide quand
     // _pendingHead >= length ; compactage (delete + reset) une fois vidée.
     uint256 private _pendingHead;
+    mapping(address => uint256) private _pendingIndexPlusOne;
+    uint256 private _pendingTotal0;
+    uint256 private _pendingTotal1;
 
     function _pendingCount() internal view returns (uint256) {
         uint256 len = pendingDeposits.length;
         return len > _pendingHead ? len - _pendingHead : 0;
+    }
+
+    function _removePending(uint256 index, PendingDeposit memory pd) private {
+        hasPendingDeposit[pd.user] = false;
+        delete _pendingIndexPlusOne[pd.user];
+        _pendingTotal0 -= pd.amount0;
+        _pendingTotal1 -= pd.amount1;
+
+        uint256 head = _pendingHead;
+        uint256 last = pendingDeposits.length - 1;
+        if (index == head) {
+            _pendingHead = head + 1;
+        } else {
+            if (index != last) {
+                PendingDeposit memory moved = pendingDeposits[last];
+                pendingDeposits[index] = moved;
+                _pendingIndexPlusOne[moved.user] = index + 1;
+            }
+            pendingDeposits.pop();
+        }
+
+        if (_pendingHead >= pendingDeposits.length) {
+            delete pendingDeposits;
+            _pendingHead = 0;
+        }
     }
 
     uint256 public totalShares;
@@ -404,7 +436,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             || selector == bytes4(keccak256("configurePriceFeeds(address,address,address)"))
             || selector == bytes4(keccak256("sendTokenForHedge(address,uint256,address)"))
             || selector == bytes4(keccak256("setInitMultiSwapTvl(uint256)"))
-            || selector == bytes4(keccak256("setSwapFeeBps(uint16)"))
             || selector == bytes4(keccak256("setTreasuryAddress(address)"))
             || selector == bytes4(keccak256("setSafeAddress(address)"))
             || selector == bytes4(keccak256("setAuthorizedExecutor(address,bool)"));
@@ -468,6 +499,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         );
 
         hasPendingDeposit[msg.sender] = true;
+        _pendingIndexPlusOne[msg.sender] = pendingDeposits.length;
+        _pendingTotal0 += amount0;
+        _pendingTotal1 += amount1;
 
         emit PendingDepositAdded(msg.sender, amount0, amount1);
     }
@@ -482,13 +516,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         PendingDeposit memory pd = pendingDeposits[_pendingHead];
         if (block.timestamp < pd.timestamp + dnDepositRefundDelay) revert E_NOT_REFUNDABLE();
 
-        // Libérer le flag + avancer la tête (mêmes invariants que _processOneDeposit).
-        hasPendingDeposit[pd.user] = false;
-        _pendingHead++;
-        if (_pendingHead >= pendingDeposits.length) {
-            delete pendingDeposits;
-            _pendingHead = 0;
-        }
+        _removePending(_pendingHead, pd);
 
         // Rembourser le déposant (fonds encore détenus par le vault tant que non traités). Destinataire FIGÉ = pd.user.
         if (pd.amount0 > 0) token0.safeTransfer(pd.user, pd.amount0);
@@ -586,13 +614,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             token1.safeTransfer(address(rangeManager), pd.amount1);
         }
 
-        // Retirer ce dépôt : avancer la tête (O(1), audit V1 — DoS gas A) au lieu du shift O(n).
-        hasPendingDeposit[pd.user] = false;
-        _pendingHead++;
-        if (_pendingHead >= pendingDeposits.length) {
-            delete pendingDeposits;
-            _pendingHead = 0;
-        }
+        _removePending(_pendingHead, pd);
 
         return (pd, depositValue, currentTotalValue, totalSharesBefore);
     }
@@ -608,9 +630,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (creditedValue == 0) revert E_ZERO_SHARES();
 
         if (totalSharesBefore <= DEAD_SHARES) {
-            if (currentTotalValue != 0) revert E25();
             totalShares = 0;
-            sharesToMint = creditedValue * 1e10;
+            // A pre-mint donation is included in the initial share base, so dust cannot freeze the pool.
+            sharesToMint = (creditedValue + currentTotalValue) * 1e10;
             if (sharesToMint <= DEAD_SHARES) revert E24();
             sharesToMint -= DEAD_SHARES;
             totalShares = DEAD_SHARES;
@@ -883,7 +905,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 token0.safeTransfer(hedgeManager, wethBal);
             }
             IAaveHedgeSettlement(hedgeManager).settleProportional(
-                wethBal, (shareAmount * 1e18) / totalSharesBefore, isFullWithdraw, address(this)
+                wethBal, RangeOperations.mulDivUp(shareAmount, 1e18, totalSharesBefore), isFullWithdraw, address(this)
             );
         }
 
@@ -1075,16 +1097,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     ///      au-dessus qui porte le fail-closed). Separe de getCurrentPortfolioValue pour que le revert E73
     ///      (fail-closed hedge) ne soit pas capture par ces catch.
     function _lpPortfolioValue() private view returns (uint256) {
-        try rangeManager.getCurrentBalances() returns (uint256 bal0, uint256 bal1) {
-            try rangeManager.priceCache() returns (uint128 price0, uint128 price1, uint160, int24, uint64, bool valid) {
-                if (!valid) return 0;
-                RangeOperations.RangeConfig memory config = rangeManager.config();
-                uint256 value0 = (bal0 * uint256(price0)) / (10 ** config.token0Decimals);
-                uint256 value1 = (bal1 * uint256(price1)) / (10 ** config.token1Decimals);
-                return value0 + value1;
-            } catch {
-                return 0;
-            }
+        address module = botModule;
+        if (module == address(0)) return 0;
+        try IBotNav(module).getOracleLpValueUsd() returns (uint256 valueUsd) {
+            return valueUsd;
         } catch {
             return 0;
         }
@@ -1209,8 +1225,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                     liquidityToRemove = totalLiquidity;
                 } else {
                     // Retirer un pourcentage de liquidité proportionnel aux shares
-                    liquidityToRemove = (totalLiquidity * shareAmount) / (totalShares + shareAmount);
-                    if (liquidityToRemove == 0) revert E33();
+                    liquidityToRemove = RangeOperations.mulDivUp(totalLiquidity, shareAmount, totalShares + shareAmount);
                 }
             }
         }
@@ -1229,6 +1244,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (liquidityToRemove > 0 && tokenId > 0) {
             rangeManager.removeLiquidityForWithdraw(tokenId, uint128(liquidityToRemove));
         }
+        // Dernier utilisateur: le decrease/collect ci-dessus a vidé le NFT. Le burner puis le détracker
+        // dans la même transaction permet au prochain cycle (totalShares == DEAD_SHARES) de remint un range.
+        if (isFullWithdraw && tokenId > 0) rangeManager.burnPosition(tokenId);
 
         // ===== ETAPE 3 : TRANSFERER DEPUIS RANGEMANAGER VERS VAULT =====
         // SÉCURITÉ (audit V1) : on n'envoie QUE le principal proportionnel du user, borné par
@@ -1460,18 +1478,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             // avant le calcul proportionnel (deposit() transfère sur le vault avant traitement). Sinon un
             // user récupérerait une part d'un total gonflé par les pending d'autrui. Ses propres pending
             // sont ajoutés séparément à l'étape 2.
-            uint256 pend0;
-            uint256 pend1;
-            uint256 pendingLen = pendingDeposits.length;
-            for (uint256 i = _pendingHead; i < pendingLen; i++) {
-                // audit V1 DoS gas A
-                pend0 += pendingDeposits[i].amount0;
-                pend1 += pendingDeposits[i].amount1;
-            }
             uint256 raw0 = token0.balanceOf(address(this));
             uint256 raw1 = token1.balanceOf(address(this));
-            uint256 vBal0 = raw0 > pend0 ? raw0 - pend0 : 0;
-            uint256 vBal1 = raw1 > pend1 ? raw1 - pend1 : 0;
+            uint256 vBal0 = raw0 > _pendingTotal0 ? raw0 - _pendingTotal0 : 0;
+            uint256 vBal1 = raw1 > _pendingTotal1 ? raw1 - _pendingTotal1 : 0;
             uint256 rBal0 = token0.balanceOf(address(rangeManager));
             uint256 rBal1 = token1.balanceOf(address(rangeManager));
             uint256 share0 = ((vBal0 + rBal0) * userShares) / totalSharesBefore;
@@ -1488,27 +1498,24 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             userAmount1 += share1;
         }
 
-        // 2. Depots en attente (de _pendingHead à la fin — audit V1 DoS gas A)
+        // 2. Depot en attente: index direct + swap-and-pop, donc O(1).
         if (hasPendingDeposit[userAddress]) {
+            uint256 idx1 = _pendingIndexPlusOne[userAddress];
             uint256 len = pendingDeposits.length;
-            for (uint256 i = _pendingHead; i < len; i++) {
-                if (pendingDeposits[i].user == userAddress) {
-                    userAmount0 += pendingDeposits[i].amount0;
-                    userAmount1 += pendingDeposits[i].amount1;
-                    if (i < len - 1) {
-                        pendingDeposits[i] = pendingDeposits[len - 1];
-                    }
-                    pendingDeposits.pop();
-                    break;
-                }
-            }
-            hasPendingDeposit[userAddress] = false;
+            if (idx1 == 0 || idx1 <= _pendingHead || idx1 > len) revert E44();
+            uint256 i = idx1 - 1;
+            PendingDeposit memory pd = pendingDeposits[i];
+            if (pd.user != userAddress) revert E44();
+            userAmount0 += pd.amount0;
+            userAmount1 += pd.amount1;
+            _removePending(i, pd);
             delete userFeeDebtToken0[userAddress];
             delete userFeeDebtToken1[userAddress];
         }
 
         // 3. Settle hedge proportionnel pour pools DN
-        uint256 proportionX18 = totalSharesBefore > 0 ? (userShares * 1e18) / totalSharesBefore : 0;
+        uint256 proportionX18 =
+            totalSharesBefore > 0 ? RangeOperations.mulDivUp(userShares, 1e18, totalSharesBefore) : 0;
         bool isFullWithdraw = totalSharesBefore > userShares ? totalSharesBefore - userShares <= DEAD_SHARES : true;
 
         // 4. Mettre a jour les stats avant les appels externes.
@@ -1547,18 +1554,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // ATTENTE des AUTRES users. À ce stade, le pending de CE user a déjà été retiré de la queue
         // (étape 2) ; il reste donc sur le vault les pending des autres, à exclure. On borne le solde
         // disponible à (balanceOf − pending des autres) puis on plafonne par le dû du user.
-        uint256 otherPending0;
-        uint256 otherPending1;
-        uint256 otherPendingLen = pendingDeposits.length;
-        for (uint256 i = _pendingHead; i < otherPendingLen; i++) {
-            // audit V1 DoS gas A
-            otherPending0 += pendingDeposits[i].amount0;
-            otherPending1 += pendingDeposits[i].amount1;
-        }
         uint256 rawBal0 = token0.balanceOf(address(this));
         uint256 rawBal1 = token1.balanceOf(address(this));
-        uint256 bal0 = rawBal0 > otherPending0 ? rawBal0 - otherPending0 : 0;
-        uint256 bal1 = rawBal1 > otherPending1 ? rawBal1 - otherPending1 : 0;
+        uint256 bal0 = rawBal0 > _pendingTotal0 ? rawBal0 - _pendingTotal0 : 0;
+        uint256 bal1 = rawBal1 > _pendingTotal1 ? rawBal1 - _pendingTotal1 : 0;
         // AUDIT MED-1 : un SEUL chemin de plafonnement pour DN et std — toSend = min(dû user, solde dispo).
         // En DN, emergencySettleForVault envoie directement au user la part hedge récupérée; ce bloc ne paie
         // que la quote-part vault/RangeManager restante. Plus d'envoi de tout le solde disponible.
