@@ -78,7 +78,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     // Après un rebalance permissionless, le short net effectif doit ≈ targetShort (sinon le keeper a mal
     // dimensionné la composition LP). Constantes (pas de setter / SLOAD : économie EIP-170).
     uint16 private constant DN_REBAL_MAX_DRIFT_BPS = 300; // plafond fixe ; DnDepositLib applique dynamiquement min(plafond, seuil critique range)
-    uint256 private constant DN_REBAL_DUST_FLOOR_USD = 50e8; // 50 USD (8 déc) : sous ce target, pas de contrainte
+    uint256 private constant DN_REBAL_DUST_FLOOR_USD = 10e8; // 10 USD (8 déc) : ignore seulement le vrai dust
     // AUDIT H-06 : seuil de drift DN au-delà duquel un rebalance() permissionless est autorisé même si la LP est
     // in-range. Fallback si le divisor dynamique n'est pas lisible ; chemin normal = range/HEDGE_CRIT_RANGE_DIVISOR.
     uint16 private constant DN_REBAL_CRIT_DRIFT_BPS = 900;

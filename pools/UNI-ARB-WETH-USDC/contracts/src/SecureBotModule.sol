@@ -42,24 +42,6 @@ interface IRangeManagerBotState {
             uint32 maxPositions
         );
 
-    function getBotInstructions()
-        external
-        view
-        returns (bool hasPosition, uint256 tokenId, bool shouldRebalance, string memory action, string memory reason);
-
-    function getOptimalSwapParams()
-        external
-        view
-        returns (
-            bool swapNeeded,
-            bool zeroForOne,
-            uint256 amountIn,
-            uint256 currentBalance0,
-            uint256 currentBalance1,
-            uint256 targetRatio0Bps,
-            int24 tickLower,
-            int24 tickUpper
-        );
 }
 
 contract SecureBotModule {
@@ -79,32 +61,12 @@ contract SecureBotModule {
     uint256 public lastResetDay;
     bool public paused;
     bool public directExecution;
-    uint8 public botCycleState;
-    uint64 public botCycleUpdatedAt;
-    bool private cycleSwapPlanSet;
-    bool private cycleSwapZeroForOne;
-    uint256 private cycleSwapExpectedIn;
-    uint256 private cycleSwapSpentIn;
 
-    // Audit V3 (Point 2) : endRebalance() est EXEMPTE de la limite quotidienne dans executeVaultFunction.
-    // C'est un DEVERROUILLAGE (il ne deplace aucun fonds, il libere depots/retraits) : si la limite est
-    // atteinte un jour de forte activite, le vault ne doit JAMAIS rester verrouille. startRebalance()
-    // (qui verrouille) reste lui soumis a la limite. Le kill-switch module reste distinct : quand il est
-    // active, aucun relais privilegie bot ne passe ; la maintenance permissionless reste appelable en direct.
+    // endRebalance() est exempte de la limite quotidienne: ce deverrouillage ne deplace aucun fonds.
+    // Mints, depots et rebalances utilisent leurs entrees atomiques; l'ancien automate module
+    // start/burn/swap/mint n'est plus expose.
     bytes4 private constant END_REBALANCE_SELECTOR = 0x0040718e; // endRebalance()
-    bytes4 private constant START_REBALANCE_SELECTOR = 0x4dce7057; // startRebalance()
-    bytes4 private constant MINT_INITIAL_SELECTOR = 0x63ccfd0b; // mintInitialPosition()
-    bytes4 private constant BURN_SELECTOR = 0x38ca63bc; // burnPosition(uint256)
-    bytes4 private constant SWAP_SELECTOR = 0xb07391c0; // executeSwap(address,address,uint256,uint256)
-    bytes4 private constant ADD_LIQUIDITY_SELECTOR = 0x2a7cf2fe; // addLiquidityToPosition()
     bytes4 private constant REFRESH_PRICE_SELECTOR = 0x0be1c372; // refreshPriceCache()
-    uint8 private constant CYCLE_IDLE = 0;
-    uint8 private constant CYCLE_LOCKED = 1;
-    uint8 private constant CYCLE_REBALANCE_BURNED = 2;
-    uint8 private constant CYCLE_LOCKED_MAINTENANCE = 5;
-    // Marks an interrupted bot cycle as stale for alerts and lets the bot clear it after timeout.
-    // resetStaleBotCycle only resets local module state; it never moves funds or unlocks the Vault.
-    uint32 public constant BOT_CYCLE_TIMEOUT = 30 minutes;
 
     // Events
     event FunctionExecuted(bytes4 indexed selector, uint256 dailyCount);
@@ -115,7 +77,6 @@ contract SecureBotModule {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event ModuleSweep(address indexed token, uint256 amount);
-    event BotCycleStateUpdated(uint8 state, bytes4 indexed selector);
 
     constructor(
         address _safe,
@@ -147,9 +108,6 @@ contract SecureBotModule {
         // uniquement (une clé bot compromise pourrait empoisonner les prix). Le bot rafraîchit le cache
         // via refreshPriceCache() ci-dessous, qui ne change aucune adresse.
         allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
-        allowedFunctions[0x63ccfd0b] = true; // mintInitialPosition
-        allowedFunctions[0x38ca63bc] = true; // burnPosition (collecte fees + retire liquidite)
-        allowedFunctions[0xb07391c0] = true; // executeSwap (swaps via Uniswap V3)
         allowedFunctions[0x6ecfe0f8] = true; // recordPriceSnapshot() - snapshot de prix (fallback bot si aucun keeper)
         // Setters de stratégie/risk retirés du module: configureRanges, setDynamicRangeEnabled,
         // configureSlippage, configureProtections, configureTolerance.
@@ -159,10 +117,7 @@ contract SecureBotModule {
         // processSingleDeposit (0xac1df9bd) RETIRÉ de la whitelist : le bot traite désormais aussi le
         // mint initial standard via processDepositPermissionless(), en une transaction atomique bot-only.
         allowedFunctions[0x76919a59] = true; // processDepositPermissionless(uint256[],uint256[],address,address)
-        allowedFunctions[0x4dce7057] = true; // startRebalance()
         allowedFunctions[0x0040718e] = true; // endRebalance()
-        // Sélecteur RangeManager, exécuté via executeRangeManagerFunction (pas via executeVaultFunction).
-        allowedFunctions[0x2a7cf2fe] = true; // addLiquidityToPosition()
 
         // Fonctions Treasury (bridge Stargate v2 vers staking contract Phase 2)
         allowedFunctions[0xa5599124] = true; // bridgeToStakers(uint256)
@@ -262,26 +217,30 @@ contract SecureBotModule {
     /// @dev Reset journalier + incrementation du compteur sous la limite. Extrait du modifier pour
     ///      que executeVaultFunction puisse l'appeler conditionnellement (exemption endRebalance).
     function _consumeDailyLimit() private {
+        _resetDailyCounterIfNeeded();
+        require(dailySpent < dailyLimit, "Daily limit exceeded");
+        dailySpent++;
+    }
+
+    function _resetDailyCounterIfNeeded() private {
         uint256 currentDay = block.timestamp / 86400;
         if (currentDay != lastResetDay) {
             dailySpent = 0;
             lastResetDay = currentDay;
         }
-        require(dailySpent < dailyLimit, "Daily limit exceeded");
-        dailySpent++;
     }
 
     // Fonction existante pour RangeManager
     function executeRangeManagerFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
         bytes4 selector = bytes4(data[:4]);
         _requireInflowsForSelector(selector);
-        _beforeRangeManagerCall(selector, data);
         if (selector != REFRESH_PRICE_SELECTOR) {
             _consumeDailyLimit();
+        } else {
+            _resetDailyCounterIfNeeded();
         }
 
         _execute(rangeManager, 0, data);
-        _afterRangeManagerCall(selector);
 
         emit FunctionExecuted(selector, dailySpent);
     }
@@ -293,13 +252,13 @@ contract SecureBotModule {
         // Toutes les autres fonctions vault (dont startRebalance) restent soumises a la limite.
         bytes4 selector = bytes4(data[:4]);
         _requireInflowsForSelector(selector);
-        _beforeVaultCall(selector);
         if (selector != END_REBALANCE_SELECTOR) {
             _consumeDailyLimit();
+        } else {
+            _resetDailyCounterIfNeeded();
         }
 
         _execute(vault, 0, data);
-        _afterVaultCall(selector);
 
         emit FunctionExecuted(selector, dailySpent);
     }
@@ -383,22 +342,6 @@ contract SecureBotModule {
         emit OwnershipTransferred(oldOwner, owner);
     }
 
-    /// @notice Reset manuel du cycle bot si une suite multi-tx a ete interrompue hors-chain.
-    /// @dev Ne deplace aucun fonds et ne change aucune allowlist. Safe garde ce levier d'urgence en Phase 2.
-    function resetBotCycle() external {
-        require(msg.sender == owner || msg.sender == safe, "Only owner");
-        _setCycle(CYCLE_IDLE, 0x00000000);
-    }
-
-    /// @notice Let the hot bot clear an interrupted module cycle after timeout.
-    /// @dev Only resets the module's internal cycle state. The Vault lock, if any, remains controlled by Vault/Safe.
-    function resetStaleBotCycle() external onlyBot returns (bool reset) {
-        if (botCycleState == CYCLE_IDLE) return false;
-        if (block.timestamp <= uint256(botCycleUpdatedAt) + uint256(BOT_CYCLE_TIMEOUT)) return false;
-        _setCycle(CYCLE_IDLE, 0x00000000);
-        return true;
-    }
-
     function sweepNativeToSafe() external {
         require(msg.sender == owner || msg.sender == safe, "Only owner");
         uint256 amount = address(this).balance;
@@ -460,127 +403,6 @@ contract SecureBotModule {
         revert("Execution failed");
     }
 
-    function _beforeVaultCall(bytes4 selector) private {
-        if (selector == START_REBALANCE_SELECTOR) {
-            require(botCycleState == CYCLE_IDLE, "Bad cycle");
-            _requireVaultUnlocked();
-            _refreshRangeManagerCache();
-            _requireStartRebalanceTrigger();
-        }
-    }
-
-    function _afterVaultCall(bytes4 selector) private {
-        if (selector == START_REBALANCE_SELECTOR) {
-            _setCycle(CYCLE_LOCKED, selector);
-        } else if (selector == END_REBALANCE_SELECTOR) {
-            _setCycle(CYCLE_IDLE, selector);
-        }
-    }
-
-    function _beforeRangeManagerCall(bytes4 selector, bytes calldata data) private {
-        uint8 state = botCycleState;
-        if (selector == BURN_SELECTOR) {
-            require(state == CYCLE_LOCKED, "Bad cycle");
-            _refreshRangeManagerCache();
-            _requireRebalanceTrigger();
-        } else if (selector == SWAP_SELECTOR) {
-            require(
-                state == CYCLE_LOCKED || state == CYCLE_REBALANCE_BURNED || state == CYCLE_LOCKED_MAINTENANCE,
-                "Bad cycle"
-            );
-            _refreshRangeManagerCache();
-            _requireCycleSwapPlan(data);
-        } else if (selector == MINT_INITIAL_SELECTOR) {
-            require(
-                state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE || state == CYCLE_REBALANCE_BURNED,
-                "Bad cycle"
-            );
-            _refreshRangeManagerCache();
-            _requireSwapPlanCompleteOrNone();
-        } else if (selector == ADD_LIQUIDITY_SELECTOR) {
-            require(state == CYCLE_LOCKED || state == CYCLE_LOCKED_MAINTENANCE, "Bad cycle");
-            _refreshRangeManagerCache();
-            _requireSwapPlanCompleteOrNone();
-        }
-    }
-
-    function _afterRangeManagerCall(bytes4 selector) private {
-        uint8 state = botCycleState;
-        if (selector == BURN_SELECTOR) {
-            _setCycle(CYCLE_REBALANCE_BURNED, selector);
-        } else if (selector == SWAP_SELECTOR) {
-            if (state != CYCLE_LOCKED_MAINTENANCE) _setCycle(CYCLE_LOCKED_MAINTENANCE, selector);
-        } else if (selector == MINT_INITIAL_SELECTOR) {
-            _setCycle(CYCLE_LOCKED, selector);
-        } else if (selector == ADD_LIQUIDITY_SELECTOR) {
-            _setCycle(CYCLE_LOCKED, selector);
-        }
-    }
-
-    function _setCycle(uint8 state, bytes4 selector) private {
-        botCycleState = state;
-        botCycleUpdatedAt = uint64(block.timestamp);
-        if (state == CYCLE_IDLE || state == CYCLE_LOCKED || state == CYCLE_REBALANCE_BURNED) {
-            _clearCycleSwapPlan();
-        }
-        emit BotCycleStateUpdated(state, selector);
-    }
-
-    function _clearCycleSwapPlan() private {
-        cycleSwapPlanSet = false;
-        cycleSwapZeroForOne = false;
-        cycleSwapExpectedIn = 0;
-        cycleSwapSpentIn = 0;
-    }
-
-    function _refreshRangeManagerCache() private {
-        _execute(rangeManager, 0, abi.encodeWithSelector(REFRESH_PRICE_SELECTOR));
-    }
-
-    function _requireCycleSwapPlan(bytes calldata data) private {
-        (address tokenIn,, uint256 amountIn,) = abi.decode(data[4:], (address, address, uint256, uint256));
-        IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
-        bool tokenInIsToken0 = tokenIn == rm.token0();
-        if (!cycleSwapPlanSet) {
-            (bool swapNeeded, bool zeroForOne, uint256 expectedAmountIn,,,,,) = rm.getOptimalSwapParams();
-            require(swapNeeded && expectedAmountIn > 0, "No swap plan");
-            cycleSwapPlanSet = true;
-            cycleSwapZeroForOne = zeroForOne;
-            cycleSwapExpectedIn = expectedAmountIn;
-            cycleSwapSpentIn = 0;
-        }
-        require(tokenInIsToken0 == cycleSwapZeroForOne, "Bad swap dir");
-        uint256 tolerance = _cycleSwapTolerance(cycleSwapExpectedIn);
-        require(cycleSwapSpentIn + amountIn <= cycleSwapExpectedIn + tolerance, "Swap too high");
-        cycleSwapSpentIn += amountIn;
-    }
-
-    function _requireSwapPlanCompleteOrNone() private view {
-        if (cycleSwapPlanSet) {
-            uint256 tolerance = _cycleSwapTolerance(cycleSwapExpectedIn);
-            require(cycleSwapSpentIn + tolerance >= cycleSwapExpectedIn, "Swap too low");
-            return;
-        }
-        (bool swapNeeded,, uint256 expectedAmountIn,,,,,) = IRangeManagerBotState(rangeManager).getOptimalSwapParams();
-        require(!swapNeeded || expectedAmountIn == 0, "Swap missing");
-    }
-
-    function _cycleSwapTolerance(uint256 expectedAmountIn) private view returns (uint256 tolerance) {
-        (,,, uint16 toleranceBps,,,,,,) = IRangeManagerBotState(rangeManager).config();
-        tolerance = (expectedAmountIn * uint256(toleranceBps)) / 10000;
-        if (tolerance == 0) tolerance = 1;
-    }
-
-    function _requireRebalanceTrigger() private view {
-        (bool hasPosition,, bool shouldRebalance,,) = IRangeManagerBotState(rangeManager).getBotInstructions();
-        require(hasPosition && shouldRebalance, "No rebalance");
-    }
-
-    function _requireStartRebalanceTrigger() private view {
-        (bool hasPosition,, bool shouldRebalance,,) = IRangeManagerBotState(rangeManager).getBotInstructions();
-        require(!hasPosition || shouldRebalance, "No rebalance");
-    }
-
     // Fonctions de lecture
     function getDailyStats()
         external
@@ -599,17 +421,6 @@ contract SecureBotModule {
         return allowedFunctions[selector];
     }
 
-    function getBotCycleStatus()
-        external
-        view
-        returns (uint8 state, uint64 updatedAt, uint32 timeoutSeconds, bool stale)
-    {
-        state = botCycleState;
-        updatedAt = botCycleUpdatedAt;
-        timeoutSeconds = BOT_CYCLE_TIMEOUT;
-        stale = state != CYCLE_IDLE && block.timestamp > uint256(updatedAt) + uint256(timeoutSeconds);
-    }
-
     function _requireInflowsForSelector(bytes4 selector) private view {
         if (
             selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
@@ -626,21 +437,11 @@ contract SecureBotModule {
         }
     }
 
-    function _requireVaultUnlocked() private view {
-        (bool ok, bytes memory ret) = vault.staticcall(abi.encodeWithSelector(0xab8d23bd)); // isRebalancing()
-        require(ok && ret.length >= 32 && !abi.decode(ret, (bool)), "Vault locked");
-    }
-
     function _isCoreSelector(bytes4 selector) private pure returns (bool) {
         return selector == 0x0be1c372 // refreshPriceCache()
-            || selector == 0x63ccfd0b // mintInitialPosition()
-            || selector == 0x38ca63bc // burnPosition(uint256)
-            || selector == 0xb07391c0 // executeSwap(address,address,uint256,uint256)
             || selector == 0x6ecfe0f8 // recordPriceSnapshot()
             || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
-            || selector == 0x4dce7057 // startRebalance()
             || selector == 0x0040718e // endRebalance()
-            || selector == 0x2a7cf2fe // addLiquidityToPosition()
             || selector == 0xa5599124 // bridgeToStakers(uint256)
             || selector == 0x56a12aca // distributeToStakers(uint256)
             || selector == 0x1dc28748; // collectAndBridge(address,uint24,uint256,uint256)

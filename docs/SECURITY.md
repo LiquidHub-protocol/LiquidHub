@@ -22,10 +22,10 @@ The `SecureBotModule` is a Gnosis Safe module that whitelists specific function 
 
 **Whitelisted operations (high-level):**
 
-- Operational module actions only: queued deposit processing, snapshots, cache refresh, module-mediated cycle
-  recovery, and treasury distribution/bridge calls when enabled.
-- Standard pool legacy primitives may remain available for controlled bot cycles, but the nominal rebalance path is
-  the atomic public `RangeManager.rebalance(...)` entrypoint.
+- Operational module actions only: atomic queued-deposit processing, snapshots, cache refresh, and Treasury
+  distribution/bridge calls when enabled.
+- Both pool variants use the atomic public `RangeManager.rebalance(...)` entrypoint. Legacy multi-transaction
+  primitives are excluded from the module core-selector set and cannot be re-enabled through `allowFunction()`.
 - Refresh the price cache (`refreshPriceCache`, no address change) — oracle **addresses** themselves can only be
   set by the Safe (`configurePriceFeeds` / `setOracleParams` are Safe-only, not in the module)
 - Record price snapshots (dynamic-range ring buffer; bot fallback when no keeper acts)
@@ -151,9 +151,7 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 | Function | Access | Description |
 |----------|--------|-------------|
 | `rebalance()` | Public (permissionless) | Atomic burn → swaps → mint; protected by the refresh + deviation guard, oracle-bounded `minAmountsOut`, exact-input consumption checks, and the on-chain rebalance-needed condition |
-| `executeSwap()` | `onlyAuthorized` | Operational executor/module only; refreshes the cache + enforces the oracle floor |
-| `mintInitialPosition()` | `onlyAuthorized` | Operational executor/module only; refreshes the cache + deviation guard before minting |
-| `burnPosition()` | `onlyVaultOrAuthorized` | Vault or operational executor/module; tokens stay in the protocol flow |
+| `executeSwap()` / `mintInitialPosition()` / `burnPosition()` | Restricted legacy primitives | Excluded from the `SecureBotModule`; production deposits use `processDepositPermissionless()` and rebalances use atomic `rebalance()` |
 | `configurePriceFeeds()` / `setOracleParams()` | Vault owner relay | Governance settings via `MultiUserVault.executeRangeManagerGovernance(bytes)`: Safe in phase 1, Timelock in phase 2 |
 | `refreshPriceCache()` | Public | Refreshes the price cache (no address change) |
 | `configureRanges()` | Vault owner relay | Governance setting via Safe/Timelock relay, not the bot module |

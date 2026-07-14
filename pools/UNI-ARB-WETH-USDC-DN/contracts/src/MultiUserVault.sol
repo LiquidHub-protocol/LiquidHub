@@ -621,12 +621,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     function _finalizeProcessedDeposit(
         PendingDeposit memory pd,
-        uint256 depositValue,
-        uint256 swapLossUsd,
+        uint256 creditedValue,
         uint256 currentTotalValue,
         uint256 totalSharesBefore
     ) private returns (uint256 sharesToMint) {
-        uint256 creditedValue = depositValue > swapLossUsd ? depositValue - swapLossUsd : 0;
         if (creditedValue == 0) revert E_ZERO_SHARES();
 
         if (totalSharesBefore <= DEAD_SHARES) {
@@ -749,7 +747,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
 
         // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk
-        (uint256 swapLossUsd, uint256 incumbentLossUsd) = DnDepositLib.executeDepositSwaps(
+        DnDepositLib.executeDepositSwaps(
             address(rangeManager),
             address(token0),
             swapAmountsIn,
@@ -759,13 +757,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             price0,
             price1,
             cfg.token0Decimals,
-            cfg.token1Decimals,
-            tokenIn == address(token0) ? pd.amount0 : pd.amount1
+            cfg.token1Decimals
         );
-        if (incumbentLossUsd > 0) {
-            if (incumbentLossUsd >= valueBefore) revert E25();
-            valueBefore -= incumbentLossUsd;
-        }
 
         // 7. Ajouter a la position existante, ou minter la position initiale après hedge + swaps.
         if (hasPosition) rangeManager.addLiquidityToPosition();
@@ -784,7 +777,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             );
         }
 
-        _finalizeProcessedDeposit(pd, depositValue, swapLossUsd, valueBefore, sharesBefore);
+        // Shares are based on the real NAV increase after hedge, swaps and LP mint/add. This attributes
+        // every execution cost induced by this deposit to the depositor, including swaps of freshly
+        // borrowed token0, without socializing that loss to existing holders.
+        uint256 valueAfter = getCurrentPortfolioValue();
+        uint256 creditedValue = valueAfter > valueBefore ? valueAfter - valueBefore : 0;
+        _finalizeProcessedDeposit(pd, creditedValue, valueBefore, sharesBefore);
 
         // 8. DEVERROU
         _processingRebalance = false;

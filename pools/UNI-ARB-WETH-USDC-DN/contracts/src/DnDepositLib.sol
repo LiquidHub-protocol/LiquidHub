@@ -162,11 +162,8 @@ library DnDepositLib {
         uint128 price0,
         uint128 price1,
         uint8 dec0,
-        uint8 dec1,
-        uint256 depositTokenIn
-    ) external returns (uint256 depositLossUsd, uint256 incumbentLossUsd) {
-        uint256 totalLossUsd;
-        uint256 totalIn;
+        uint8 dec1
+    ) external returns (uint256 totalLossUsd) {
         bool zeroForOne = tokenIn == token0;
         uint256 n = amountsIn.length;
         for (uint256 i; i < n; i++) {
@@ -174,12 +171,6 @@ library DnDepositLib {
             uint256 valueIn = zeroForOne ? _toUsd(amountsIn[i], price0, dec0) : _toUsd(amountsIn[i], price1, dec1);
             uint256 valueOut = zeroForOne ? _toUsd(amountOut, price1, dec1) : _toUsd(amountOut, price0, dec0);
             if (valueIn > valueOut) totalLossUsd += valueIn - valueOut;
-            totalIn += amountsIn[i];
-        }
-        depositLossUsd = totalLossUsd;
-        if (depositTokenIn < totalIn) {
-            depositLossUsd = (totalLossUsd * depositTokenIn) / totalIn;
-            incumbentLossUsd = totalLossUsd - depositLossUsd;
         }
     }
 
