@@ -1048,9 +1048,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // swaps (plancher minOut), mais la barrière de déviation ne dépend plus de la présence de swaps.
 
         // Verify rebalance is needed — soit le range l'exige, soit (AUDIT H-06) le hedge DN a dérivé de façon
-        // CRITIQUE alors que la LP est encore in-range. Sans ce 2e déclencheur, un sous-hedge sévère ne pourrait
-        // être corrigé par personne en permissionless (adjustHedge revert UnderHedged ; rebalance exigeait
-        // uniquement un besoin de range). Le rebalance reconstruit alors la composition LP pour viser la cible,
+        // CRITIQUE alors que la LP est encore in-range. Ce second chemin reste le fallback permissionless si
+        // adjustHedge ne peut pas satisfaire le HF ou si de gros soldes token0 idle exigent une recomposition.
+        // Le rebalance reconstruit alors la composition LP pour viser la cible,
         // et le post-check DN (étape 4b) garantit que le résultat est dans la tolérance (sinon toute la tx revert).
         (bool hasPosition, uint256 tokenId, bool _needsRebalance,,) = _botInstructions();
         // collect() pousse le feeGrowth latent avant le drift et le plan DN. Si la decision refuse le

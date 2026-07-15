@@ -260,11 +260,10 @@ async function main() {
 
       // --- Hedge adjustment (permissionless, hedge bounty) ---
       // DN refactor: adjustHedge() pilots on the net effective short (debt - free WETH HM - free WETH RM)
-      // vs target (hedgeTargetBps × wethInLP). It only corrects an OVER-HEDGE (repay excess, WETH bought
-      // on the market). On an UNDER-HEDGE it REVERTS (custom error UnderHedged) — the staticCall below
-      // catches it so we never send a tx for nothing. It also REVERTS when drift is below the dynamic
-      // range-width threshold returned by adjustHedgeBps(), or when the
-      // on-chain cooldown (hedgeAdjustCooldown) has not elapsed. A successful (over-hedge) call earns the bounty.
+      // vs target (hedgeTargetBps × token0InLP). It corrects both directions atomically with no keeper-provided
+      // sizing: flash-repay for over-hedge, borrow + oracle-bounded sale + collateral supply for under-hedge.
+      // The staticCall prevents a transaction when drift is below the dynamic threshold, cooldown is active,
+      // or a safety post-condition cannot be met. Every successful correction can earn the bounty.
       if (!CHECK_ONLY && hedgeManager && wallet) {
         try {
           // Always simulate the on-chain action. adjustHedge() itself applies the normal cooldown, while
@@ -287,7 +286,7 @@ async function main() {
           }, 'adjustHedge');
           console.log(`  -> Hedge adjusted: ${rcpt.hash}`);
         } catch (e) {
-          // Revert is expected here: under-hedge, drift below threshold, or normal cooldown. Not fatal.
+          // Revert is expected here for low drift, normal cooldown, or an unmet safety condition. Not fatal.
           console.log(`  Hedge: no adjustment (${(e.reason || e.message || '').slice(0, 80)})`);
         }
       }

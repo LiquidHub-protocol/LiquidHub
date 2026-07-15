@@ -66,10 +66,8 @@ contract AaveHedgeManager is ReentrancyGuard {
     // Reconstitution de reserve apres repay (HF cible). L'USDC libere reste sur ce contrat (reserve).
     uint16 public reserveHfTargetBps; // HF cible apres reconstitution, ex 14000 = 1.4
     uint16 public liqThresholdBps; // seuil de liquidation du collateral (AAVE), ex 8500 = 0.85
-    // Cooldown on-chain entre deux reajustements (borrow OU repay). S'applique aux KEEPERS via
-    // adjustHedge() permissionless ET au bot quand il passe par adjustHedge(). Le canal botModule
-    // direct (borrowMore/repayDebt) N'EST PAS bloque par ce cooldown : c'est la voie surge du bot.
-    // Tout reajustement (keeper ou bot) met a jour lastHedgeAdjustAt pour synchroniser le cooldown.
+    // Cooldown on-chain entre deux reajustements. S'applique de facon identique aux keepers et au bot
+    // via adjustHedge(); aucun canal hot-key ne permet de contourner ce garde-fou.
     uint32 public hedgeAdjustCooldown; // secondes entre deux adjustHedge() (0 = desactive)
     uint64 public lastHedgeAdjustAt; // timestamp du dernier reajustement (borrow ou repay)
     // audit V1 (V3-R4 Point 2) : ecart MAX tolere entre le prix LP (slot0 du pool) et le ratio ORACLE
@@ -95,10 +93,6 @@ contract AaveHedgeManager is ReentrancyGuard {
     // fausse effectiveShort. En-dessous de ce seuil, le token0 libre du RM est IGNORE (anti-grief donation).
     uint256 public donationDustToken0;
 
-    // Custom error sous-hedge : adjustHedge() permissionless ne corrige PAS le sous-hedge (il faudrait
-    // modifier la LP, ce qu'il ne peut pas). Il REVERT -> le staticCall du keeper l'attrape (0 gas, 0 bounty).
-    // La correction du sous-hedge passe par le chemin rebalance() permissionless (solveur). int256 : effective peut etre < 0.
-    error UnderHedged(uint256 targetShort, int256 effectiveShort);
     error BadHealthFactor();
     error HedgeCheck(uint8 code);
 
@@ -106,7 +100,6 @@ contract AaveHedgeManager is ReentrancyGuard {
 
     // ===== EVENTS =====
     event SupplyAndBorrow(uint256 usdcSupplied, uint256 wethBorrowed);
-    event BorrowMore(uint256 wethBorrowed);
     event RepayAndWithdraw(uint256 wethRepaid, uint256 usdcWithdrawn);
     event RepayDebt(uint256 wethRepaid);
     event WithdrawCollateral(uint256 usdcWithdrawn, address to);
@@ -212,8 +205,9 @@ contract AaveHedgeManager is ReentrancyGuard {
         // Approve max token1 and token0 to AAVE Pool for supply/repay
         IERC20(_usdc).safeApprove(_pool, type(uint256).max);
         IERC20(_weth).safeApprove(_pool, type(uint256).max);
-        // Approve max token1 to SwapRouter for flash loan token1->token0 swap
+        // Approve both pair tokens to SwapRouter for the oracle-bounded hedge adjustments.
         IERC20(_usdc).safeApprove(_swapRouter, type(uint256).max);
+        IERC20(_weth).safeApprove(_swapRouter, type(uint256).max);
     }
 
     // ===== ATOMIC SETTLEMENT (called by Vault during withdraw) =====
@@ -434,34 +428,6 @@ contract AaveHedgeManager is ReentrancyGuard {
         emit SupplyAndBorrow(collateralAmountUsdc, borrowAmountWeth);
     }
 
-    /// @notice Borrow additional WETH (after new collateral has been supplied)
-    /// @dev Used when ETH exposure increases after rebalance or new deposit
-    /// @param borrowAmountWeth Amount of WETH to borrow additionally
-    function borrowMore(uint256 borrowAmountWeth) external onlyBotModule nonReentrant {
-        _doBorrowMore(borrowAmountWeth);
-    }
-
-    /// @dev Coeur de borrowMore, reutilise par adjustHedge (permissionless). Pas de modifier.
-    function _doBorrowMore(uint256 borrowAmountWeth) private {
-        if (borrowAmountWeth == 0) revert HedgeCheck(23);
-
-        // Supply any pending USDC first (if vault sent more collateral)
-        uint256 usdcBalance = usdc.balanceOf(address(this));
-        if (usdcBalance > 0) {
-            pool.supply(address(usdc), usdcBalance, address(this), 0);
-        }
-
-        // Borrow more WETH
-        pool.borrow(address(weth), borrowAmountWeth, 2, 0, address(this));
-        _requireHfMin();
-
-        // Repousser le cooldown adjustHedge: un reajustement (keeper OU bot via onlySafe) vient
-        // d'avoir lieu, le prochain adjustHedge() permissionless devra attendre hedgeAdjustCooldown.
-        lastHedgeAdjustAt = uint64(block.timestamp);
-
-        emit BorrowMore(borrowAmountWeth);
-    }
-
     function _requireHfMin() private view {
         (,,,,, uint256 hf) = pool.getUserAccountData(address(this));
         if (hf < uint256(reserveHfTargetBps) * 1e14) revert BadHealthFactor();
@@ -644,16 +610,15 @@ contract AaveHedgeManager is ReentrancyGuard {
         botModule = newModule;
     }
 
-    /// @notice Reajuste le hedge AAVE de facon permissionless pour resorber un over-hedge.
+    /// @notice Reajuste le hedge AAVE de facon permissionless dans les deux directions.
     /// @dev Pilotage sur le SHORT NET EFFECTIF (effectiveShort = dette - token0 libre HM - token0 libre RM),
     ///      pas la dette brute. Cible = hedgeTargetBps/10000 * token0InLP (gouvernee, defaut 100% = DN strict ;
     ///      H_opt RETIRE). Le keeper ne fournit AUCUN parametre de decision.
-    ///      - UNDER-HEDGED : le rebalance permissionless reconstruit la LP des le seuil dynamique adjust.
-    ///      - OVER-HEDGED (effectiveShort > targetShort) : repay de l'exces, token0 achete AU MARCHE (oracle-borne),
-    ///        JAMAIS depuis le buffer idle (repay-buffer = no-op delta). Bounty paye ici seulement.
+    ///      - UNDER-HEDGED : emprunte l'ecart, vend atomiquement ce token0 avec plancher oracle/TWAP puis
+    ///        fournit le token1 recu a AAVE. Aucun token0 emprunte ne reste idle.
+    ///      - OVER-HEDGED : flash-repay de l'exces avant de retirer le collateral necessaire au swap de
+    ///        remboursement. Cela reste fonctionnel meme lorsque le HF cible interdit tout retrait prealable.
     ///      Garde-fous : require(drift>=seuil dynamique range/divisor) ET cooldown ecoule. Verifie le HF apres action.
-    ///      Le canal botModule/direct (borrowMore/repayDebt) du bot n'est PAS soumis au cooldown (voie surge) ;
-    ///      le rebalance-solveur est la voie de correction du sous-hedge sans augmenter la dette AAVE.
     function adjustHedge() external nonReentrant {
         if (rangeManager == address(0) || adjustHedgeRangeDivisor == 0) revert HedgeCheck(40);
 
@@ -677,8 +642,7 @@ contract AaveHedgeManager is ReentrancyGuard {
         }
 
         // 0. Cooldown on-chain (keepers + bot via ce chemin): limite la frequence des reajustements
-        // permissionless. Verifie EN TETE pour echouer tot (gas) avant la lecture LP. Le bot conserve
-        // un canal surge non bride via borrowMore/repayDebt botModule (qui ne portent pas ce require).
+        // permissionless. Verifie EN TETE pour echouer tot (gas) avant la lecture LP.
         if (block.timestamp < uint256(lastHedgeAdjustAt) + uint256(hedgeAdjustCooldown)) revert HedgeCheck(41);
 
         // Cristallise feeGrowth + rafraichit l'oracle dans le RangeManager, atomiquement avec la decision.
@@ -714,8 +678,14 @@ contract AaveHedgeManager is ReentrancyGuard {
         (uint256 currentDebtWeth, int256 effectiveShort) =
             DnDepositLib.aaveEffectiveShort(address(variableDebtWeth), address(weth), rangeManager, donationDustToken0);
 
-        if (effectiveShort < int256(targetShort)) revert UnderHedged(targetShort, effectiveShort);
-        uint256 diff = uint256(effectiveShort - int256(targetShort));
+        // Une exposition nette negative signifie que les soldes token0 idle depassent la dette (donation,
+        // fees non reinvesties ou etat transitoire). Ne jamais emprunter un montant dicte par ces soldes:
+        // le rebalance atomique doit d'abord les integrer a la composition LP.
+        if (effectiveShort < 0) revert HedgeCheck(57);
+        bool borrowed = effectiveShort < int256(targetShort);
+        uint256 diff = borrowed
+            ? uint256(int256(targetShort) - effectiveShort)
+            : uint256(effectiveShort - int256(targetShort));
         if (targetShort == 0) {
             if (diff <= donationDustToken0) revert HedgeCheck(44);
         } else {
@@ -723,11 +693,16 @@ contract AaveHedgeManager is ReentrancyGuard {
             if (driftBps < uint256(_dynamicHedgeBps(adjustHedgeRangeDivisor, 100))) revert HedgeCheck(44);
         }
 
-        // Acheter le token0 de repay au marche: consommer le buffer idle serait un no-op delta.
-        _acquireWethForRepay(diff);
-        _doRepayDebt(diff);
+        if (borrowed) {
+            _increaseEffectiveShort(diff);
+        } else {
+            // Repay d'abord grace au flash loan, puis seulement retirer le collateral rendu disponible.
+            _flashLoanActive = true;
+            pool.flashLoanSimple(address(this), address(weth), diff, abi.encode(diff, 0, false, address(0), 0), 0);
+            _flashLoanActive = false;
+        }
 
-        // Reset du cooldown : un VRAI ajustement delta (over-hedge corrige) vient d'avoir lieu.
+        // Reset du cooldown : un vrai ajustement du delta vient d'avoir lieu.
         lastHedgeAdjustAt = uint64(block.timestamp);
 
         _rebuildReserve();
@@ -739,7 +714,7 @@ contract AaveHedgeManager is ReentrancyGuard {
             try IHedgeTreasury(treasuryAddress).payHedgeBounty(msg.sender) {} catch {}
         }
 
-        emit HedgeAdjusted(currentDebtWeth, targetShort, false, msg.sender);
+        emit HedgeAdjusted(currentDebtWeth, targetShort, borrowed, msg.sender);
     }
 
     /// @dev Apres un repay, libere le collateral AAVE excedentaire (au-dela du HF cible) vers ce
@@ -782,11 +757,8 @@ contract AaveHedgeManager is ReentrancyGuard {
         if (share > 0) usdc.safeTransfer(recipient, share);
     }
 
-    /// @dev Obtient `wethNeeded` token0 pour le repay en swappant du token1 (retire d'AAVE si besoin),
-    ///      avec protection de slippage via le ratio oracle token0/token1 du RangeManager.
     /// @dev Plafond token1 (anti-sandwich) pour acheter `wethNeeded` token0 : coût théorique oracle majoré
-    ///      du slippage toléré. Réutilisé par _acquireWethForRepay ET par le callback flash loan
-    ///      executeOperation (audit V1 — High 3 : le callback utilisait balanceOf entier, sandwichable).
+    ///      du slippage toléré. Utilisé par les callbacks flash loan de settlement et d'ajustement.
     function _oracleMaxUsdcForWeth(uint256 wethNeeded)
         private
         returns (uint256 amountInMaximum, uint160 sqrtPriceLimitX96)
@@ -806,7 +778,7 @@ contract AaveHedgeManager is ReentrancyGuard {
             budget, amountInMaximum, address(pool), address(aTokenUsdc), liqThresholdBps, reserveHfTargetBps
         );
         if (toWithdraw > 0) pool.withdraw(address(usdc), toWithdraw, address(this));
-        if (capped < amountInMaximum || usdc.balanceOf(address(this)) < amountInMaximum) revert HedgeCheck(55);
+        if (capped < amountInMaximum || usdc.balanceOf(address(this)) < amountInMaximum) revert HedgeCheck(58);
         swapRouter.exactOutputSingle(
             ISwapRouter.ExactOutputSingleParams({
                 tokenIn: address(usdc),
@@ -821,39 +793,35 @@ contract AaveHedgeManager is ReentrancyGuard {
         );
     }
 
-    function _acquireWethForRepay(uint256 wethNeeded) private {
-        // Cout theorique majore du slippage (plafond anti-sandwich via oracle Chainlink).
-        (uint256 amountInMaximum, uint160 sqrtPriceLimitX96) = _oracleMaxUsdcForWeth(wethNeeded);
-
-        // Compléter le budget depuis AAVE uniquement dans la limite compatible avec le HF cible.
-        // En stress HF, adjustHedge doit fail-closed plutôt que retirer du collatéral qui aggrave le risque.
-        uint256 budget = usdc.balanceOf(address(this));
-        if (budget < amountInMaximum) {
-            _refreshRangePriceCache();
-            uint256 toWithdraw;
-            (amountInMaximum, toWithdraw) = DnDepositLib.aaveHfSafeSwapBudget(
-                budget, amountInMaximum, address(pool), address(aTokenUsdc), liqThresholdBps, reserveHfTargetBps
-            );
-            if (toWithdraw > 0) {
-                pool.withdraw(address(usdc), toWithdraw, address(this));
-            }
-        }
-        if (amountInMaximum == 0) revert HedgeCheck(46);
-
-        // exactOutputSingle: obtenir exactement wethNeeded token0, en depensant au plus amountInMaximum token1
-        // (revert si le marche est plus defavorable que oracle + slippage => protection anti-sandwich)
-        swapRouter.exactOutputSingle(
-            ISwapRouter.ExactOutputSingleParams({
-                tokenIn: address(usdc),
-                tokenOut: address(weth),
+    /// @dev Corrige un sous-hedge sans modifier la LP: emprunte token0, le vend integralement avec
+    ///      protection oracle/spot/TWAP, puis fournit le produit token1 comme collateral. Le delta net
+    ///      augmente exactement de `amount0`; une execution partielle du swap fait revert toute la tx.
+    function _increaseEffectiveShort(uint256 amount0) private {
+        _refreshRangePriceCache();
+        (uint256 minOut, uint160 sqrtLimit) = DnDepositLib.aaveOracleMinToken1ForToken0(
+            amount0,
+            rangeManager,
+            volatileDecimals,
+            stableDecimals,
+            swapSlippageBps,
+            address(weth) < address(usdc)
+        );
+        uint256 token0Before = weth.balanceOf(address(this));
+        pool.borrow(address(weth), amount0, 2, 0, address(this));
+        uint256 amount1 = swapRouter.exactInputSingle(
+            ISwapRouter.ExactInputSingleParams({
+                tokenIn: address(weth),
+                tokenOut: address(usdc),
                 fee: swapPoolFee,
                 recipient: address(this),
                 deadline: block.timestamp,
-                amountOut: wethNeeded,
-                amountInMaximum: amountInMaximum,
-                sqrtPriceLimitX96: sqrtPriceLimitX96
+                amountIn: amount0,
+                amountOutMinimum: minOut,
+                sqrtPriceLimitX96: sqrtLimit
             })
         );
+        if (weth.balanceOf(address(this)) != token0Before) revert HedgeCheck(46);
+        pool.supply(address(usdc), amount1, address(this), 0);
     }
 
     /// @notice Close entire position: repay all debt + withdraw all collateral

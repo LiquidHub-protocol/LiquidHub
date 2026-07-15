@@ -829,6 +829,28 @@ library DnDepositLib {
         return _oracleMaxToken1ForToken0(amount0Out, rangeManager, dec0, dec1, slippageBps, zeroForOne);
     }
 
+    /// @notice Plancher token1 recu pour vendre `amount0In` token0 via exactInput.
+    /// @dev Utilise par le reajustement sous-hedge: le token0 nouvellement emprunte est vendu dans
+    ///      la meme transaction puis le token1 recu est fourni comme collateral. Le cache RM doit
+    ///      avoir ete rafraichi par le caller juste avant.
+    function aaveOracleMinToken1ForToken0(
+        uint256 amount0In,
+        address rangeManager,
+        uint8 dec0,
+        uint8 dec1,
+        uint16 slippageBps,
+        bool zeroForOne
+    ) external view returns (uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) {
+        (uint128 price0, uint128 price1, uint160 sqrtP,,, bool valid) = IRmDep(rangeManager).priceCache();
+        require(valid && price0 > 0 && price1 > 0 && sqrtP > 0, "Bad oracle");
+        uint256 theoretical = Math.mulDiv(amount0In, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0));
+        amountOutMinimum = Math.mulDiv(theoretical, 10000 - uint256(slippageBps), 10000);
+        require(amountOutMinimum > 0, "Bad oracle");
+        sqrtPriceLimitX96 = uint160(
+            (uint256(sqrtP) * (zeroForOne ? 20000 - uint256(slippageBps) : 20000 + uint256(slippageBps))) / 20000
+        );
+    }
+
     function _oracleMaxToken1ForToken0(
         uint256 amount0Out,
         address rangeManager,

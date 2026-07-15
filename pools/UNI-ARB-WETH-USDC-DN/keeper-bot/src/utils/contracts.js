@@ -74,11 +74,9 @@ const PAUSE_CONTROLLER_ABI = [
 // healthFactor: 1e18 fixed-point
 // adjustHedge() is permissionless. DN refactor: it pilots on the NET EFFECTIVE SHORT
 // (effectiveShort = debt - free WETH on HedgeManager - free WETH on RangeManager) vs the target
-// (hedgeTargetBps × wethInLP, default 100% = strict DN). It ONLY corrects an OVER-HEDGE (repays the
-// excess, buying WETH on the market). On an UNDER-HEDGE it REVERTS with custom error UnderHedged(...)
-// — a borrow would not change the net short. So the keeper's staticCall catches the revert and skips
-  // the tx (0 gas, no bounty). A successful (over-hedge) call pays the hedge bounty. The under-hedge is
-  // corrected by the permissionless rebalance() path, which rebuilds the LP composition and post-checks.
+// (hedgeTargetBps × token0InLP, default 100% = strict DN). It corrects both directions without caller sizing:
+// flash-repay for over-hedge; borrow, oracle-bounded token0 sale and token1 collateral supply for under-hedge.
+// The keeper staticCall skips any action whose cooldown, drift threshold or safety checks are not satisfied.
 const AAVE_HEDGE_ABI = [
   "function getHedgeData() external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase)",
   "function adjustHedge() external",
