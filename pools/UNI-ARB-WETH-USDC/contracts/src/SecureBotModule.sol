@@ -41,7 +41,6 @@ interface IRangeManagerBotState {
             uint16 rangeDownPercent,
             uint32 maxPositions
         );
-
 }
 
 contract SecureBotModule {

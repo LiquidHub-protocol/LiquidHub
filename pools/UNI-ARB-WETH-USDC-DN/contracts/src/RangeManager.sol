@@ -1113,10 +1113,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
         _recordSuccessfulOperation();
 
         // 4b. POST-CHECK DN (refonte DN) : la composition LP fraîchement remintée doit ramener le short net
-        // effectif ≈ targetShort (tolérance dnRebalanceMaxDriftBps) + HF sain. Le sous-hedge se corrige
-        // UNIQUEMENT ici, par la composition LP visée off-chain (moins de WETH → targetShort baisse), JAMAIS
-        // par un borrow permissionless. Si le keeper a mal dimensionné, TOUT le rebalance revert → pas de
-        // bounty, position inchangée (le burn/mint est rollback). No-op si pas de hedgeManager (std).
+        // effectif ≈ targetShort (tolérance dnRebalanceMaxDriftBps) + HF sain. Ce chemin est le repli canonique
+        // lorsque l'ajustement direct d'un sous-hedge ne peut pas conserver le HF cible : la composition LP visée
+        // réduit token0InLP sans ajouter de dette. Si le keeper a mal dimensionné, TOUT le rebalance revert →
+        // pas de bounty, position inchangée (le burn/mint est rollback). No-op si pas de hedgeManager (std).
         DnDepositLib.postCheckRebalanceHedge(
             address(this),
             token0,

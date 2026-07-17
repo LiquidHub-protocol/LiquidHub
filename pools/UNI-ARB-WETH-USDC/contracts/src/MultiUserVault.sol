@@ -208,7 +208,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     uint256 public depositMaxCacheAge = 300;
     uint256 public depositRefundDelay = 7 days;
 
-    // Système de tracking des fees time-weighted
+    // Systeme de tracking lazy des fees nettes par share
     // audit V1 (M3-B-fix, retour Codex) : COMPTA DES FEES — accFeePerShare pro-rata des SHARES courantes.
     // Modele MasterChef standard, prouve correct et O(1). Remplace l'ancien "time-weighted + accumulateur
     // monotone" qui SURCOMPTAIT apres plusieurs distributions sans checkpoint (3F au lieu de 2F). Les
@@ -994,9 +994,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // Auto-compound: part proportionnelle du LP (inclut fees compoundees)
         amount0 = (totalToken0 * info.shares) / totalShares;
         amount1 = (totalToken1 * info.shares) / totalShares;
-        // Fees bruts comptables pour affichage
-        fees0 = info.totalFeesEarnedToken0;
-        fees1 = info.totalFeesEarnedToken1;
+        // Fees nettes comptabilisees: creditees + pending lazy. Les fees NFT non collectees
+        // restent exclues jusqu'a leur cristallisation par collectFeesForVault().
+        (fees0, fees1) = _currentUserFees(user);
     }
 
     /**
@@ -1025,20 +1025,20 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         lastDepositTime = info.lastDepositTime;
         firstDepositTime = info.firstDepositTime;
 
-        if (info.shares > 0 && totalShares > 0) {
-            // Fees deja creditees (comptable)
-            totalFeesToken0 = info.totalFeesEarnedToken0;
-            totalFeesToken1 = info.totalFeesEarnedToken1;
+        (totalFeesToken0, totalFeesToken1) = _currentUserFees(user);
+    }
 
-            // audit V1 (M3-B-fix) — pending = shares * accFeePerShare - debt (modele accFeePerShare), par token.
-            uint256 accrued0 = info.shares * accFeePerShare0;
-            uint256 accrued1 = info.shares * accFeePerShare1;
-            if (accrued0 > userFeeDebtToken0[user]) totalFeesToken0 += (accrued0 - userFeeDebtToken0[user]) / 1e36;
-            if (accrued1 > userFeeDebtToken1[user]) totalFeesToken1 += (accrued1 - userFeeDebtToken1[user]) / 1e36;
-        } else {
-            totalFeesToken0 = 0;
-            totalFeesToken1 = 0;
-        }
+    function _currentUserFees(address user) private view returns (uint256 fees0, uint256 fees1) {
+        UserInfo storage info = userInfo[user];
+        uint256 shares = info.shares;
+        if (shares == 0 || totalShares == 0) return (0, 0);
+
+        fees0 = info.totalFeesEarnedToken0;
+        fees1 = info.totalFeesEarnedToken1;
+        uint256 accrued0 = shares * accFeePerShare0;
+        uint256 accrued1 = shares * accFeePerShare1;
+        if (accrued0 > userFeeDebtToken0[user]) fees0 += (accrued0 - userFeeDebtToken0[user]) / 1e36;
+        if (accrued1 > userFeeDebtToken1[user]) fees1 += (accrued1 - userFeeDebtToken1[user]) / 1e36;
     }
 
     // ===== FONCTIONS DE RETRAITS ET DE COLLECTE =====

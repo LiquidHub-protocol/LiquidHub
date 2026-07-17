@@ -373,19 +373,19 @@ contract AaveHedgeManager is ReentrancyGuard {
             (uint256 amountInMaximum, uint160 sqrtPriceLimitX96) = _oracleMaxUsdcForWeth(wethNeeded);
             if (!isFullWithdraw && amountInMaximum > usdcRecovered) amountInMaximum = usdcRecovered;
             if (amountInMaximum == 0) revert HedgeCheck(21);
-            // exactOutputSingle: swap minimum token1 to get exactly wethNeeded token0, plafonné à l'oracle.
-            swapRouter.exactOutputSingle(
-                ISwapRouter.ExactOutputSingleParams({
-                    tokenIn: address(usdc),
-                    tokenOut: address(weth),
-                    fee: swapPoolFee,
-                    recipient: address(this),
-                    deadline: block.timestamp,
-                    amountOut: wethNeeded,
-                    amountInMaximum: amountInMaximum,
-                    sqrtPriceLimitX96: sqrtPriceLimitX96
-                })
-            );
+            // Uniswap V3 autorise un exact-output partiel lorsqu'une limite sqrt est fournie. Refuser ce cas
+            // pour que le flash-loan ne puisse jamais consommer le token0 idle protege des autres utilisateurs.
+            if (
+                DnDepositLib.aaveExactOutput(
+                    address(swapRouter),
+                    address(usdc),
+                    address(weth),
+                    swapPoolFee,
+                    wethNeeded,
+                    amountInMaximum,
+                    sqrtPriceLimitX96
+                ) != wethNeeded
+            ) revert HedgeCheck(59);
         }
         // AAVE will pull flashLoanOwed token0 from this contract (max approve in constructor)
 
@@ -568,7 +568,8 @@ contract AaveHedgeManager is ReentrancyGuard {
     }
 
     /// @notice Configure le cooldown on-chain entre deux adjustHedge() permissionless (gouvernance).
-    /// @dev 0 = desactive (retrocompat). Borne haute 24h. Ne bloque PAS le canal surge botModule du bot.
+    /// @dev 0 = desactive (retrocompat). Borne haute 24h. Le même cooldown s'applique au bot et aux keepers ;
+    ///      seule la réparation prioritaire d'un HF sous la cible le contourne.
     function setHedgeAdjustCooldown(uint32 _cooldownSeconds) external onlyGovernance {
         if (_cooldownSeconds > 86400) revert HedgeCheck(36);
         hedgeAdjustCooldown = _cooldownSeconds;
@@ -614,8 +615,9 @@ contract AaveHedgeManager is ReentrancyGuard {
     /// @dev Pilotage sur le SHORT NET EFFECTIF (effectiveShort = dette - token0 libre HM - token0 libre RM),
     ///      pas la dette brute. Cible = hedgeTargetBps/10000 * token0InLP (gouvernee, defaut 100% = DN strict ;
     ///      H_opt RETIRE). Le keeper ne fournit AUCUN parametre de decision.
-    ///      - UNDER-HEDGED : emprunte l'ecart, vend atomiquement ce token0 avec plancher oracle/TWAP puis
-    ///        fournit le token1 recu a AAVE. Aucun token0 emprunte ne reste idle.
+    ///      - UNDER-HEDGED : tente d'emprunter l'ecart, vend atomiquement ce token0 avec plancher oracle/TWAP
+    ///        puis fournit le token1 recu a AAVE. Si la marge HF ne permet pas de conserver la cible, la tx
+    ///        revert atomiquement et bot/keepers utilisent le rebalance LP atomique au même cycle/au suivant.
     ///      - OVER-HEDGED : flash-repay de l'exces avant de retirer le collateral necessaire au swap de
     ///        remboursement. Cela reste fonctionnel meme lorsque le HF cible interdit tout retrait prealable.
     ///      Garde-fous : require(drift>=seuil dynamique range/divisor) ET cooldown ecoule. Verifie le HF apres action.
@@ -683,9 +685,8 @@ contract AaveHedgeManager is ReentrancyGuard {
         // le rebalance atomique doit d'abord les integrer a la composition LP.
         if (effectiveShort < 0) revert HedgeCheck(57);
         bool borrowed = effectiveShort < int256(targetShort);
-        uint256 diff = borrowed
-            ? uint256(int256(targetShort) - effectiveShort)
-            : uint256(effectiveShort - int256(targetShort));
+        uint256 diff =
+            borrowed ? uint256(int256(targetShort) - effectiveShort) : uint256(effectiveShort - int256(targetShort));
         if (targetShort == 0) {
             if (diff <= donationDustToken0) revert HedgeCheck(44);
         } else {
@@ -779,32 +780,27 @@ contract AaveHedgeManager is ReentrancyGuard {
         );
         if (toWithdraw > 0) pool.withdraw(address(usdc), toWithdraw, address(this));
         if (capped < amountInMaximum || usdc.balanceOf(address(this)) < amountInMaximum) revert HedgeCheck(58);
-        swapRouter.exactOutputSingle(
-            ISwapRouter.ExactOutputSingleParams({
-                tokenIn: address(usdc),
-                tokenOut: address(weth),
-                fee: swapPoolFee,
-                recipient: address(this),
-                deadline: block.timestamp,
-                amountOut: flashOwed,
-                amountInMaximum: amountInMaximum,
-                sqrtPriceLimitX96: sqrtPriceLimitX96
-            })
-        );
+        if (
+            DnDepositLib.aaveExactOutput(
+                address(swapRouter),
+                address(usdc),
+                address(weth),
+                swapPoolFee,
+                flashOwed,
+                amountInMaximum,
+                sqrtPriceLimitX96
+            ) != flashOwed
+        ) revert HedgeCheck(59);
     }
 
-    /// @dev Corrige un sous-hedge sans modifier la LP: emprunte token0, le vend integralement avec
+    /// @dev Tente de corriger un sous-hedge sans modifier la LP: emprunte token0, le vend integralement avec
     ///      protection oracle/spot/TWAP, puis fournit le produit token1 comme collateral. Le delta net
-    ///      augmente exactement de `amount0`; une execution partielle du swap fait revert toute la tx.
+    ///      augmente exactement de `amount0`; une execution partielle ou un HF final sous la cible fait revert
+    ///      toute la tx. Le repli de liveness est le rebalance atomique, qui réduit token0InLP sans ajouter de dette.
     function _increaseEffectiveShort(uint256 amount0) private {
         _refreshRangePriceCache();
         (uint256 minOut, uint160 sqrtLimit) = DnDepositLib.aaveOracleMinToken1ForToken0(
-            amount0,
-            rangeManager,
-            volatileDecimals,
-            stableDecimals,
-            swapSlippageBps,
-            address(weth) < address(usdc)
+            amount0, rangeManager, volatileDecimals, stableDecimals, swapSlippageBps, address(weth) < address(usdc)
         );
         uint256 token0Before = weth.balanceOf(address(this));
         pool.borrow(address(weth), amount0, 2, 0, address(this));
@@ -881,7 +877,12 @@ contract AaveHedgeManager is ReentrancyGuard {
     /// @dev This is NOT the protocol PauseController. When enabled, it blocks supplyAndBorrow()
     ///      only. Settlement, adjustHedge, repay/withdraw, close and sweeps remain available so the
     ///      active position can be maintained or de-risked.
-    function setPaused(bool _paused) external onlySafe {
+    function setPaused(bool _paused) external {
+        // Phase 1: governance == Safe. Phase 2: Safe peut arreter, gouvernance seule peut reprendre.
+        if (msg.sender != governance) {
+            if (msg.sender != safe) revert HedgeCheck(1);
+            if (!_paused) revert HedgeCheck(2);
+        }
         paused = _paused;
         emit Paused(_paused);
     }

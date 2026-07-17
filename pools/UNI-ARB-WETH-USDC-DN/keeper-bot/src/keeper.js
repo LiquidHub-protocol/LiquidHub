@@ -192,6 +192,23 @@ async function main() {
         }
       }
 
+      // --- Hedge/HF priority (permissionless) ---
+      // Simuler avant snapshots et depots. Le contrat contourne le cooldown uniquement pour reparer un HF;
+      // un drift insuffisant revert ici sans envoyer de transaction.
+      if (!CHECK_ONLY && hedgeManager && wallet) {
+        try {
+          const rcpt = await rpcPool.executeSignedTxWithRetry(async (p) => {
+            const signer = wallet.connect(p);
+            const hedge = hedgeManager.connect(signer);
+            await hedge.adjustHedge.staticCall();
+            return { wallet: signer, request: await hedge.adjustHedge.populateTransaction() };
+          }, 'adjustHedge-priority');
+          console.log(`  -> Priority hedge/HF repair executed: ${rcpt.hash}`);
+        } catch (e) {
+          console.log(`  Priority hedge: no action (${(e.reason || e.message || '').slice(0, 80)})`);
+        }
+      }
+
       // --- Dynamic range snapshot (permissionless, metrics bounty) ---
       // The on-chain range is computed from price snapshots stored in a ring buffer. Anyone can
       // record one when it is due (the contract spaces them by 24h/maxSnapshotsPerDay and reverts
