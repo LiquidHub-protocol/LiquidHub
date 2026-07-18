@@ -717,9 +717,10 @@ library DnDepositLib {
         );
     }
 
-    /// @notice Indique si le drift DN depasse le seuil dynamique adjust (sous/sur-hedge), pour autoriser
-    ///         un rebalance permissionless meme quand la LP est in-range. Le parametre fixe reste le fallback
-    ///         fail-closed si le HedgeManager ne fournit pas encore le diviseur dynamique.
+    /// @notice Indique si le drift DN depasse le seuil dynamique critique (sous/sur-hedge), pour autoriser
+    ///         un rebalance permissionless meme quand la LP est in-range. Le drift normal reste traite par
+    ///         adjustHedge(); le rebalance LP n'est que le fallback critique. Le parametre fixe reste le
+    ///         fallback fail-closed si le HedgeManager ne fournit pas encore le diviseur dynamique.
     ///         Args plats (RangeManager appelle avec address(this)). No-op→false si pool std (hedgeManager==0).
     function dnHedgeDriftExceeds(
         address rangeManager,
@@ -732,9 +733,9 @@ library DnDepositLib {
         address hedgeManager = IVaultDep(IRmDep(rangeManager).vault()).hedgeManager();
         if (hedgeManager == address(0)) return false;
         uint16 effectiveCritBps = critBps;
-        uint16 dynamicAdjustBps =
-            _rangeHedgeThresholdBps(rangeManager, IHedgeDep(hedgeManager).adjustHedgeRangeDivisor(), 100);
-        if (dynamicAdjustBps < effectiveCritBps) effectiveCritBps = dynamicAdjustBps;
+        uint16 dynamicCriticalBps =
+            _rangeHedgeThresholdBps(rangeManager, IHedgeDep(hedgeManager).criticalHedgeRangeDivisor(), 250);
+        if (dynamicCriticalBps < effectiveCritBps) effectiveCritBps = dynamicCriticalBps;
         (bool ok,) = _driftBps(hedgeManager, rangeManager, token0, price0, dec0, effectiveCritBps, dustFloorUsd);
         return !ok; // ok == drift <= seuil critique effectif ; donc !ok == drift > seuil critique (critique)
     }

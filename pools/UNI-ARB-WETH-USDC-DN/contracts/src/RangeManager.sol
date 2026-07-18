@@ -328,7 +328,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     ) external onlyVaultOwner {
         require(
             _maxSnapshotsPerDay >= 1 && _maxSnapshotsPerDay <= 24 && _volatMoyDay >= 1 && _volatMoyDay <= 20
-                && uint16(_volatTrimDay) * 2 + 1 <= uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay)
+                && uint16(_volatTrimDay) * 2 + 2 <= uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay)
                 && _rangeStepBps >= 10 && _rangeStepBps <= 1000 && _rangeMultiplicatorBps >= 5000
                 && _rangeMultiplicatorBps <= 30000 && _rangeMinBps >= 10 && _rangeMinBps <= _rangeMaxBps
                 && _rangeMaxBps <= 5000 && uint256(_rangeMinBps) * 2 >= _minTotalRangeBps(),

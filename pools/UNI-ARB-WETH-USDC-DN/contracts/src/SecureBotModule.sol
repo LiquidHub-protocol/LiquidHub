@@ -263,8 +263,12 @@ contract SecureBotModule {
         emit FunctionExecuted(selector, dailySpent);
     }
 
-    // Fonctions pour AaveHedgeManager (Delta Neutral)
-    function executeHedgeFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) withinDailyLimit {
+    // Fonctions pour AaveHedgeManager (Delta Neutral). Le seul selector autorise est adjustHedge(), qui est
+    // deja permissionless et strictement borne dans AaveHedgeManager (drift/cooldown/HF/oracle/TWAP). Ne pas le
+    // faire consommer par la limite du hot bot: une reparation HF doit rester disponible meme apres une journee
+    // chargee. Le compteur est tout de meme remis au jour pour conserver une vue coherente.
+    function executeHedgeFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
+        _resetDailyCounterIfNeeded();
         bytes4 selector = bytes4(data[:4]);
         _execute(hedgeManager, 0, data);
 

@@ -1340,8 +1340,8 @@ library RangeOperations {
             }
         }
 
-        // 2. Cold start: il faut au moins 2*trim+1 valeurs pour pouvoir trimmer et garder un min/max
-        uint256 needed = uint256(drc.volatTrimDay) * 2 + 1;
+        // 2. Cold start: apres le trim haut+bas, deux valeurs doivent rester pour mesurer high-low.
+        uint256 needed = uint256(drc.volatTrimDay) * 2 + 2;
         if (count < needed || count == 0) return (0, false);
 
         // 3. Trim: retirer les `volatTrimDay` plus hauts ET plus bas par selection par passes.
