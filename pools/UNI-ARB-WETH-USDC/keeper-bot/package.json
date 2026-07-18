@@ -5,7 +5,8 @@
   "main": "src/keeper.js",
   "scripts": {
     "start": "node src/keeper.js",
-    "check": "node src/keeper.js --check-only"
+    "check": "node src/keeper.js --check-only",
+    "test": "node --test"
   },
   "dependencies": {
     "ethers": "^6.9.0",

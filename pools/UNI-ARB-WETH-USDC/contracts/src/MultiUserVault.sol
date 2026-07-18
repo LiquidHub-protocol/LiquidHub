@@ -1260,9 +1260,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     // ===== FONCTIONS DE CONFIGURATION =====
 
-    function updateCommissionRate(uint256 newRate) external onlyOwner {
+    function updateCommissionRate(uint256 newRate) external onlyOwner nonReentrant {
         require(newRate <= 3000, "E14"); // Max 30%
         uint256 oldRate = commissionRate;
+        // Crystallize all fees already earned by the NFT while the old rate is still active.
+        // The RangeManager is fail-closed: if collection fails, the rate remains unchanged.
+        rangeManager.collectFeesForVault();
         commissionRate = newRate;
         emit CommissionRateUpdated(oldRate, newRate);
     }
@@ -1316,17 +1319,21 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emergencySafe = newSafe;
     }
 
-    /// @notice Recover non-protected tokens (airdrops, erroneous transfers, donations)
-    /// @dev Blocks token0/token1 (user funds, cannot be moved). Destination is flexible:
-    ///      refund the sender, send to Treasury, or keep for protocol use depending on context.
-    ///      Each rescue emits TokenRescued for full on-chain traceability.
-    /// @param tokenAddr Token to rescue (must not be token0 or token1)
+    /// @notice Recover airdrops or erroneous direct transfers held by this Vault.
+    /// @dev For token0/token1, only the local balance strictly above queued deposit reserves is recoverable.
+    ///      This function cannot access RangeManager balances, LP liquidity or pending user deposits.
+    /// @param tokenAddr Token to rescue
     /// @param to Recipient address
     /// @param amount Amount to rescue
-    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyEmergencySafe {
-        if (tokenAddr == address(token0) || tokenAddr == address(token1)) revert ProtectedPoolToken();
+    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyEmergencySafe nonReentrant {
         if (to == address(0)) revert InvalidRecipient();
-        IERC20(tokenAddr).safeTransfer(to, amount);
+        IERC20 rescueAsset = IERC20(tokenAddr);
+        if (tokenAddr == address(token0) || tokenAddr == address(token1)) {
+            uint256 reserved = tokenAddr == address(token0) ? _pendingTotal0 : _pendingTotal1;
+            uint256 balance = rescueAsset.balanceOf(address(this));
+            if (balance < reserved || amount > balance - reserved) revert ProtectedPoolToken();
+        }
+        rescueAsset.safeTransfer(to, amount);
         emit TokenRescued(tokenAddr, to, amount);
     }
 

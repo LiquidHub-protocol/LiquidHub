@@ -1056,7 +1056,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // collect() pousse le feeGrowth latent avant le drift et le plan DN. Si la decision refuse le
         // rebalance, le revert annule aussi cette collecte: aucun refresh de fees isole n'est requis.
         if (hasPosition) _collectPositionFees(tokenId);
-        bool dnDriftCritical = DnDepositLib.dnHedgeDriftExceeds(
+        (bool dnDriftCritical, bool rawDnDriftCritical) = DnDepositLib.dnHedgeDriftExceeds(
             address(this),
             token0,
             priceCache.price0,
@@ -1129,8 +1129,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // 5. Unlock vault
         IMultiUserVault(vault).endRebalance();
 
-        // 6. Pay keeper bounty (silent - don't revert if bounty fails)
-        _payBounty(false);
+        // 6. Range movement remains rewarded. A drift-only rebalance is rewarded only when the raw
+        // debt-vs-LP target also qualifies, so idle/donated token0 cannot farm the keeper bounty.
+        if (_needsRebalance || rawDnDriftCritical) _payBounty(false);
     }
 
     /// @dev Bounds one swap to roughly config.maxSlippageBps of price movement from the validated live pool price.

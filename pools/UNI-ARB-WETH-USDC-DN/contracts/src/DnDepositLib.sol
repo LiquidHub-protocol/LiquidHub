@@ -69,6 +69,10 @@ interface IVaultDep {
     function hedgeManager() external view returns (address);
 }
 
+interface IHedgePauseDep {
+    function paused() external view returns (bool);
+}
+
 interface IHedgeRepairContext {
     function pool() external view returns (address);
     function usdc() external view returns (address);
@@ -110,6 +114,10 @@ interface IAavePoolDep {
 ///      Aucun accès storage : tout est passé en paramètres. Calcul pur délégué à RangeOperations.
 library DnDepositLib {
     using SafeERC20 for IERC20;
+
+    error ProtectedVaultFunds();
+    error E70();
+    error E_HEDGE_PAUSED();
     /// @dev Adresses regroupées (anti stack-too-deep).
 
     struct Addrs {
@@ -117,6 +125,34 @@ library DnDepositLib {
         address rangeManager;
         address token0;
         address token1;
+    }
+
+    /// @dev Garde d'entree DN delestee du Vault pour sa marge EIP-170. Les selectors d'erreur restent
+    ///      identiques a ceux exposes par le Vault pour conserver le decodage off-chain.
+    function requireDepositOpen(address hedgeManager, uint256 amount0) external view {
+        if (hedgeManager == address(0)) return;
+        if (amount0 > 0) revert E70();
+        if (IHedgePauseDep(hedgeManager).paused()) revert E_HEDGE_PAUSED();
+    }
+
+    /// @dev Execute en delegatecall depuis le Vault: seuls les soldes locaux au-dela des reserves FIFO
+    ///      peuvent sortir. Le controle d'acces Safe et le nonReentrant restent portes par le Vault.
+    function rescueVaultToken(
+        address token,
+        address token0,
+        address token1,
+        address to,
+        uint256 amount,
+        uint256 pending0,
+        uint256 pending1
+    ) external {
+        IERC20 asset = IERC20(token);
+        if (token == token0 || token == token1) {
+            uint256 reserved = token == token0 ? pending0 : pending1;
+            uint256 balance = asset.balanceOf(address(this));
+            if (balance < reserved || amount > balance - reserved) revert ProtectedVaultFunds();
+        }
+        asset.safeTransfer(to, amount);
     }
 
     error InsufficientCollateral();
@@ -668,7 +704,7 @@ library DnDepositLib {
     ) private view {
         IHedgeDep hm = IHedgeDep(hedgeManager);
         uint16 effectiveMaxDriftBps = _postCheckMaxDriftBps(hedgeManager, rangeManager, maxDriftBps);
-        (bool ok,) = _driftBps(hedgeManager, rangeManager, token0, price0, dec0, effectiveMaxDriftBps, dustFloorUsd);
+        (bool ok,,) = _driftBps(hedgeManager, rangeManager, token0, price0, dec0, effectiveMaxDriftBps, dustFloorUsd);
         if (!ok) revert PreAdjustRequired();
 
         if (_toUsd(hm.getWethDebt(), price0, dec0) > 0) {
@@ -701,7 +737,7 @@ library DnDepositLib {
         uint8 dec0,
         uint16 maxDriftBps,
         uint256 dustFloorUsd
-    ) private view returns (bool ok, uint256 driftBps) {
+    ) private view returns (bool ok, uint256 driftBps, bool rawDebtDriftExceeds_) {
         IHedgeDep hm = IHedgeDep(hedgeManager);
         IRmDep rm = IRmDep(rangeManager);
         uint256 dustTok0 = hm.donationDustToken0();
@@ -712,9 +748,12 @@ library DnDepositLib {
         (uint256 totalBal0,) = rm.getCurrentBalances();
         uint256 nftWeth = totalBal0 > freeRmWeth ? totalBal0 - freeRmWeth : 0;
         uint256 wethInLpUsd = _toUsd(nftWeth, price0, dec0);
-        return RangeOperations.checkHedgeDelta(
+        (ok, driftBps) = RangeOperations.checkHedgeDelta(
             debtUsd, idleHmUsd, idleRmUsd, wethInLpUsd, hm.hedgeTargetBps(), maxDriftBps, dustFloorUsd
         );
+        (bool rawOk,) =
+            RangeOperations.checkHedgeDelta(debtUsd, 0, 0, wethInLpUsd, hm.hedgeTargetBps(), maxDriftBps, dustFloorUsd);
+        rawDebtDriftExceeds_ = !rawOk;
     }
 
     /// @notice Indique si le drift DN depasse le seuil dynamique critique (sous/sur-hedge), pour autoriser
@@ -729,15 +768,27 @@ library DnDepositLib {
         uint8 dec0,
         uint16 critBps,
         uint256 dustFloorUsd
-    ) external view returns (bool) {
+    ) external view returns (bool effectiveDriftExceeds, bool rawDebtDriftExceeds_) {
         address hedgeManager = IVaultDep(IRmDep(rangeManager).vault()).hedgeManager();
-        if (hedgeManager == address(0)) return false;
+        if (hedgeManager == address(0)) return (false, false);
         uint16 effectiveCritBps = critBps;
         uint16 dynamicCriticalBps =
             _rangeHedgeThresholdBps(rangeManager, IHedgeDep(hedgeManager).criticalHedgeRangeDivisor(), 250);
         if (dynamicCriticalBps < effectiveCritBps) effectiveCritBps = dynamicCriticalBps;
-        (bool ok,) = _driftBps(hedgeManager, rangeManager, token0, price0, dec0, effectiveCritBps, dustFloorUsd);
-        return !ok; // ok == drift <= seuil critique effectif ; donc !ok == drift > seuil critique (critique)
+        (bool ok,, bool rawExceeds) =
+            _driftBps(hedgeManager, rangeManager, token0, price0, dec0, effectiveCritBps, dustFloorUsd);
+        return (!ok, rawExceeds); // effective drift pilote la maintenance; raw drift qualifie seul le bounty
+    }
+
+    /// @notice Qualification de bounty independante des soldes token0 idle/donnes.
+    function rawDebtDriftExceeds(uint256 debt, uint256 target, uint16 minDriftBps, uint256 dustFloor)
+        external
+        pure
+        returns (bool)
+    {
+        uint256 diff = debt > target ? debt - target : target - debt;
+        if (target == 0) return diff > dustFloor;
+        return Math.mulDiv(diff, 10000, target) >= uint256(minDriftBps);
     }
 
     /// @notice Seuil dynamique depuis la config range d'un RangeManager.
@@ -889,8 +940,9 @@ library DnDepositLib {
     ) private view returns (uint256 amountInMaximum, uint160 sqrtPriceLimitX96) {
         (uint128 price0, uint128 price1, uint160 sqrtP,,, bool valid) = IRmDep(rangeManager).priceCache();
         require(valid && price0 > 0 && price1 > 0 && sqrtP > 0, "Bad oracle");
-        uint256 theoretical = Math.mulDiv(amount0Out, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0));
-        amountInMaximum = Math.mulDiv(theoretical, 10000 + uint256(slippageBps), 10000);
+        uint256 theoretical =
+            Math.mulDiv(amount0Out, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0), Math.Rounding.Up);
+        amountInMaximum = Math.mulDiv(theoretical, 10000 + uint256(slippageBps), 10000, Math.Rounding.Up);
         require(amountInMaximum > 0, "Bad oracle");
         sqrtPriceLimitX96 = uint160(
             (uint256(sqrtP) * (zeroForOne ? 20000 - uint256(slippageBps) : 20000 + uint256(slippageBps))) / 20000

@@ -11,6 +11,9 @@ const RANGEMANAGER_ABI = [
   "function isSystemOperational() external view returns (bool)",
   "function config() external view returns (uint24 fee, uint8 token0Decimals, uint8 token1Decimals, uint16 toleranceBps, uint24 maxSlippageBps, uint64 lastRebalanceTime, bool oraclesConfigured, uint16 rangeUpPercent, uint16 rangeDownPercent, uint32 maxPositions)",
   "function initMultiSwapTvl() external view returns (uint256)",
+  "function vault() external view returns (address)",
+  "function token0() external view returns (address)",
+  "function token1() external view returns (address)",
   // --- Dynamic range (on-chain) ---
   // recordPriceSnapshot is permissionless: it stores a Chainlink price point in the on-chain
   // ring buffer used to compute the dynamic range. The contract spaces snapshots regularly
@@ -26,6 +29,10 @@ const RANGEMANAGER_ABI = [
 // MultiUserVault ABI (only functions needed by keeper)
 const VAULT_ABI = [
   "function treasuryAddress() external view returns (address)",
+  "function rangeManager() external view returns (address)",
+  "function token0() external view returns (address)",
+  "function token1() external view returns (address)",
+  "function hedgeManager() external view returns (address)",
   // --- depot permissionless ---
   // processDepositPermissionless traite 1 depot de la file (atomique) : shares (oracle) -> swaps
   // bornes oracle -> addLiquidity -> deposit bounty. Verrou anti-withdraw concurrent. REVERT si file
@@ -78,6 +85,8 @@ const PAUSE_CONTROLLER_ABI = [
 // flash-repay for over-hedge; borrow, oracle-bounded token0 sale and token1 collateral supply for under-hedge.
 // The keeper staticCall skips any action whose cooldown, drift threshold or safety checks are not satisfied.
 const AAVE_HEDGE_ABI = [
+  "function vault() external view returns (address)",
+  "function rangeManager() external view returns (address)",
   "function getHedgeData() external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase)",
   "function adjustHedge() external",
   "function adjustHedgeBps() external view returns (uint16)",   // current dynamic drift threshold in bps
@@ -119,4 +128,76 @@ function createContracts(provider) {
   return { rangeManager, vault, hedgeManager, pauseController };
 }
 
-module.exports = { RANGEMANAGER_ABI, VAULT_ABI, TREASURY_ABI, ERC20_ABI, AAVE_HEDGE_ABI, PAUSE_CONTROLLER_ABI, createContracts };
+function sameAddress(actual, expected) {
+  return ethers.getAddress(actual) === ethers.getAddress(expected);
+}
+
+async function assertKeeperTopology(rpcPool, { rangeManager, vault, hedgeManager }) {
+  const expected = {
+    rangeManager: process.env.RANGEMANAGER_ADDRESS,
+    vault: process.env.VAULT_ADDRESS,
+    hedgeManager: process.env.AAVE_HEDGE_MANAGER_ADDRESS,
+    token0: process.env.TOKEN0_ADDRESS,
+    token1: process.env.TOKEN1_ADDRESS,
+  };
+
+  const topology = await rpcPool.executeWithRetry(async (provider) => {
+    const rm = rangeManager.connect(provider);
+    const v = vault.connect(provider);
+    const hm = hedgeManager.connect(provider);
+    const [
+      rmCode,
+      vaultCode,
+      hmCode,
+      rmVault,
+      rmToken0,
+      rmToken1,
+      vaultRm,
+      vaultToken0,
+      vaultToken1,
+      vaultHm,
+      hmVault,
+      hmRm,
+    ] = await Promise.all([
+      provider.getCode(expected.rangeManager),
+      provider.getCode(expected.vault),
+      provider.getCode(expected.hedgeManager),
+      rm.vault(),
+      rm.token0(),
+      rm.token1(),
+      v.rangeManager(),
+      v.token0(),
+      v.token1(),
+      v.hedgeManager(),
+      hm.vault(),
+      hm.rangeManager(),
+    ]);
+    return { rmCode, vaultCode, hmCode, rmVault, rmToken0, rmToken1, vaultRm, vaultToken0, vaultToken1, vaultHm, hmVault, hmRm };
+  });
+
+  if (topology.rmCode === '0x') throw new Error('Keeper topology: RangeManager has no runtime code');
+  if (topology.vaultCode === '0x') throw new Error('Keeper topology: Vault has no runtime code');
+  if (topology.hmCode === '0x') throw new Error('Keeper topology: AaveHedgeManager has no runtime code');
+  if (!sameAddress(topology.rmVault, expected.vault)) throw new Error('Keeper topology: RangeManager.vault mismatch');
+  if (!sameAddress(topology.vaultRm, expected.rangeManager)) throw new Error('Keeper topology: Vault.rangeManager mismatch');
+  if (!sameAddress(topology.vaultHm, expected.hedgeManager)) throw new Error('Keeper topology: Vault.hedgeManager mismatch');
+  if (!sameAddress(topology.hmVault, expected.vault)) throw new Error('Keeper topology: AaveHedgeManager.vault mismatch');
+  if (!sameAddress(topology.hmRm, expected.rangeManager)) throw new Error('Keeper topology: AaveHedgeManager.rangeManager mismatch');
+  if (!sameAddress(topology.rmToken0, expected.token0) || !sameAddress(topology.vaultToken0, expected.token0)) {
+    throw new Error('Keeper topology: token0 mismatch');
+  }
+  if (!sameAddress(topology.rmToken1, expected.token1) || !sameAddress(topology.vaultToken1, expected.token1)) {
+    throw new Error('Keeper topology: token1 mismatch');
+  }
+}
+
+module.exports = {
+  RANGEMANAGER_ABI,
+  VAULT_ABI,
+  TREASURY_ABI,
+  ERC20_ABI,
+  AAVE_HEDGE_ABI,
+  PAUSE_CONTROLLER_ABI,
+  createContracts,
+  assertKeeperTopology,
+};

@@ -636,6 +636,8 @@ contract AaveHedgeManager is ReentrancyGuard {
             _flashLoanActive = false;
             _requireHfMin();
             lastHedgeAdjustAt = uint64(block.timestamp);
+            // Le HF bas est un signal de securite AAVE independant des soldes idle/donnes: conserver
+            // l'incitation keeper sur ce chemin urgent, apres reparation et post-check HF.
             if (treasuryAddress != address(0)) {
                 try IHedgeTreasury(treasuryAddress).payHedgeBounty(msg.sender) {} catch {}
             }
@@ -687,12 +689,17 @@ contract AaveHedgeManager is ReentrancyGuard {
         bool borrowed = effectiveShort < int256(targetShort);
         uint256 diff =
             borrowed ? uint256(int256(targetShort) - effectiveShort) : uint256(effectiveShort - int256(targetShort));
+        uint16 minDriftBps = _dynamicHedgeBps(adjustHedgeRangeDivisor, 100);
         if (targetShort == 0) {
             if (diff <= donationDustToken0) revert HedgeCheck(44);
         } else {
             uint256 driftBps = (diff * 10000) / targetShort;
-            if (driftBps < uint256(_dynamicHedgeBps(adjustHedgeRangeDivisor, 100))) revert HedgeCheck(44);
+            if (driftBps < uint256(minDriftBps)) revert HedgeCheck(44);
         }
+        // La maintenance reste pilotee par effectiveShort, mais une donation/solde idle ne doit jamais
+        // suffire a gagner un bounty. Celui-ci exige aussi un drift DETTE BRUTE vs cible LP.
+        bool bountyEligible =
+            DnDepositLib.rawDebtDriftExceeds(currentDebtWeth, targetShort, minDriftBps, donationDustToken0);
 
         if (borrowed) {
             _increaseEffectiveShort(diff);
@@ -711,7 +718,7 @@ contract AaveHedgeManager is ReentrancyGuard {
         _requireHfMin();
 
         // Bounty silent, uniquement apres correction et post-checks complets.
-        if (treasuryAddress != address(0)) {
+        if (bountyEligible && treasuryAddress != address(0)) {
             try IHedgeTreasury(treasuryAddress).payHedgeBounty(msg.sender) {} catch {}
         }
 
@@ -929,7 +936,7 @@ contract AaveHedgeManager is ReentrancyGuard {
         // Repay token0 debt
         if (isFullWithdraw) {
             pool.repay(address(weth), type(uint256).max, 2, address(this));
-        } else {
+        } else if (debtToRepay > 0) {
             pool.repay(address(weth), debtToRepay, 2, address(this));
         }
 

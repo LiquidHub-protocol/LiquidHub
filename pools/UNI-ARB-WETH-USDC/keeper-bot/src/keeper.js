@@ -2,7 +2,8 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 
 const { ethers } = require('ethers');
 const { RPCPool } = require('./utils/rpc');
-const { createContracts, TREASURY_ABI, ERC20_ABI } = require('./utils/contracts');
+const { createContracts, assertKeeperTopology, TREASURY_ABI, ERC20_ABI } = require('./utils/contracts');
+const { PersistentActionAlerts } = require('./utils/action-alerts');
 const { Rebalancer } = require('./rebalancer');
 
 const CHECK_INTERVAL_MS = (parseInt(process.env.CHECK_INTERVAL_MIN || '10', 10)) * 60 * 1000;
@@ -71,6 +72,14 @@ async function checkBountyFunding(label, enabled, amount, treasuryAddr, usdc, rp
   return true;
 }
 
+async function trackAction(alerts, method, ...args) {
+  try {
+    await alerts[method](...args);
+  } catch (error) {
+    console.log(`  Keeper alert state error: ${(error.message || '').slice(0, 100)}`);
+  }
+}
+
 async function main() {
   console.log('=== Liquid Hub Keeper Bot (Standard Pool) ===');
   console.log(`RangeManager: ${process.env.RANGEMANAGER_ADDRESS}`);
@@ -91,6 +100,13 @@ async function main() {
   const rpcPool = new RPCPool();
   const provider = rpcPool.getProvider();
   const { rangeManager, vault, pauseController } = createContracts(provider);
+  await assertKeeperTopology(rpcPool, { rangeManager, vault });
+  console.log('Keeper topology: RangeManager/Vault/tokens verified\n');
+
+  const actionAlerts = new PersistentActionAlerts({
+    poolName: process.env.POOL_NAME || 'UNI-ARB-WETH-USDC',
+  });
+  await actionAlerts.init();
 
   // Resolve Treasury + bounty info
   const { treasury, treasuryAddr, usdc } = await resolveTreasury(rpcPool, vault);
@@ -131,11 +147,7 @@ async function main() {
     try {
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
 
-      if (CHECK_ONLY) {
-        await logPriceCacheBeforeDecision(rangeManager, rpcPool);
-      } else {
-        await rebalancer.ensureFreshPriceCacheForDecision();
-      }
+      await logPriceCacheBeforeDecision(rangeManager, rpcPool);
 
       const [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
         async (p) => {
@@ -172,11 +184,12 @@ async function main() {
       // guard at the top), so rebalance freshness no longer depends on this snapshot — the ordering is kept
       // only so one cycle can both snapshot and rebalance on a fresh price.
       if (!CHECK_ONLY) {
+        let snapshotDue = false;
         try {
-          const due = await rpcPool.executeWithRetry(async (p) => {
+          snapshotDue = await rpcPool.executeWithRetry(async (p) => {
             return await rangeManager.connect(p).isSnapshotDue();
           });
-          if (due) {
+          if (snapshotDue) {
             const metricsEnabled = treasury ? await readContract(rpcPool, treasury, 'metricsBountyEnabled') : false;
             const metricsAmount = treasury ? await readContract(rpcPool, treasury, 'metricsBountyAmount') : 0n;
             await checkBountyFunding('metrics', metricsEnabled, metricsAmount, treasuryAddr, usdc, rpcPool);
@@ -190,10 +203,13 @@ async function main() {
               };
             }, 'recordPriceSnapshot');
             console.log(`  -> Snapshot recorded: ${rcpt.hash}`);
+            await trackAction(actionAlerts, 'success', 'snapshot', `Snapshot recorded: ${rcpt.hash}`);
+          } else {
+            await trackAction(actionAlerts, 'success', 'snapshot', 'Snapshot no longer due');
           }
         } catch (e) {
-          // Revert is expected when a snapshot is not yet due or price cache is stale — not fatal.
           console.log(`  Snapshot: skipped (${(e.reason || e.message || '').slice(0, 80)})`);
+          await trackAction(actionAlerts, 'failure', 'snapshot', e.reason || e.message);
         }
       }
 
@@ -214,16 +230,38 @@ async function main() {
               v.isRebalancing(),
             ]);
           });
-          if (pending > 0n && positions.length > 0 && !isRebalancing) {
+          if (pending === 0n) {
+            await trackAction(actionAlerts, 'success', 'deposit', 'No queued deposit remains');
+            await trackAction(
+              actionAlerts,
+              'success',
+              'mint',
+              positions.length > 0 ? 'Initial position is available' : 'No queued deposit requires an initial mint'
+            );
+          } else if (positions.length === 0) {
+            const message = `${pending} queued deposit(s) waiting for the main bot initial mint`;
+            console.log(`  Deposit deferred: ${message}`);
+            await trackAction(actionAlerts, 'failure', 'mint', message);
+          } else if (needsRebalance && action === 'REBALANCE') {
+            await trackAction(actionAlerts, 'success', 'mint', 'Initial position is available');
+            console.log(`  Deposit deferred: known rebalance is due (${reason || 'on-chain signal'})`);
+          } else if (!isRebalancing) {
+            await trackAction(actionAlerts, 'success', 'mint', 'Initial position is available');
             const depEnabled = treasury ? await readContract(rpcPool, treasury, 'depositBountyEnabled') : false;
             const depAmount = treasury ? await readContract(rpcPool, treasury, 'depositBountyAmount') : 0n;
             await checkBountyFunding('deposit', depEnabled, depAmount, treasuryAddr, usdc, rpcPool);
             console.log(`  -> ${pending.toString()} deposit(s) pending, processing one on-chain...`);
             const result = await rebalancer.processDeposit();
-            if (result.success) console.log(`  -> Deposit processed (${result.txHashes.length} tx)`);
+            if (result.success) {
+              console.log(`  -> Deposit processed (${result.txHashes.length} tx)`);
+              await trackAction(actionAlerts, 'success', 'deposit', `Deposit processed: ${result.txHashes[0]}`);
+            } else if (!result.deferred) {
+              await trackAction(actionAlerts, 'failure', 'deposit', result.error);
+            }
           }
         } catch (e) {
           console.log(`  Deposit: skipped (${(e.reason || e.message || '').slice(0, 80)})`);
+          await trackAction(actionAlerts, 'failure', 'deposit', e.reason || e.message);
         }
       }
 

@@ -2,7 +2,8 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 
 const { ethers } = require('ethers');
 const { RPCPool } = require('./utils/rpc');
-const { createContracts, TREASURY_ABI, ERC20_ABI } = require('./utils/contracts');
+const { createContracts, assertKeeperTopology, TREASURY_ABI, ERC20_ABI } = require('./utils/contracts');
+const { PersistentActionAlerts } = require('./utils/action-alerts');
 const { Rebalancer } = require('./rebalancer');
 
 const CHECK_INTERVAL_MS = (parseInt(process.env.CHECK_INTERVAL_MIN || '10', 10)) * 60 * 1000;
@@ -71,6 +72,14 @@ async function checkBountyFunding(label, enabled, amount, treasuryAddr, usdc, rp
   return true;
 }
 
+async function trackAction(alerts, method, ...args) {
+  try {
+    await alerts[method](...args);
+  } catch (error) {
+    console.log(`  Keeper alert state error: ${(error.message || '').slice(0, 100)}`);
+  }
+}
+
 async function main() {
   console.log('=== Liquid Hub Keeper Bot (Delta Neutral Pool) ===');
   console.log(`RangeManager: ${process.env.RANGEMANAGER_ADDRESS}`);
@@ -91,6 +100,13 @@ async function main() {
   const rpcPool = new RPCPool();
   const provider = rpcPool.getProvider();
   const { rangeManager, vault, hedgeManager, pauseController } = createContracts(provider);
+  await assertKeeperTopology(rpcPool, { rangeManager, vault, hedgeManager });
+  console.log('Keeper topology: RangeManager/Vault/tokens/AaveHedgeManager verified\n');
+
+  const actionAlerts = new PersistentActionAlerts({
+    poolName: process.env.POOL_NAME || 'UNI-ARB-WETH-USDC-DN',
+  });
+  await actionAlerts.init();
 
   // Resolve Treasury + bounty info
   const { treasury, treasuryAddr, usdc } = await resolveTreasury(rpcPool, vault);
@@ -133,11 +149,7 @@ async function main() {
     try {
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
 
-      if (CHECK_ONLY) {
-        await logPriceCacheBeforeDecision(rangeManager, rpcPool);
-      } else {
-        await rebalancer.ensureFreshPriceCacheForDecision();
-      }
+      await logPriceCacheBeforeDecision(rangeManager, rpcPool);
 
       const [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
         async (p) => {
@@ -164,6 +176,9 @@ async function main() {
           console.log(`  PauseController: unavailable (${(e.message || '').slice(0, 80)})`);
         }
       }
+
+      let hedgeAdjustedThisCycle = false;
+      let depositStateChangedThisCycle = false;
 
       // DN: Show AAVE hedge state. Mirrors the format used by the protocol's
       // dn-aave-watcher (`aave-watcher.js`) so logs are easy to compare.
@@ -204,6 +219,7 @@ async function main() {
             return { wallet: signer, request: await hedge.adjustHedge.populateTransaction() };
           }, 'adjustHedge-priority');
           console.log(`  -> Priority hedge/HF repair executed: ${rcpt.hash}`);
+          hedgeAdjustedThisCycle = true;
         } catch (e) {
           console.log(`  Priority hedge: no action (${(e.reason || e.message || '').slice(0, 80)})`);
         }
@@ -218,11 +234,12 @@ async function main() {
       // the top), so freshness for the rebalance no longer depends on this snapshot — but keeping the order
       // lets a single cycle both snapshot (bounty) and rebalance on a fresh price.
       if (!CHECK_ONLY) {
+        let snapshotDue = false;
         try {
-          const due = await rpcPool.executeWithRetry(async (p) => {
+          snapshotDue = await rpcPool.executeWithRetry(async (p) => {
             return await rangeManager.connect(p).isSnapshotDue();
           });
-          if (due) {
+          if (snapshotDue) {
             const metricsEnabled = treasury ? await readContract(rpcPool, treasury, 'metricsBountyEnabled') : false;
             const metricsAmount = treasury ? await readContract(rpcPool, treasury, 'metricsBountyAmount') : 0n;
             await checkBountyFunding('metrics', metricsEnabled, metricsAmount, treasuryAddr, usdc, rpcPool);
@@ -236,10 +253,13 @@ async function main() {
               };
             }, 'recordPriceSnapshot');
             console.log(`  -> Snapshot recorded: ${rcpt.hash}`);
+            await trackAction(actionAlerts, 'success', 'snapshot', `Snapshot recorded: ${rcpt.hash}`);
+          } else {
+            await trackAction(actionAlerts, 'success', 'snapshot', 'Snapshot no longer due');
           }
         } catch (e) {
-          // Revert is expected when a snapshot is not yet due or price cache is stale — not fatal.
           console.log(`  Snapshot: skipped (${(e.reason || e.message || '').slice(0, 80)})`);
+          await trackAction(actionAlerts, 'failure', 'snapshot', e.reason || e.message);
         }
       }
 
@@ -262,16 +282,37 @@ async function main() {
               v.isRebalancing(),
             ]);
           });
-          if (pending > 0n && positions.length > 0 && !isRebalancing) {
+          if (pending === 0n) {
+            await trackAction(actionAlerts, 'success', 'deposit', 'No queued deposit remains');
+            await trackAction(
+              actionAlerts,
+              'success',
+              'mint',
+              positions.length > 0 ? 'Initial position is available' : 'No queued deposit requires an initial mint'
+            );
+          } else if (positions.length === 0) {
+            const message = `${pending} queued deposit(s) waiting for the main bot initial mint`;
+            console.log(`  Deposit deferred: ${message}`);
+            await trackAction(actionAlerts, 'failure', 'mint', message);
+          } else if (!isRebalancing) {
+            await trackAction(actionAlerts, 'success', 'mint', 'Initial position is available');
             const depEnabled = treasury ? await readContract(rpcPool, treasury, 'depositBountyEnabled') : false;
             const depAmount = treasury ? await readContract(rpcPool, treasury, 'depositBountyAmount') : 0n;
             await checkBountyFunding('deposit', depEnabled, depAmount, treasuryAddr, usdc, rpcPool);
             console.log(`  -> ${pending.toString()} deposit(s) pending, processing one on-chain...`);
             const result = await rebalancer.processDeposit();
-            if (result.success) console.log(`  -> Deposit processed (${result.txHashes.length} tx)`);
+            if (result.success) {
+              console.log(`  -> Deposit processed (${result.txHashes.length} tx)`);
+              depositStateChangedThisCycle = true;
+              await trackAction(actionAlerts, 'success', 'deposit', `Deposit processed: ${result.txHashes[0]}`);
+            } else if (!result.deferred) {
+              depositStateChangedThisCycle = Boolean(result.stateMayHaveChanged);
+              await trackAction(actionAlerts, 'failure', 'deposit', result.error);
+            }
           }
         } catch (e) {
           console.log(`  Deposit: skipped (${(e.reason || e.message || '').slice(0, 80)})`);
+          await trackAction(actionAlerts, 'failure', 'deposit', e.reason || e.message);
         }
       }
 
@@ -281,7 +322,7 @@ async function main() {
       // sizing: flash-repay for over-hedge, borrow + oracle-bounded sale + collateral supply for under-hedge.
       // The staticCall prevents a transaction when drift is below the dynamic threshold, cooldown is active,
       // or a safety post-condition cannot be met. Every successful correction can earn the bounty.
-      if (!CHECK_ONLY && hedgeManager && wallet) {
+      if (!CHECK_ONLY && hedgeManager && wallet && !hedgeAdjustedThisCycle && !depositStateChangedThisCycle) {
         try {
           // Always simulate the on-chain action. adjustHedge() itself applies the normal cooldown, while
           // its HF-repair branch deliberately bypasses that cooldown. An off-chain cooldown gate here would
@@ -302,6 +343,7 @@ async function main() {
             };
           }, 'adjustHedge');
           console.log(`  -> Hedge adjusted: ${rcpt.hash}`);
+          hedgeAdjustedThisCycle = true;
         } catch (e) {
           // Revert is expected here for low drift, normal cooldown, or an unmet safety condition. Not fatal.
           console.log(`  Hedge: no adjustment (${(e.reason || e.message || '').slice(0, 80)})`);
@@ -313,29 +355,18 @@ async function main() {
       // on the RangeManager. Other actions (MINT_INITIAL, etc.) are gated on-chain
       // by `onlyAuthorized` and reserved for the protocol bot / Safe, so we just
       // wait silently for the next cycle.
-      // AUDIT M-01/H-06 : on rebalance si le RANGE l'exige, OU si un DRIFT DN peut nécessiter une recomposition.
-      // Le rebalancer simule ensuite RangeManager.rebalance() en eth_call avec les paramètres calculés et skippe
-      // proprement si la gate on-chain (needsRebalance || dnDriftCritical) refuserait la tx.
-      let dnDriftRebalance = false;
-      if (hasPosition && (!needsRebalance || action !== 'REBALANCE')) {
-        try {
-          const [, dnAmtIn] = await rpcPool.executeWithRetry(async (p) => {
-            return await vault.connect(p).getRebalanceSwapParams();
-          });
-          dnDriftRebalance = dnAmtIn > 0n;
-        } catch (_) { /* vue indisponible → pas de trigger DN */ }
-      }
-      const doRebalance = (needsRebalance && action === 'REBALANCE') || dnDriftRebalance;
+      // A non-zero swap plan is not a rebalance signal. Only the on-chain instruction can open this path.
+      const doRebalance = needsRebalance && action === 'REBALANCE';
 
       if (!doRebalance) {
         console.log('  -> No rebalance needed\n');
       } else if (CHECK_ONLY) {
-        console.log(`  -> Rebalance needed (${dnDriftRebalance && !needsRebalance ? 'DN drift in-range' : 'range'}, check-only, skipping)\n`);
+        console.log('  -> Rebalance needed (check-only, skipping)\n');
       } else {
         const keeperEnabled = treasury ? await readContract(rpcPool, treasury, 'keeperBountyEnabled') : false;
         const keeperAmount = treasury ? await readContract(rpcPool, treasury, 'keeperBountyAmount') : 0n;
         await checkBountyFunding('rebalance', keeperEnabled, keeperAmount, treasuryAddr, usdc, rpcPool);
-        console.log(`  -> Executing REBALANCE (${dnDriftRebalance && !needsRebalance ? 'DN drift in-range' : 'range'})...`);
+        console.log(`  -> Executing REBALANCE (${reason || 'on-chain signal'})...`);
         const result = await rebalancer.executeRebalance(tokenId);
         if (result.success) {
           console.log(`  -> Success (${result.txHashes.length} txs)\n`);

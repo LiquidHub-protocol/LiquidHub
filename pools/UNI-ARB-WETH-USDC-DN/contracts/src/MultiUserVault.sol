@@ -139,6 +139,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     error E_DEPOSIT_TOO_LARGE(); // dépôt en tête > plafond compatible MAX_SWAP_CHUNKS → anti-DoS file
     error E_NOT_REFUNDABLE(); // remboursement dépôt en tête demandé avant expiration
     error E_ZERO_SHARES(); // depot processe pour 0 share / 0 valeur (audit V1)
+    error E_HEDGE_PAUSED(); // nouvelles entrees DN refusees tant que les ouvertures AAVE sont suspendues
 
     // ===== STRUCTURES =====
 
@@ -466,7 +467,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         _requirePause(0x5ea9e82a); // requireInflowsActive()
         if (amount0 == 0 && amount1 == 0) revert E21();
         // DN pools: dépôts USDC uniquement (token0/WETH non accepté en dépôt direct)
-        if (hedgeManager != address(0) && amount0 > 0) revert E70();
+        // AaveHedgeManager.paused bloque uniquement les NOUVELLES ouvertures AAVE. Refuser ici
+        // evite d'empiler une entree FIFO inexecutable; settlement/withdraw/maintenance restent ouverts.
+        DnDepositLib.requireDepositOpen(hedgeManager, amount0);
         if (hasPendingDeposit[msg.sender]) revert E22();
 
         rangeManager.refreshPriceCache();
@@ -1359,9 +1362,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     // ===== FONCTIONS DE CONFIGURATION =====
 
-    function updateCommissionRate(uint256 newRate) external onlyOwner {
+    function updateCommissionRate(uint256 newRate) external onlyOwner nonReentrant {
         if (newRate > 3000) revert E14();
         uint256 oldRate = commissionRate;
+        // Cristallise feeGrowth avec l'ancien taux. Le callback recordFeesCollected() lit commissionRate
+        // avant sa mise a jour; un echec de collecte laisse donc aussi le taux inchange (fail-closed).
+        rangeManager.collectFeesForVault();
         commissionRate = newRate;
         emit CommissionRateUpdated(oldRate, newRate);
     }
@@ -1415,7 +1421,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function setHedgeManager(address _hedgeManager) external onlyOwner {
-        if (_hedgeManager == address(0)) revert E18();
+        // Configuration one-shot du deploiement courant. Aucune migration ni inspection d'un ancien
+        // HedgeManager: chaque nouvelle pool est deployee proprement et son ancien deploiement est liquide
+        // separement par l'operateur.
+        if (_hedgeManager == address(0) || hedgeManager != address(0)) revert E18();
         hedgeManager = _hedgeManager;
         emit HedgeManagerSet(_hedgeManager);
     }
@@ -1429,16 +1438,16 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     /// @notice Recover non-protected tokens (airdrops, erroneous transfers, donations)
-    /// @dev Blocks token0/token1 (user funds, cannot be moved). Destination is flexible:
-    ///      refund the sender, send to Treasury, or keep for protocol use depending on context.
-    ///      Each rescue emits TokenRescued for full on-chain traceability.
-    /// @param tokenAddr Token to rescue (must not be token0 or token1)
+    /// @dev Pool tokens are recoverable only above the exact reserves backing queued deposits.
+    ///      Active LP/AAVE capital is held outside the Vault; pending user funds remain untouchable.
+    /// @param tokenAddr Token to rescue
     /// @param to Recipient address
     /// @param amount Amount to rescue
-    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyEmergencySafe {
-        if (tokenAddr == address(token0) || tokenAddr == address(token1)) revert E18();
+    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyEmergencySafe nonReentrant {
         if (to == address(0)) revert E17();
-        IERC20(tokenAddr).safeTransfer(to, amount);
+        DnDepositLib.rescueVaultToken(
+            tokenAddr, address(token0), address(token1), to, amount, _pendingTotal0, _pendingTotal1
+        );
         emit TokenRescued(tokenAddr, to, amount);
     }
 

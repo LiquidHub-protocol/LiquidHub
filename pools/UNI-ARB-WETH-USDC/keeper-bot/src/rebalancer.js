@@ -1,14 +1,34 @@
-const { ethers } = require('ethers');
+const USD_SCALE = 100_000_000n;
+
+function ceilDiv(value, divisor) {
+  if (divisor <= 0n) throw new Error('chunk divisor must be positive');
+  return (value + divisor - 1n) / divisor;
+}
+
+function calculateChunkPlan(amountIn, priceUsd8, tokenDecimals, capUsd) {
+  const amountUsd8 = (BigInt(amountIn) * BigInt(priceUsd8)) / (10n ** BigInt(tokenDecimals));
+  const capUsd8 = BigInt(capUsd) * USD_SCALE;
+  const chunkCount = capUsd8 > 0n ? (ceilDiv(amountUsd8, capUsd8) || 1n) : 1n;
+  return { amountUsd8, chunkCount };
+}
+
+function formatUsd8(value) {
+  const amount = BigInt(value);
+  const whole = amount / USD_SCALE;
+  const fraction = (amount % USD_SCALE).toString().padStart(8, '0').slice(0, 2);
+  return `${whole}.${fraction}`;
+}
 
 /**
  * Splits a BigInt amount into `numChunks` as-equal-as-possible parts.
  */
 function divideIntoChunks(totalAmount, numChunks) {
-  if (numChunks <= 1) return [totalAmount];
+  const count = BigInt(numChunks);
+  if (count <= 1n) return [BigInt(totalAmount)];
   const chunks = [];
-  const chunkSize = totalAmount / BigInt(numChunks);
-  for (let i = 0; i < numChunks - 1; i++) chunks.push(chunkSize);
-  chunks.push(totalAmount - chunkSize * BigInt(numChunks - 1));
+  const chunkSize = BigInt(totalAmount) / count;
+  for (let i = 1n; i < count; i++) chunks.push(chunkSize);
+  chunks.push(BigInt(totalAmount) - chunkSize * (count - 1n));
   return chunks;
 }
 
@@ -28,72 +48,29 @@ class Rebalancer {
     this.rpcPool = rpcPool;
   }
 
-  async ensureFreshPriceCacheForDecision() {
-    return await this._freshPriceCache('keeper decision');
-  }
-
   async executeRebalance(tokenId) {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
     try {
-      await this._syncFeesForDepositPlan();
-      const priceCache = await this._freshPriceCache('rebalance plan/minOut');
-      // 1. Read optimal swap params (what the contract would expect) — REBALANCE = état post-burn (NFT inclus).
-      const swapParams = await this.rpcPool.executeWithRetry(async (provider) => {
-        return await this.rangeManager.connect(provider).getOptimalSwapParams();
-      });
-
-      let swapAmounts = [];
-      let minOuts = [];
-      let tokenIn = process.env.TOKEN0_ADDRESS;
-      let tokenOut = process.env.TOKEN1_ADDRESS;
-
-      if (swapParams.swapNeeded && swapParams.amountIn > 0n) {
-        const token0 = process.env.TOKEN0_ADDRESS;
-        const token1 = process.env.TOKEN1_ADDRESS;
-        tokenIn = swapParams.zeroForOne ? token0 : token1;
-        tokenOut = swapParams.zeroForOne ? token1 : token0;
-
-        // Read on-chain chunk cap (initMultiSwapTvl in USD, contract value)
-        const initMultiSwapTvl = await this.rpcPool.executeWithRetry(async (provider) => {
-          return await this.rangeManager.connect(provider).initMultiSwapTvl();
-        });
-        // Decimals read ON-CHAIN from config() (generic for any pair, not the .env) — same source as processDeposit
-        const cfg = await this.rpcPool.executeWithRetry(async (provider) => {
-          return await this.rangeManager.connect(provider).config();
-        });
-        const dec0 = Number(cfg.token0Decimals);
-        const dec1 = Number(cfg.token1Decimals);
-        const decimals = swapParams.zeroForOne ? dec0 : dec1;
-        const price = swapParams.zeroForOne
-          ? Number(priceCache.price0) / 1e8
-          : Number(priceCache.price1) / 1e8;
-
-        const amountUSD = parseFloat(ethers.formatUnits(swapParams.amountIn, decimals)) * price;
-        const capUSD = Number(initMultiSwapTvl);
-
-        // Number of chunks to stay under the on-chain per-chunk cap
-        const numSwaps = capUSD > 0 ? Math.max(1, Math.ceil(amountUSD / capUSD)) : 1;
-        swapAmounts = divideIntoChunks(swapParams.amountIn, numSwaps);
-        // AUDIT H-03 : minOut DOIT respecter le plancher oracle on-chain (validateMinOutsAgainstOracle) —
-        // 0 ferait revert "minOut<floor". Même calcul que le dépôt (_oracleMinOut), pas de 0.
-        const slippageBps = Number(cfg.maxSlippageBps);
-        minOuts = swapAmounts.map((amtIn) => this._oracleMinOut(swapParams.zeroForOne, amtIn, priceCache, dec0, dec1, slippageBps));
-
-        console.log(`  Swap: ${numSwaps} chunk(s), ~$${amountUSD.toFixed(0)} total (cap $${capUSD}/chunk), minOut oracle-floored`);
-      } else {
-        console.log('  No swap needed (already balanced)');
+      let plan;
+      try {
+        plan = await this._buildRebalancePlan(await this._readPriceCache());
+        await this._simulateRebalance(plan);
+      } catch (firstError) {
+        console.log(`  Rebalance plan rejected; refreshing once and recomputing: ${this._errorText(firstError)}`);
+        const refreshed = await this._refreshPriceCacheForAction('rebalance stale-plan retry');
+        plan = await this._buildRebalancePlan(refreshed);
+        await this._simulateRebalance(plan);
       }
 
-      // 2. Single atomic call — contract does burn → swap(s) → mint → bounty
+      this._logPlan(plan);
       console.log('  Executing rebalance() on-chain...');
       const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
         const signer = this.wallet.connect(provider);
         const rm = this.rangeManager.connect(signer);
-        await rm.rebalance.staticCall(swapAmounts, minOuts, tokenIn, tokenOut);
         return {
           wallet: signer,
-          request: await rm.rebalance.populateTransaction(swapAmounts, minOuts, tokenIn, tokenOut),
+          request: await rm.rebalance.populateTransaction(plan.swapAmounts, plan.minOuts, plan.tokenIn, plan.tokenOut),
         };
       }, 'rebalance');
       console.log(`  Rebalance complete: ${receipt.hash}`);
@@ -116,59 +93,31 @@ class Rebalancer {
   async processDeposit() {
     console.log('\n=== Processing queued deposit (permissionless) ===');
     try {
-      const priceCache = await this._freshPriceCache('deposit plan/minOut');
       await this._syncFeesForDepositPlan();
-      // AUDIT H-01/H-03 : DÉPÔT → vue dédiée (état post-transfert du dépôt + ratio NFT existant), PAS
-      // getOptimalSwapParams (qui reflète l'état rebalance/post-burn → faux pour un dépôt).
-      const [zeroForOne, amountIn] = await this.rpcPool.executeWithRetry(async (provider) => {
-        return await this.vault.connect(provider).getDepositSwapParams();
-      });
-
-      let swapAmounts = [];
-      let minOuts = [];
-      let tokenIn = process.env.TOKEN0_ADDRESS;
-      let tokenOut = process.env.TOKEN1_ADDRESS;
-
-      if (amountIn > 0n) {
-        const token0 = process.env.TOKEN0_ADDRESS;
-        const token1 = process.env.TOKEN1_ADDRESS;
-        tokenIn = zeroForOne ? token0 : token1;
-        tokenOut = zeroForOne ? token1 : token0;
-
-        const [initMultiSwapTvl, cfg] = await this.rpcPool.executeWithRetry(async (provider) => {
-          const rm = this.rangeManager.connect(provider);
-          return await Promise.all([rm.initMultiSwapTvl(), rm.config()]);
-        });
-
-        const dec0 = Number(cfg.token0Decimals);
-        const dec1 = Number(cfg.token1Decimals);
-        const decimals = zeroForOne ? dec0 : dec1;
-        const price = zeroForOne
-          ? Number(priceCache.price0) / 1e8
-          : Number(priceCache.price1) / 1e8;
-
-        const amountUSD = parseFloat(ethers.formatUnits(amountIn, decimals)) * price;
-        const capUSD = Number(initMultiSwapTvl);
-        const numSwaps = capUSD > 0 ? Math.max(1, Math.ceil(amountUSD / capUSD)) : 1;
-        swapAmounts = divideIntoChunks(amountIn, numSwaps);
-
-        // Oracle-floored minOuts (replicates RangeOperations.oracleMinOut on-chain math) — au plancher exact.
-        const slippageBps = Number(cfg.maxSlippageBps);
-        minOuts = swapAmounts.map((amt) => this._oracleMinOut(zeroForOne, amt, priceCache, dec0, dec1, slippageBps));
-
-        console.log(`  Swap: ${numSwaps} chunk(s), ~$${amountUSD.toFixed(0)} total (cap $${capUSD}/chunk), minOut floored by oracle`);
-      } else {
-        console.log('  No swap needed (deposit already balanced)');
+      let plan;
+      try {
+        plan = await this._buildDepositPlan(await this._readPriceCache());
+        await this._simulateDeposit(plan);
+      } catch (firstError) {
+        console.log(`  Deposit plan rejected; refreshing once and recomputing: ${this._errorText(firstError)}`);
+        const refreshed = await this._refreshPriceCacheForAction('deposit stale-plan retry');
+        plan = await this._buildDepositPlan(refreshed);
+        await this._simulateDeposit(plan);
       }
 
+      this._logPlan(plan);
       console.log('  Executing processDepositPermissionless() on-chain...');
       const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
         const signer = this.wallet.connect(provider);
         const vault = this.vault.connect(signer);
-        await vault.processDepositPermissionless.staticCall(swapAmounts, minOuts, tokenIn, tokenOut);
         return {
           wallet: signer,
-          request: await vault.processDepositPermissionless.populateTransaction(swapAmounts, minOuts, tokenIn, tokenOut),
+          request: await vault.processDepositPermissionless.populateTransaction(
+            plan.swapAmounts,
+            plan.minOuts,
+            plan.tokenIn,
+            plan.tokenOut
+          ),
         };
       }, 'processDepositPermissionless');
       console.log(`  Deposit processed: ${receipt.hash}`);
@@ -196,37 +145,106 @@ class Rebalancer {
     return (theo * (10000n - slip)) / 10000n;
   }
 
-  async _freshPriceCache(label) {
-    let priceCache = await this.rpcPool.executeWithRetry(async (provider) => {
+  async _readPriceCache() {
+    return await this.rpcPool.executeWithRetry(async (provider) => {
       return await this.rangeManager.connect(provider).priceCache();
     });
-    if (!this._needsPriceCacheRefresh(priceCache)) return priceCache;
+  }
 
-    console.log(`  priceCache stale/invalid before ${label}; calling refreshPriceCache()...`);
-    try {
-      const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
-        const signer = this.wallet.connect(provider);
-        const rm = this.rangeManager.connect(signer);
-        return {
-          wallet: signer,
-          request: await rm.refreshPriceCache.populateTransaction(),
-        };
-      }, 'refreshPriceCache');
-      console.log(`  priceCache refreshed: ${receipt.hash}`);
-      priceCache = await this.rpcPool.executeWithRetry(async (provider) => {
-        return await this.rangeManager.connect(provider).priceCache();
-      });
-    } catch (error) {
-      console.log(`  refreshPriceCache skipped/failed: ${(error.reason || error.shortMessage || error.message || '').slice(0, 100)}`);
-    }
-
+  async _refreshPriceCacheForAction(label) {
+    const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
+      const signer = this.wallet.connect(provider);
+      const rm = this.rangeManager.connect(signer);
+      return { wallet: signer, request: await rm.refreshPriceCache.populateTransaction() };
+    }, label);
+    console.log(`  priceCache refreshed for ${label}: ${receipt.hash}`);
+    const priceCache = await this._readPriceCache();
     if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) {
-      throw new Error('priceCache invalid after refresh attempt');
-    }
-    if (this._needsPriceCacheRefresh(priceCache)) {
-      throw new Error('priceCache still stale after refresh attempt');
+      throw new Error('priceCache invalid after action-linked refresh');
     }
     return priceCache;
+  }
+
+  async _buildRebalancePlan(priceCache) {
+    const swapParams = await this.rpcPool.executeWithRetry(async (provider) => {
+      return await this.rangeManager.connect(provider).getOptimalSwapParams();
+    });
+    return await this._buildPlan(swapParams.zeroForOne, swapParams.swapNeeded ? swapParams.amountIn : 0n, priceCache);
+  }
+
+  async _buildDepositPlan(priceCache) {
+    const [zeroForOne, amountIn] = await this.rpcPool.executeWithRetry(async (provider) => {
+      return await this.vault.connect(provider).getDepositSwapParams();
+    });
+    return await this._buildPlan(zeroForOne, amountIn, priceCache);
+  }
+
+  async _buildPlan(zeroForOne, amountIn, priceCache) {
+    const plan = {
+      swapAmounts: [],
+      minOuts: [],
+      tokenIn: process.env.TOKEN0_ADDRESS,
+      tokenOut: process.env.TOKEN1_ADDRESS,
+      amountUsd8: 0n,
+      chunkCount: 0n,
+      capUsd: 0n,
+    };
+    if (amountIn <= 0n) return plan;
+
+    const [initMultiSwapTvl, cfg] = await this.rpcPool.executeWithRetry(async (provider) => {
+      const rm = this.rangeManager.connect(provider);
+      return await Promise.all([rm.initMultiSwapTvl(), rm.config()]);
+    });
+    const dec0 = Number(cfg.token0Decimals);
+    const dec1 = Number(cfg.token1Decimals);
+    const tokenDecimals = zeroForOne ? dec0 : dec1;
+    const priceUsd8 = zeroForOne ? BigInt(priceCache.price0) : BigInt(priceCache.price1);
+    const { amountUsd8, chunkCount } = calculateChunkPlan(amountIn, priceUsd8, tokenDecimals, initMultiSwapTvl);
+
+    plan.tokenIn = zeroForOne ? process.env.TOKEN0_ADDRESS : process.env.TOKEN1_ADDRESS;
+    plan.tokenOut = zeroForOne ? process.env.TOKEN1_ADDRESS : process.env.TOKEN0_ADDRESS;
+    plan.swapAmounts = divideIntoChunks(amountIn, chunkCount);
+    plan.minOuts = plan.swapAmounts.map((amount) =>
+      this._oracleMinOut(zeroForOne, amount, priceCache, dec0, dec1, Number(cfg.maxSlippageBps))
+    );
+    plan.amountUsd8 = amountUsd8;
+    plan.chunkCount = chunkCount;
+    plan.capUsd = BigInt(initMultiSwapTvl);
+    return plan;
+  }
+
+  async _simulateRebalance(plan) {
+    await this.rpcPool.executeWithRetry(async (provider) => {
+      const rm = this.rangeManager.connect(this.wallet.connect(provider));
+      return await rm.rebalance.staticCall(plan.swapAmounts, plan.minOuts, plan.tokenIn, plan.tokenOut);
+    });
+  }
+
+  async _simulateDeposit(plan) {
+    await this.rpcPool.executeWithRetry(async (provider) => {
+      const vault = this.vault.connect(this.wallet.connect(provider));
+      return await vault.processDepositPermissionless.staticCall(
+        plan.swapAmounts,
+        plan.minOuts,
+        plan.tokenIn,
+        plan.tokenOut
+      );
+    });
+  }
+
+  _logPlan(plan) {
+    if (plan.chunkCount === 0n) {
+      console.log('  No swap needed (already balanced)');
+      return;
+    }
+    console.log(
+      `  Swap: ${plan.chunkCount} chunk(s), ~$${formatUsd8(plan.amountUsd8)} total ` +
+      `(cap $${plan.capUsd}/chunk), minOut oracle-floored`
+    );
+  }
+
+  _errorText(error) {
+    return (error.reason || error.shortMessage || error.message || 'unknown error').slice(0, 120);
   }
 
   async _syncFeesForDepositPlan() {
@@ -245,13 +263,6 @@ class Rebalancer {
     }
   }
 
-  _needsPriceCacheRefresh(priceCache) {
-    if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) return true;
-    const maxAgeSec = parseInt(process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || process.env.BOT_PRICE_CACHE_MAX_AGE_SEC || '300', 10);
-    const ts = Number(priceCache.timestamp || 0);
-    if (!Number.isFinite(maxAgeSec) || maxAgeSec <= 0 || !ts) return false;
-    return Math.floor(Date.now() / 1000) - ts > maxAgeSec;
-  }
 }
 
-module.exports = { Rebalancer };
+module.exports = { Rebalancer, calculateChunkPlan, divideIntoChunks };
