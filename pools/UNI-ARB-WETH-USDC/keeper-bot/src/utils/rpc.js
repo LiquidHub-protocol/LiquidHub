@@ -1,5 +1,8 @@
 const { ethers } = require('ethers');
 
+const RPC_READ_TIMEOUT_MS = 20_000;
+const RPC_TX_TIMEOUT_MS = 90_000;
+
 class RPCPool {
   constructor() {
     const urls = [
@@ -85,18 +88,35 @@ class RPCPool {
       msg.includes('nonce has already been used');
   }
 
-  async executeWithRetry(fn, maxRetries = 3) {
+  async withTimeout(fn, timeoutMs, label = 'RPC request') {
+    let timeoutId;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(fn),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => {
+            const error = new Error(`${label} timeout after ${timeoutMs}ms`);
+            error.code = 'TIMEOUT';
+            reject(error);
+          }, timeoutMs);
+        })
+      ]);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+  }
+
+  async executeWithRetry(fn, maxRetries = 3, timeoutMs = RPC_READ_TIMEOUT_MS) {
     let lastError;
     const attempts = Math.max(maxRetries, this.providers.length);
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const provider = this.getProvider();
       try {
-        return await fn(provider);
+        return await this.withTimeout(() => fn(provider), timeoutMs, `RPC attempt ${attempt}`);
       } catch (error) {
         lastError = error;
-        if (this.isProviderError(error)) {
-          this.markUnhealthy(provider, true);
-        }
+        if (!this.isProviderError(error)) throw error;
+        this.markUnhealthy(provider, true);
         console.warn(`RPC attempt ${attempt}/${attempts} failed: ${error.message}`);
       }
     }
@@ -136,7 +156,7 @@ class RPCPool {
         error.message = `${error.message} (broadcast tx: ${txHash})`;
         throw error;
       }
-    }, maxRetries);
+    }, maxRetries, RPC_TX_TIMEOUT_MS);
   }
 
   async executeSignedTxWithRetry(prepareFn, label = 'transaction', maxRetries = 3) {
@@ -189,8 +209,8 @@ class RPCPool {
         error.message = `${error.message} (signed broadcast tx: ${txHash})`;
         throw error;
       }
-    }, maxRetries);
+    }, maxRetries, RPC_TX_TIMEOUT_MS);
   }
 }
 
-module.exports = { RPCPool };
+module.exports = { RPCPool, RPC_READ_TIMEOUT_MS, RPC_TX_TIMEOUT_MS };

@@ -108,14 +108,14 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     // SÉCURITÉ (audit V1) : plancher oracle anti-sandwich pour les swaps de la Treasury.
     // Le Treasury est PARTAGÉ par toutes les pools d'une même chaîne → il peut swapper des tokens
     // volatils variés (WETH, WBTC, ...). Un feed Chainlink par token est déclaré par la gouvernance.
-    // swapToUSDC/collectAndBridge imposent amountOutMinimum >= prix oracle × (1 − swapFeedSlippageBps[token]),
+    // swapToUSDC impose amountOutMinimum >= prix oracle × (1 − swapFeedSlippageBps[token]),
     // et REVERT si aucun feed n'est configuré pour tokenIn (pas de swap d'un token non oraclé).
     mapping(address => AggregatorV3Interface) public swapFeeds; // tokenIn => feed Chainlink (prix en USD)
     mapping(address => uint32) public swapFeedMaxAges; // tokenIn => heartbeat max accepte pour ce feed
     mapping(address => uint16) public swapFeedSlippageBps; // tokenIn => slippage max tolere pour le floor oracle
     mapping(address => uint24) public swapPoolFees; // tokenIn => fee tier Uniswap autorise par le batch de pool
 
-    // --- Bridge Bounty (Phase 2) — paid to whoever calls bridgeToStakers / collectAndBridge ---
+    // --- Bridge Bounty (Phase 2) — paid to whoever calls bridgeToStakers ---
     // Anti-drain protections (configurable by multisig):
     //  - cooldown:  bounty paid at most once per `bridgeBountyCooldown` seconds
     //  - min ratio: bridged amount must be >= bridgeBountyAmount * BRIDGE_BOUNTY_MIN_RATIO
@@ -190,7 +190,6 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     event RangeManagerAuthorized(address indexed rangeManager, bool authorized);
     event SwapFeedConfigured(address indexed token, address feed, uint16 swapSlippageBps, uint32 maxAge);
     event SwapPoolFeeConfigured(address indexed token, uint24 fee);
-    event CollectedAndBridged(address indexed tokenIn, uint256 swappedUSDC, uint256 bridgedUSDC, uint32 dstEid);
     event MetricsBountyPaid(address indexed keeper, uint256 amount);
     event MetricsBountyConfigured(bool enabled, uint256 amount);
     event MetricsBountyDailyCapConfigured(uint256 dailyCap);
@@ -238,7 +237,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
 
     // --- Public Functions ---
 
-    /// @notice Swap any ERC-20 token held by this Treasury to USDC via Uniswap V3. Callable by anyone.
+    /// @notice Swap an approved ERC-20 held by this Treasury to USDC through an owner-authorized route.
     // SÉCURITÉ (audit V1) : restreint à onlyOwner (Safe). Avant, swapToUSDC était public : n'importe qui
     // pouvait déclencher un swap des tokens de la Treasury avec un minAmountOut faible / une route
     // défavorable et sandwicher la conversion des fees. C'est une opération de gestion de trésorerie
@@ -380,87 +379,6 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
             reserve += (depositBountyDailyCap > 0 ? depositBountyDailyCap : depositBountyAmount) * authorizedVaultCount;
         }
         if (bridgeBountyEnabled) reserve += bridgeBountyAmount;
-    }
-
-    /// @notice Swap token to USDC + bridge to staking in one transaction. Callable by anyone.
-    /// @dev Caller pays native gas for Stargate cross-chain fees via msg.value.
-    function collectAndBridge(address tokenIn, uint24 fee, uint256 amountIn, uint256 minSwapOut)
-        external
-        payable
-        nonReentrant
-        returns (uint256 usdcBridged)
-    {
-        require(bridgeEnabled, "Bridge disabled");
-        require(bridgeDestinationAddress != address(0), "Destination not set");
-        require(amountIn > 0, "Zero amount");
-
-        // Step 1: Swap to USDC (if not already USDC)
-        uint256 usdcAmount;
-        if (tokenIn == address(usdc)) {
-            usdcAmount = amountIn;
-            _requireDistributableUsdc(amountIn);
-        } else {
-            require(fee == swapPoolFees[tokenIn] && fee != 0, "Unapproved fee");
-            IERC20 token = IERC20(tokenIn);
-            uint256 balanceBefore = token.balanceOf(address(this));
-            require(balanceBefore >= amountIn, "Insufficient balance");
-
-            token.safeApprove(address(swapRouter), 0);
-            token.safeApprove(address(swapRouter), amountIn);
-
-            // SÉCURITÉ (audit V1) : collectAndBridge est PERMISSIONLESS (décentralisation). On impose donc
-            // un plancher oracle anti-sandwich : amountOutMinimum = max(minSwapOut fourni, plancher oracle).
-            // Le plancher revert si aucun feed n'est configuré pour tokenIn → pas de swap d'un token non oraclé.
-            (uint256 floor, uint160 sqrtPriceLimitX96) = _oracleSwapBounds(tokenIn, amountIn);
-            uint256 minOut = minSwapOut > floor ? minSwapOut : floor;
-
-            ISwapRouter.ExactInputSingleParams memory swapParams = ISwapRouter.ExactInputSingleParams({
-                tokenIn: tokenIn,
-                tokenOut: address(usdc),
-                fee: fee,
-                recipient: address(this),
-                deadline: block.timestamp,
-                amountIn: amountIn,
-                amountOutMinimum: minOut,
-                sqrtPriceLimitX96: sqrtPriceLimitX96
-            });
-
-            usdcAmount = swapRouter.exactInputSingle(swapParams);
-            require(balanceBefore - token.balanceOf(address(this)) == amountIn, "Partial fill");
-            emit SwappedToUSDC(tokenIn, fee, amountIn, usdcAmount);
-            uint256 distributable = _distributableUsdc();
-            require(distributable > 0, "Bounty reserve");
-            if (usdcAmount > distributable) usdcAmount = distributable;
-        }
-
-        // Step 2: Bridge all swapped USDC via Stargate
-        SendParam memory sendParam = SendParam({
-            dstEid: bridgeDestinationEid,
-            to: bytes32(uint256(uint160(bridgeDestinationAddress))),
-            amountLD: usdcAmount,
-            minAmountLD: 0,
-            extraOptions: new bytes(0),
-            composeMsg: new bytes(0),
-            oftCmd: ""
-        });
-
-        (,, OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
-        _requireBridgeMinReceived(usdcAmount, receipt.amountReceivedLD);
-        sendParam.minAmountLD = receipt.amountReceivedLD;
-
-        MessagingFee memory msgFee = stargatePool.quoteSend(sendParam, false);
-        require(msg.value >= msgFee.nativeFee, "Insufficient native fee");
-
-        usdc.safeApprove(address(stargatePool), 0);
-        usdc.safeApprove(address(stargatePool), usdcAmount);
-
-        (, OFTReceipt memory oftReceipt,) =
-            stargatePool.sendToken{value: msgFee.nativeFee}(sendParam, msgFee, msg.sender);
-
-        usdcBridged = oftReceipt.amountReceivedLD;
-        emit CollectedAndBridged(tokenIn, usdcAmount, usdcBridged, bridgeDestinationEid);
-        _payBridgeBounty(msg.sender, oftReceipt.amountSentLD);
-        _refundNativeSurplus(msgFee.nativeFee);
     }
 
     function _refundNativeSurplus(uint256 usedNativeFee) internal {
@@ -786,7 +704,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         emit VaultAuthorized(_vault, _authorized);
     }
 
-    /// @notice Configure the bridge bounty (paid to whoever calls bridgeToStakers / collectAndBridge).
+    /// @notice Configure the bridge bounty (paid to whoever calls bridgeToStakers).
     function setBridgeBounty(bool _enabled, uint256 _amount) external onlyOwner {
         if (_enabled && _amount > 0 && bridgeBountyCooldown == 0) revert BridgeBountyCooldownZero();
         if (_enabled && _amount > 0 && bridgeBountyMinRatio == 0) revert BridgeBountyMinRatioZero();
@@ -861,6 +779,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         delete swapFeedSlippageBps[token];
         delete swapPoolFees[token];
         emit SwapFeedConfigured(token, address(0), 0, 0);
+        emit SwapPoolFeeConfigured(token, 0);
     }
 
     /// @dev Plancher anti-sandwich : USDC minimum attendu pour `amountIn` de `tokenIn`, depuis l'oracle

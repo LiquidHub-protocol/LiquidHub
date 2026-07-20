@@ -80,9 +80,10 @@ class PersistentActionAlerts {
     if (!previous || previous.consecutiveFailures === 0) return;
 
     if (previous.alerted) {
-      await this.sender(
+      const sent = await this.sender(
         `[${this.poolName}] Keeper ${action} recovered after ${previous.consecutiveFailures} failed cycles.\n${details}`
       );
+      if (!sent) return;
     }
     delete this.state.actions[action];
     await this._persist();

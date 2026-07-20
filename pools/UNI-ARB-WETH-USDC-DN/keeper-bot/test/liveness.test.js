@@ -6,6 +6,15 @@ const test = require('node:test');
 
 const { Rebalancer, calculateChunkPlan, divideIntoChunks } = require('../src/rebalancer');
 const { PersistentActionAlerts } = require('../src/utils/action-alerts');
+const { RPCPool } = require('../src/utils/rpc');
+
+test('RPC timeout releases a silent provider call', async () => {
+  const pool = Object.create(RPCPool.prototype);
+  await assert.rejects(
+    pool.withTimeout(() => new Promise(() => {}), 5, 'silent read'),
+    (error) => error.code === 'TIMEOUT' && /silent read timeout/.test(error.message)
+  );
+});
 
 test('chunk count and splitting stay in BigInt arithmetic', () => {
   const amountIn = 10n * 10n ** 18n;
@@ -89,4 +98,17 @@ test('rebalance simulates before one action-linked refresh and never syncs fees'
     'simulate:2',
     'send:rebalance',
   ]);
+});
+
+test('unrelated rebalance revert does not trigger an isolated price refresh', async () => {
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
+  let refreshCount = 0;
+  rebalancer._readPriceCache = async () => ({ valid: true });
+  rebalancer._buildRebalancePlan = async () => ({ swapAmounts: [], minOuts: [] });
+  rebalancer._simulateRebalance = async () => { throw new Error('E03 cooldown active'); };
+  rebalancer._refreshPriceCacheForAction = async () => { refreshCount += 1; };
+
+  const result = await rebalancer.executeRebalance(1n);
+  assert.equal(result.success, false);
+  assert.equal(refreshCount, 0);
 });

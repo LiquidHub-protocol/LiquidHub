@@ -11,6 +11,7 @@ contract PauseController {
 
     address public immutable safe;
     address public governance;
+    address public pendingGovernance;
     address public pauseGuardian;
     uint64 public inflowsPausedUntil;
     uint64 public withdrawalsPausedUntil;
@@ -27,6 +28,7 @@ contract PauseController {
     event WithdrawalsUnpaused();
     event DepositCooldownUpdated(uint64 oldCooldown, uint64 newCooldown);
     event GovernanceTransferred(address indexed oldGovernance, address indexed newGovernance);
+    event GovernanceTransferStarted(address indexed governance, address indexed pendingGovernance);
     event PauseGuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
 
     modifier onlyGovernance() {
@@ -49,9 +51,16 @@ contract PauseController {
 
     function transferGovernance(address newGovernance) external onlyGovernance {
         require(newGovernance != address(0), "E_ZERO");
+        pendingGovernance = newGovernance;
+        emit GovernanceTransferStarted(governance, newGovernance);
+    }
+
+    function acceptGovernance() external {
+        require(msg.sender == pendingGovernance, "E_PENDING_GOV");
         address oldGovernance = governance;
-        governance = newGovernance;
-        emit GovernanceTransferred(oldGovernance, newGovernance);
+        governance = msg.sender;
+        pendingGovernance = address(0);
+        emit GovernanceTransferred(oldGovernance, msg.sender);
     }
 
     function setPauseGuardian(address newGuardian) external onlyGovernance {

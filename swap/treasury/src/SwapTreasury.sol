@@ -118,7 +118,6 @@ contract SwapTreasury is Ownable {
     event BridgeBountyCooldownConfigured(uint64 cooldown, uint16 minRatio);
     event BridgeBountyPaid(address indexed keeper, uint256 amount);
     event BridgedToStakers(uint256 amountSent, uint256 amountReceived, uint32 dstEid, bytes32 guid);
-    event CollectedAndBridged(address indexed tokenIn, uint256 swappedUSDC, uint256 bridgedUSDC, uint32 dstEid);
     event TokenRescued(address indexed token, address indexed to, uint256 amount);
     event ETHRescued(address indexed to, uint256 amount);
 
@@ -164,33 +163,6 @@ contract SwapTreasury is Ownable {
         _requireDistributableUsdc(amount);
 
         (uint256 amountSent, uint256 amountReceived, bytes32 guid, uint256 nativeFee) = _bridgeUsdc(amount);
-        emit BridgedToStakers(amountSent, amountReceived, bridgeDestinationEid, guid);
-        _refundNativeSurplus(nativeFee);
-        _payBridgeBounty(msg.sender, amountSent);
-    }
-
-    function collectAndBridge(address tokenIn, uint24 fee, uint256 amountIn, uint256 minSwapOut)
-        external
-        payable
-        returns (uint256 usdcBridged)
-    {
-        require(!adminWithdrawEnabled, "Phase 1");
-        require(bridgeEnabled, "Bridge disabled");
-        require(bridgeDestinationAddress != address(0), "Destination not set");
-
-        uint256 usdcAmount;
-        if (tokenIn == address(usdc)) {
-            usdcAmount = amountIn;
-        } else {
-            usdcAmount = _swapToUSDC(tokenIn, fee, amountIn, minSwapOut);
-        }
-
-        uint256 amountToBridge = _bridgeableFromAmount(usdcAmount);
-        require(amountToBridge > 0, "Bounty reserve");
-
-        (uint256 amountSent, uint256 amountReceived, bytes32 guid, uint256 nativeFee) = _bridgeUsdc(amountToBridge);
-        usdcBridged = amountReceived;
-        emit CollectedAndBridged(tokenIn, usdcAmount, amountSent, bridgeDestinationEid);
         emit BridgedToStakers(amountSent, amountReceived, bridgeDestinationEid, guid);
         _refundNativeSurplus(nativeFee);
         _payBridgeBounty(msg.sender, amountSent);
@@ -396,12 +368,6 @@ contract SwapTreasury is Ownable {
             composeMsg: new bytes(0),
             oftCmd: ""
         });
-    }
-
-    function _bridgeableFromAmount(uint256 amount) internal view returns (uint256) {
-        uint256 available = bridgeableUsdc();
-        if (available == 0) return 0;
-        return amount < available ? amount : available;
     }
 
     function _requireDistributableUsdc(uint256 amount) internal view {

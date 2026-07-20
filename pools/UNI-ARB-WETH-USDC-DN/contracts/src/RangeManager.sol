@@ -27,6 +27,7 @@ interface IMultiUserVault {
     function totalShares() external view returns (uint256);
     function commissionRate() external view returns (uint256);
     function treasuryAddress() external view returns (address);
+    function dnMaxDepositUsd() external view returns (uint256);
     function startRebalance() external;
     function endRebalance() external;
 }
@@ -1163,6 +1164,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     function setInitMultiSwapTvl(uint256 _initMultiSwapTvl) external onlyVaultOwner {
         require(_initMultiSwapTvl > 0 && _initMultiSwapTvl <= 1_000_000, "E97");
+        require(IMultiUserVault(vault).dnMaxDepositUsd() <= _initMultiSwapTvl * 10 * 1e8, "E97");
         emit InitMultiSwapTvlUpdated(initMultiSwapTvl, _initMultiSwapTvl);
         initMultiSwapTvl = _initMultiSwapTvl;
     }

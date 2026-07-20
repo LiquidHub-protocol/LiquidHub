@@ -108,10 +108,10 @@ library RangeOperations {
         uint8 maxSnapshotsPerDay; // nombre de snapshots/jour (timing regulier = 86400/maxSnapshotsPerDay)
         uint8 volatMoyDay; // fenetre de calcul high/low en jours (<= 20)
         uint8 volatTrimDay; // nombre d'extremes hauts ET bas retires (trim des pics)
-        uint16 rangeStepBps; // palier d'arrondi du range, ex 50 = 0,5%
+        uint16 rangeStepBps; // unite strategique appliquee ensuite comme distance de ticks (~50 = 0,5%)
         uint16 rangeMultiplicatorBps; // facteur d'amplitude, 10000 = x1,0 ; 12500 = x1,25 ; 8000 = x0,8
-        uint16 rangeMinBps; // borne basse par cote du range dynamique (ex 100 = +/-1%)
-        uint16 rangeMaxBps; // borne haute par cote du range dynamique (ex 1000 = +/-10%)
+        uint16 rangeMinBps; // borne basse par cote en distance de ticks approx. (100 ~= +1,005%/-0,995%)
+        uint16 rangeMaxBps; // borne haute par cote en distance de ticks approx. (1000 ~= +10,52%/-9,52%)
         uint64 lastSnapshotAt; // timestamp du dernier snapshot (timing regulier)
     }
 
@@ -236,8 +236,8 @@ library RangeOperations {
         int24 tickSpacing = pool.tickSpacing();
 
         // Calculer le nombre de ticks pour chaque cote (ASYMETRIQUE)
-        // rangeUpPercent et rangeDownPercent sont en basis points (100 = 1%)
-        // 1% de prix ≈ 100 ticks (formule exacte: log(1.01) / log(1.0001) ≈ 99.5)
+        // Les valeurs BPS sont appliquees comme distances de ticks: approximation volontaire.
+        // 100 ticks = +1,005% vers le haut et -0,995% vers le bas avant alignement tickSpacing.
         int24 ticksUp = int24(uint24(config.rangeUpPercent));
         int24 ticksDown = int24(uint24(config.rangeDownPercent));
 

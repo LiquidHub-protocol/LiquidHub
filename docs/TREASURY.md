@@ -14,10 +14,10 @@ The protocol is currently in **Phase 1 of its decentralization roadmap**. What t
 
 | Aspect | Phase 1 (current) | Phase 2 (planned) |
 |--------|-------------------|-------------------|
-| Governance | Gnosis Safe 2-of-3 multisig controls all configuration | Same multisig, but admin withdrawals locked |
+| Governance | Gnosis Safe multisig controls configuration | Timelock governance controls configuration; the Safe keeps only the separately documented emergency/recovery powers |
 | Admin withdrawals | Enabled, capped by a configurable monthly limit | `disableAdminWithdraw()` called irreversibly — Treasury locked against any admin withdrawal |
 | Keeper / deposit / metrics / hedge bounties | **Enabled** — configurable by the multisig | Permissionless, fully active |
-| Bridge to stakers | Mechanism deployed, **bounty disabled** (no staking contract yet) | `bridgeToStakers()` / `collectAndBridge()` live, fees routed to stakers |
+| Bridge to stakers | Mechanism deployed, **bounty disabled** (no staking contract yet) | `bridgeToStakers()` live, fees routed to the governed destination |
 
 We believe clarity on what is and isn't decentralized matters more than marketing claims. Every function described below already exists on-chain and is verified on the block explorer — the table above states what is *enabled* today versus what is planned.
 
@@ -55,7 +55,9 @@ Converts a configured ERC-20 token held by the Treasury to USDC via the DEX rout
 - USDC remains in the Treasury after the swap.
 - Useful for consolidating revenue from multiple token types into USDC.
 
-`collectAndBridge()` remains permissionless in Phase 2, but it enforces the same approved fee tier and the configured oracle floor before swapping and bridging.
+Conversion and bridging are deliberately separate. Governance first calls owner-only `swapToUSDC()` through the Safe
+in Phase 1 or the Timelock in Phase 2. A keeper may then call permissionless `bridgeToStakers()` for the resulting
+USDC. There is no permissionless function that can choose when or how Treasury-held non-USDC assets are sold.
 
 ---
 
@@ -69,7 +71,7 @@ The Treasury rewards community keepers who execute the protocol's permissionless
 | Deposit (process) | `processDepositPermissionless()` on the Vault | `setDepositBounty(enabled, amount)` |
 | Metrics (snapshot) | `recordPriceSnapshot()` on the RangeManager | `setMetricsBounty(enabled, amount)` |
 | Hedge (DN) | `adjustHedge()` on the AaveHedgeManager | `setHedgeBounty(enabled, amount)` |
-| Bridge _(Phase 2)_ | `bridgeToStakers()` / `collectAndBridge()` | `setBridgeBounty(enabled, amount)` |
+| Bridge _(Phase 2)_ | `bridgeToStakers()` | `setBridgeBounty(enabled, amount)` |
 
 > **Amounts** are not listed here. The current bounty amounts are published on the protocol's Decentralization page (https://liquidhub.app/docs#decentralization) and are the source of truth on-chain — read the live value on the Treasury contract (`keeperBountyAmount()`, `depositBountyAmount()`, etc.) before relying on it.
 

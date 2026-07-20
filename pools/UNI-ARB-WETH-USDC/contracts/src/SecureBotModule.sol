@@ -121,7 +121,6 @@ contract SecureBotModule {
         // Fonctions Treasury (bridge Stargate v2 vers staking contract Phase 2)
         allowedFunctions[0xa5599124] = true; // bridgeToStakers(uint256)
         allowedFunctions[0x56a12aca] = true; // distributeToStakers(uint256) - bridge treasury same-chain
-        allowedFunctions[0x1dc28748] = true; // collectAndBridge(address,uint24,uint256,uint256)
     }
 
     receive() external payable {}
@@ -442,7 +441,6 @@ contract SecureBotModule {
             || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
             || selector == 0x0040718e // endRebalance()
             || selector == 0xa5599124 // bridgeToStakers(uint256)
-            || selector == 0x56a12aca // distributeToStakers(uint256)
-            || selector == 0x1dc28748; // collectAndBridge(address,uint24,uint256,uint256)
+            || selector == 0x56a12aca; // distributeToStakers(uint256)
     }
 }

@@ -55,7 +55,7 @@ The range is computed entirely by `RangeManager` — no off-chain bot or databas
 - Additionally uses an **AAVE V3 hedge** to neutralize directional price exposure:
   - USDC is supplied as AAVE collateral and WETH is borrowed against it.
   - The borrowed WETH offsets the LP's long WETH exposure. The hedge is piloted on the **net effective short** (`effectiveShort = debt − idle WETH`, idle on the HedgeManager and RangeManager) versus a target of `hedgeTargetBps × wethInLP` (100% = strict delta-neutral by default). The borrowed WETH is integrated into the LP (never left idle), so the AAVE debt is a real short covering the LP's WETH.
-- **Permissionless hedge adjustment** — `adjustHedge()` (see Hedge Adjustment below) is callable by any keeper for a bounty: it corrects an **over-hedge** on-chain (repay) and **reverts on under-hedge** (an under-hedge is corrected by rebuilding the LP composition during a `rebalance()`, with an on-chain post-check).
+- **Permissionless hedge adjustment** — `adjustHedge()` (see Hedge Adjustment below) is callable by any keeper for a bounty. It corrects over-hedge and under-hedge without caller-supplied sizing; every path is atomic and guarded by oracle/TWAP, drift, cooldown and final AAVE health-factor checks. The atomic LP rebalance remains the fallback when direct under-hedge repair lacks safe HF headroom or market liquidity.
 - **USDC reserve** — a small USDC reserve is kept on the HedgeManager so adjustments don't have to touch the LP; it is **reconstituted on-chain inside `adjustHedge()`** when the health factor is above target (no separate action).
 - **Net effect**: LP fees are earned without directional price exposure.
 - **Withdrawals are atomic**: burn LP, flash loan settlement (if needed), return tokens to user in a single transaction.
@@ -95,7 +95,7 @@ The nominal flow is a single public transaction:
    vault and pays the keeper bounty if enabled.
 2. If any check fails, the whole transaction reverts and the next bot/keeper cycle can retry with a fresh plan.
 
-On DN pools, routine over-hedge corrections are adjusted independently and permissionlessly via `adjustHedge()` (see Hedge Adjustment). Severe under-hedge is handled by the permissionless `rebalance()` path: the LP composition is rebuilt and the transaction includes strict post-checks so a badly hedged result reverts atomically.
+On DN pools, routine drift in either direction is adjusted independently and permissionlessly via `adjustHedge()` (see Hedge Adjustment). If a direct under-hedge repair cannot preserve the configured AAVE health factor, the permissionless `rebalance()` path rebuilds the LP composition with strict post-checks; a badly hedged result reverts atomically.
 
 ---
 

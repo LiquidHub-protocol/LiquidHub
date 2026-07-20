@@ -57,6 +57,7 @@ class Rebalancer {
         plan = await this._buildRebalancePlan(await this._readPriceCache());
         await this._simulateRebalance(plan);
       } catch (firstError) {
+        if (!this._shouldRefreshForPlanError(firstError)) throw firstError;
         console.log(`  Rebalance plan rejected; refreshing once and recomputing: ${this._errorText(firstError)}`);
         const refreshed = await this._refreshPriceCacheForAction('rebalance stale-plan retry');
         plan = await this._buildRebalancePlan(refreshed);
@@ -99,6 +100,7 @@ class Rebalancer {
         plan = await this._buildDepositPlan(await this._readPriceCache());
         await this._simulateDeposit(plan);
       } catch (firstError) {
+        if (!this._shouldRefreshForPlanError(firstError)) throw firstError;
         console.log(`  Deposit plan rejected; refreshing once and recomputing: ${this._errorText(firstError)}`);
         const refreshed = await this._refreshPriceCacheForAction('deposit stale-plan retry');
         plan = await this._buildDepositPlan(refreshed);
@@ -245,6 +247,12 @@ class Rebalancer {
 
   _errorText(error) {
     return (error.reason || error.shortMessage || error.message || 'unknown error').slice(0, 120);
+  }
+
+  _shouldRefreshForPlanError(error) {
+    const text = this._errorText(error).toLowerCase();
+    return ['stale', 'cache', 'oracle', 'twap', 'price', 'minout', 'e38', 'e93', 'e94']
+      .some((marker) => text.includes(marker));
   }
 
   async _syncFeesForDepositPlan() {

@@ -80,6 +80,53 @@ async function trackAction(alerts, method, ...args) {
   }
 }
 
+async function executeHedgeIfReady({ hedgeManager, wallet, rpcPool, actionAlerts, label, beforeSend }) {
+  try {
+    await rpcPool.executeWithRetry(async (provider) => {
+      await hedgeManager.connect(provider).adjustHedge.staticCall();
+    });
+  } catch (error) {
+    console.log(`  ${label}: no action (${(error.reason || error.message || '').slice(0, 80)})`);
+    if (rpcPool.isProviderError(error)) {
+      await trackAction(actionAlerts, 'failure', 'adjustHedge', error.reason || error.message);
+    } else {
+      await trackAction(actionAlerts, 'success', 'adjustHedge', 'Adjustment no longer required');
+    }
+    return false;
+  }
+
+  if (beforeSend) await beforeSend();
+  try {
+    const receipt = await rpcPool.executeSignedTxWithRetry(async (provider) => {
+      const signer = wallet.connect(provider);
+      return {
+        wallet: signer,
+        request: await hedgeManager.connect(signer).adjustHedge.populateTransaction(),
+      };
+    }, label);
+    console.log(`  -> ${label} executed: ${receipt.hash}`);
+    await trackAction(actionAlerts, 'success', 'adjustHedge', `Hedge adjusted: ${receipt.hash}`);
+    return true;
+  } catch (error) {
+    let stillRequired = true;
+    try {
+      await rpcPool.executeWithRetry(async (provider) => {
+        await hedgeManager.connect(provider).adjustHedge.staticCall();
+      });
+    } catch (recheckError) {
+      stillRequired = rpcPool.isProviderError(recheckError);
+    }
+    if (stillRequired) {
+      await trackAction(actionAlerts, 'failure', 'adjustHedge', error.reason || error.message);
+      console.log(`  ${label}: failed while still required (${(error.reason || error.message || '').slice(0, 80)})`);
+    } else {
+      await trackAction(actionAlerts, 'success', 'adjustHedge', 'Adjustment completed elsewhere or no longer required');
+      console.log(`  ${label}: no longer required after send race`);
+    }
+    return false;
+  }
+}
+
 async function main() {
   console.log('=== Liquid Hub Keeper Bot (Delta Neutral Pool) ===');
   console.log(`RangeManager: ${process.env.RANGEMANAGER_ADDRESS}`);
@@ -177,9 +224,6 @@ async function main() {
         }
       }
 
-      let hedgeAdjustedThisCycle = false;
-      let depositStateChangedThisCycle = false;
-
       // DN: Show AAVE hedge state. Mirrors the format used by the protocol's
       // dn-aave-watcher (`aave-watcher.js`) so logs are easy to compare.
       // getHedgeData() returns: totalCollateralBase, totalDebtBase, healthFactor,
@@ -211,18 +255,13 @@ async function main() {
       // Simuler avant snapshots et depots. Le contrat contourne le cooldown uniquement pour reparer un HF;
       // un drift insuffisant revert ici sans envoyer de transaction.
       if (!CHECK_ONLY && hedgeManager && wallet) {
-        try {
-          const rcpt = await rpcPool.executeSignedTxWithRetry(async (p) => {
-            const signer = wallet.connect(p);
-            const hedge = hedgeManager.connect(signer);
-            await hedge.adjustHedge.staticCall();
-            return { wallet: signer, request: await hedge.adjustHedge.populateTransaction() };
-          }, 'adjustHedge-priority');
-          console.log(`  -> Priority hedge/HF repair executed: ${rcpt.hash}`);
-          hedgeAdjustedThisCycle = true;
-        } catch (e) {
-          console.log(`  Priority hedge: no action (${(e.reason || e.message || '').slice(0, 80)})`);
-        }
+        await executeHedgeIfReady({
+          hedgeManager,
+          wallet,
+          rpcPool,
+          actionAlerts,
+          label: 'adjustHedge-priority',
+        });
       }
 
       // --- Dynamic range snapshot (permissionless, metrics bounty) ---
@@ -303,50 +342,14 @@ async function main() {
             const result = await rebalancer.processDeposit();
             if (result.success) {
               console.log(`  -> Deposit processed (${result.txHashes.length} tx)`);
-              depositStateChangedThisCycle = true;
               await trackAction(actionAlerts, 'success', 'deposit', `Deposit processed: ${result.txHashes[0]}`);
             } else if (!result.deferred) {
-              depositStateChangedThisCycle = Boolean(result.stateMayHaveChanged);
               await trackAction(actionAlerts, 'failure', 'deposit', result.error);
             }
           }
         } catch (e) {
           console.log(`  Deposit: skipped (${(e.reason || e.message || '').slice(0, 80)})`);
           await trackAction(actionAlerts, 'failure', 'deposit', e.reason || e.message);
-        }
-      }
-
-      // --- Hedge adjustment (permissionless, hedge bounty) ---
-      // DN refactor: adjustHedge() pilots on the net effective short (debt - free WETH HM - free WETH RM)
-      // vs target (hedgeTargetBps × token0InLP). It corrects both directions atomically with no keeper-provided
-      // sizing: flash-repay for over-hedge, borrow + oracle-bounded sale + collateral supply for under-hedge.
-      // The staticCall prevents a transaction when drift is below the dynamic threshold, cooldown is active,
-      // or a safety post-condition cannot be met. Every successful correction can earn the bounty.
-      if (!CHECK_ONLY && hedgeManager && wallet && !hedgeAdjustedThisCycle && !depositStateChangedThisCycle) {
-        try {
-          // Always simulate the on-chain action. adjustHedge() itself applies the normal cooldown, while
-          // its HF-repair branch deliberately bypasses that cooldown. An off-chain cooldown gate here would
-          // therefore suppress a safety repair that the contract is explicitly ready to execute.
-          const hedgeEnabled = treasury ? await readContract(rpcPool, treasury, 'hedgeBountyEnabled') : false;
-          const hedgeAmount = treasury ? await readContract(rpcPool, treasury, 'hedgeBountyAmount') : 0n;
-          await checkBountyFunding('hedge', hedgeEnabled, hedgeAmount, treasuryAddr, usdc, rpcPool);
-          console.log('  -> Hedge drift above threshold, adjusting on-chain...');
-          const rcpt = await rpcPool.executeSignedTxWithRetry(async (p) => {
-            const signer = wallet.connect(p);
-            const hedge = hedgeManager.connect(signer);
-            // Static-call first: lets us distinguish "drift below threshold" (revert, normal) from
-            // actually sending a tx, so we only pay gas when an adjustment will go through.
-            await hedge.adjustHedge.staticCall();
-            return {
-              wallet: signer,
-              request: await hedge.adjustHedge.populateTransaction(),
-            };
-          }, 'adjustHedge');
-          console.log(`  -> Hedge adjusted: ${rcpt.hash}`);
-          hedgeAdjustedThisCycle = true;
-        } catch (e) {
-          // Revert is expected here for low drift, normal cooldown, or an unmet safety condition. Not fatal.
-          console.log(`  Hedge: no adjustment (${(e.reason || e.message || '').slice(0, 80)})`);
         }
       }
 
@@ -360,6 +363,7 @@ async function main() {
 
       if (!doRebalance) {
         console.log('  -> No rebalance needed\n');
+        await trackAction(actionAlerts, 'success', 'rebalance', 'Rebalance completed elsewhere or no longer required');
       } else if (CHECK_ONLY) {
         console.log('  -> Rebalance needed (check-only, skipping)\n');
       } else {
@@ -370,13 +374,17 @@ async function main() {
         const result = await rebalancer.executeRebalance(tokenId);
         if (result.success) {
           console.log(`  -> Success (${result.txHashes.length} txs)\n`);
+          await trackAction(actionAlerts, 'success', 'rebalance', `Rebalance executed: ${result.txHashes[0]}`);
         } else {
           console.error(`  -> Failed: ${result.error}\n`);
+          await trackAction(actionAlerts, 'failure', 'rebalance', result.error);
         }
       }
 
+      await trackAction(actionAlerts, 'success', 'cycle', 'Keeper cycle completed');
     } catch (error) {
       console.error(`Error: ${error.message}\n`);
+      await trackAction(actionAlerts, 'failure', 'cycle', error.message);
     }
 
     if (CHECK_ONLY) break;

@@ -272,6 +272,7 @@ async function main() {
       // wait silently for the next cycle.
       if (!needsRebalance || action !== 'REBALANCE') {
         console.log('  -> No rebalance needed\n');
+        await trackAction(actionAlerts, 'success', 'rebalance', 'Rebalance completed elsewhere or no longer required');
       } else if (CHECK_ONLY) {
         console.log('  -> Rebalance needed (check-only mode, skipping)\n');
       } else {
@@ -282,13 +283,17 @@ async function main() {
         const result = await rebalancer.executeRebalance(tokenId);
         if (result.success) {
           console.log(`  -> Success (${result.txHashes.length} txs)\n`);
+          await trackAction(actionAlerts, 'success', 'rebalance', `Rebalance executed: ${result.txHashes[0]}`);
         } else {
           console.error(`  -> Failed: ${result.error}\n`);
+          await trackAction(actionAlerts, 'failure', 'rebalance', result.error);
         }
       }
 
+      await trackAction(actionAlerts, 'success', 'cycle', 'Keeper cycle completed');
     } catch (error) {
       console.error(`Error: ${error.message}\n`);
+      await trackAction(actionAlerts, 'failure', 'cycle', error.message);
     }
 
     if (CHECK_ONLY) break;

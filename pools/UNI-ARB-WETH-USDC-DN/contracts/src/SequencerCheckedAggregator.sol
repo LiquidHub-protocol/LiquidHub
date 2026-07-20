@@ -10,7 +10,7 @@ import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/Aggrega
 ///      au redémarrage du séquenceur, Chainlink peut servir un prix périmé pendant la fenêtre de grâce).
 ///
 ///      POURQUOI UN WRAPPER plutôt que modifier les contrats :
-///      - Les prix Chainlink sont lus à PLUSIEURS endroits hors du cache RangeManager : Treasury.collectAndBridge,
+///      - Les prix Chainlink sont lus à PLUSIEURS endroits hors du cache RangeManager : Treasury.swapToUSDC,
 ///        AaveHedgeManager (_oracleMaxUsdcForWeth, _requireLpNotDeviated). Un fix dans RangeOperations.updatePriceCache
 ///        n'aurait couvert QUE le cache. Le wrapper couvre TOUS les consommateurs d'un coup.
 ///      - Les contrats critiques RangeManager/Treasury/HedgeManager continuent d'appeler latestRoundData()

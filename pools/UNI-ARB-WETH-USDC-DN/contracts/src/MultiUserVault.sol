@@ -476,17 +476,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         (uint128 p0, uint128 p1,,, uint64 ts, bool valid) = rangeManager.priceCache();
         if (!valid || p0 == 0 || p1 == 0 || block.timestamp - uint256(ts) > depositMaxCacheAge) revert E72();
 
-        // Vérifier le montant minimum seulement si > 0
-        if (minDepositUSD > 0) {
-            uint256 depositValueUSD = _calculateDepositValue(amount0, amount1);
-            if (depositValueUSD < minDepositUSD) revert E23();
-        }
+        uint256 depositValueUSD = _calculateDepositValue(amount0, amount1);
+        if (depositValueUSD < minDepositUSD) revert E23();
         // Anti-DoS file (refonte DN) : plafond de dépôt compatible avec DN_MAX_SWAP_CHUNKS, pour qu'un dépôt
         // ne puisse pas exiger > 10 chunks de swap (sinon il bloquerait la tête de file en permissionless).
-        if (dnMaxDepositUsd > 0) {
-            uint256 depUsd = _calculateDepositValue(amount0, amount1);
-            if (depUsd > dnMaxDepositUsd) revert E_DEPOSIT_TOO_LARGE();
-        }
+        if (dnMaxDepositUsd > 0 && depositValueUSD > dnMaxDepositUsd) revert E_DEPOSIT_TOO_LARGE();
 
         // Transferer les tokens au vault
         if (amount0 > 0) {
@@ -1380,7 +1374,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function setMinDepositUSD(uint256 _newMinimum) external onlyOwner {
-        if (_newMinimum == 0) revert E23();
+        if (_newMinimum == 0 || _newMinimum > dnMaxDepositUsd) revert E23();
         uint256 oldMinimum = minDepositUSD;
         minDepositUSD = _newMinimum;
         emit MinDepositUpdated(oldMinimum, _newMinimum);
@@ -1403,7 +1397,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (postCheckMaxDriftBps < 50 || postCheckMaxDriftBps > 1000) revert E18();
         if (dustFloorUsd == 0) revert E18();
         if (refundDelay < 3600 || refundDelay > 30 days) revert E18();
-        if (maxDepositUsd == 0) revert E18();
+        if (maxDepositUsd < minDepositUSD) revert E18();
         uint256 maxByChunks = uint256(rangeManager.initMultiSwapTvl()) * 10 * 1e8;
         if (maxByChunks > 0 && maxDepositUsd > maxByChunks) revert E18();
         dnPostCheckMaxDriftBps = postCheckMaxDriftBps;

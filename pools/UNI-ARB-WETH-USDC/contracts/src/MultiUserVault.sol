@@ -408,11 +408,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         require(valid && p0 > 0 && p1 > 0 && block.timestamp - uint256(ts) <= depositMaxCacheAge, "E38");
 
         // Vérifier les bornes dépôt sur la valeur oracle avant transfert.
-        if (minDepositUSD > 0 || maxDepositUsd > 0) {
-            uint256 depositValueUSD = _calculateDepositValue(amount0, amount1);
-            if (minDepositUSD > 0) require(depositValueUSD >= minDepositUSD, "E23");
-            if (maxDepositUsd > 0) require(depositValueUSD <= maxDepositUsd, "E26");
-        }
+        uint256 depositValueUSD = _calculateDepositValue(amount0, amount1);
+        require(depositValueUSD >= minDepositUSD, "E23");
+        if (maxDepositUsd > 0) require(depositValueUSD <= maxDepositUsd, "E26");
 
         // Transferer les tokens au vault
         if (amount0 > 0) {
@@ -1278,14 +1276,14 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function setMinDepositUSD(uint256 _newMinimum) external onlyOwner {
-        require(_newMinimum > 0, "E23");
+        require(_newMinimum > 0 && (maxDepositUsd == 0 || _newMinimum <= maxDepositUsd), "E23");
         uint256 oldMinimum = minDepositUSD;
         minDepositUSD = _newMinimum;
         emit MinDepositUpdated(oldMinimum, _newMinimum);
     }
 
     function setMaxDepositUsd(uint256 _newMaximum) external onlyOwner {
-        require(_newMaximum > minDepositUSD, "E18");
+        require(_newMaximum >= minDepositUSD, "E18");
         uint256 oldMaximum = maxDepositUsd;
         maxDepositUsd = _newMaximum;
         emit MaxDepositUpdated(oldMaximum, _newMaximum);
