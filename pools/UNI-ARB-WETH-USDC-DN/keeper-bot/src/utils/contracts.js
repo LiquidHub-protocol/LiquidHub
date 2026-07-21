@@ -14,6 +14,8 @@ const RANGEMANAGER_ABI = [
   "function vault() external view returns (address)",
   "function token0() external view returns (address)",
   "function token1() external view returns (address)",
+  "function pool() external view returns (address)",
+  "function positionManager() external view returns (address)",
   // --- Dynamic range (on-chain) ---
   // recordPriceSnapshot is permissionless: it stores a Chainlink price point in the on-chain
   // ring buffer used to compute the dynamic range. The contract spaces snapshots regularly

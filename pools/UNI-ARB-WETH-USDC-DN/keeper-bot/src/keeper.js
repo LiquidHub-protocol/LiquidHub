@@ -23,8 +23,29 @@ async function logPriceCacheBeforeDecision(rangeManager, rpcPool) {
   const priceCache = await rpcPool.executeWithRetry(async (provider) => {
     return await rangeManager.connect(provider).priceCache();
   });
-  if (!needsPriceCacheRefresh(priceCache)) return;
+  if (!needsPriceCacheRefresh(priceCache)) return false;
   console.log('  priceCache stale/invalid before keeper decision — action paths refresh it atomically before use');
+  return true;
+}
+
+async function isLivePositionOutOfRange(rangeManager, tokenId, rpcPool) {
+  return await rpcPool.executeWithRetry(async (provider) => {
+    const rm = rangeManager.connect(provider);
+    const [poolAddress, positionManagerAddress] = await Promise.all([rm.pool(), rm.positionManager()]);
+    const pool = new ethers.Contract(
+      poolAddress,
+      ['function slot0() view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)'],
+      provider
+    );
+    const positionManager = new ethers.Contract(
+      positionManagerAddress,
+      ['function positions(uint256) view returns (uint96,address,address,address,uint24,int24,int24,uint128,uint256,uint256,uint128,uint128)'],
+      provider
+    );
+    const [slot0, position] = await Promise.all([pool.slot0(), positionManager.positions(tokenId)]);
+    const tick = Number(slot0[1]);
+    return tick <= Number(position[5]) || tick >= Number(position[6]);
+  });
 }
 
 async function readContract(rpcPool, contract, method, ...args) {
@@ -196,14 +217,21 @@ async function main() {
     try {
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
 
-      await logPriceCacheBeforeDecision(rangeManager, rpcPool);
+      const priceCacheWasStale = await logPriceCacheBeforeDecision(rangeManager, rpcPool);
 
-      const [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
+      let [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
         async (p) => {
           const rm = rangeManager.connect(p);
           return await rm.getBotInstructions();
         }
       );
+      if (priceCacheWasStale && hasPosition && !needsRebalance
+          && await isLivePositionOutOfRange(rangeManager, tokenId, rpcPool)) {
+        needsRebalance = true;
+        action = 'REBALANCE';
+        reason = 'Live pool tick is outside the current range; action path will refresh and recompute';
+        console.log('  Live tick check: position is out of range; rebalance action enabled');
+      }
 
       console.log(`  Position: ${hasPosition ? '#' + tokenId.toString() : 'none'}`);
       if (hasPosition) {
@@ -255,13 +283,23 @@ async function main() {
       // Simuler avant snapshots et depots. Le contrat contourne le cooldown uniquement pour reparer un HF;
       // un drift insuffisant revert ici sans envoyer de transaction.
       if (!CHECK_ONLY && hedgeManager && wallet) {
-        await executeHedgeIfReady({
+        const hedgeAdjusted = await executeHedgeIfReady({
           hedgeManager,
           wallet,
           rpcPool,
           actionAlerts,
           label: 'adjustHedge-priority',
         });
+        if (!hedgeAdjusted && hasPosition && !needsRebalance
+            && await rebalancer.canExecuteCriticalHedgeRebalance()) {
+          console.log('  -> Critical DN drift permits an atomic rebalance fallback...');
+          const fallback = await rebalancer.executeRebalance(tokenId);
+          if (fallback.success) {
+            await trackAction(actionAlerts, 'success', 'rebalance', `Critical hedge fallback: ${fallback.txHashes[0]}`);
+          } else {
+            await trackAction(actionAlerts, 'failure', 'rebalance', fallback.error);
+          }
+        }
       }
 
       // --- Dynamic range snapshot (permissionless, metrics bounty) ---

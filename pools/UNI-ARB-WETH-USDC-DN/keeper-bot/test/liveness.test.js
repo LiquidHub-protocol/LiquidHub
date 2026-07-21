@@ -30,6 +30,18 @@ test('chunk count and splitting stay in BigInt arithmetic', () => {
   assert.ok(chunks.every((value) => typeof value === 'bigint'));
 });
 
+test('atomic action gas is buffered but never allowed to reach the block limit', async () => {
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
+  const signer = { address: '0x0000000000000000000000000000000000000011' };
+  const provider = {
+    estimateGas: async () => 100n,
+    getBlock: async () => ({ gasLimit: 1_000n }),
+  };
+  assert.equal((await rebalancer._boundTransactionGas(provider, signer, {}, 'rebalance')).gasLimit, 120n);
+  provider.estimateGas = async () => 1_000n;
+  await assert.rejects(rebalancer._boundTransactionGas(provider, signer, {}, 'rebalance'), /above block limit/);
+});
+
 test('failure threshold and recovery survive a restart', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-alerts-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
@@ -52,7 +64,7 @@ test('failure threshold and recovery survive a restart', async (t) => {
   assert.match(messages[1], /^\[POOL\] Keeper deposit recovered/);
 });
 
-test('rebalance simulates before one action-linked refresh and never syncs fees', async () => {
+test('rebalance syncs fees before planning and refreshes only for a retryable rejection', async () => {
   const events = [];
   const wallet = { connect: () => wallet };
   const rangeManager = {
@@ -85,12 +97,14 @@ test('rebalance simulates before one action-linked refresh and never syncs fees'
     events.push('refresh');
     return { valid: true };
   };
-  rebalancer._syncFeesForDepositPlan = async () => { throw new Error('must not sync'); };
+  rebalancer._syncFeesForActionPlan = async (action) => { events.push(`sync:${action}`); };
+  rebalancer._boundTransactionGas = async (_provider, _signer, request) => request;
   rebalancer._logPlan = () => {};
 
   const result = await rebalancer.executeRebalance(1n);
   assert.equal(result.success, true);
   assert.deepEqual(events, [
+    'sync:rebalance',
     'build:1',
     'simulate:1',
     'refresh',
@@ -104,6 +118,7 @@ test('unrelated rebalance revert does not trigger an isolated price refresh', as
   const rebalancer = new Rebalancer({}, {}, {}, {}, {});
   let refreshCount = 0;
   rebalancer._readPriceCache = async () => ({ valid: true });
+  rebalancer._syncFeesForActionPlan = async () => {};
   rebalancer._buildRebalancePlan = async () => ({ swapAmounts: [], minOuts: [] });
   rebalancer._simulateRebalance = async () => { throw new Error('E03 cooldown active'); };
   rebalancer._refreshPriceCacheForAction = async () => { refreshCount += 1; };

@@ -459,11 +459,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /// @notice (audit V1 — V3-M1) Paramètres oracle : seuil de déviation pool/oracle + heartbeats par feed.
     /// @dev Gouvernance via Vault owner (Safe phase 1, Timelock phase 2) car ces bornes pilotent toute la protection MEV/staleness. Bornes dures :
-    ///      déviation <= 1000 bps (10%) pour éviter de neutraliser la protection ; maxAge entre 1h et 48h
-    ///      (Chainlink heartbeats réels 1h-24h, marge x2). _maxOracleDeviationBps=0 désactive le check
-    ///      (réservé à un mode dégradé volontaire). Aiguille tous les _updatePriceCache() en aval.
+    ///      déviation 1..1000 bps pour éviter de neutraliser la protection ; maxAge entre 1h et 48h
+    ///      (Chainlink heartbeats réels 1h-24h, marge x2). Aiguille tous les _updatePriceCache() en aval.
     function setOracleParams(uint16 _maxOracleDeviationBps, uint32 _maxAge0, uint32 _maxAge1) external onlyVaultOwner {
-        require(_maxOracleDeviationBps <= 1000, "E21"); // déviation <=10%
+        require(_maxOracleDeviationBps > 0 && _maxOracleDeviationBps <= 1000, "E21");
         require(_maxAge0 >= 3600 && _maxAge0 <= 172800 && _maxAge1 >= 3600 && _maxAge1 <= 172800, "E20"); // 1h-48h
         protectionConfig.maxOracleDeviationBps = _maxOracleDeviationBps;
         protectionConfig.maxAge0 = _maxAge0;

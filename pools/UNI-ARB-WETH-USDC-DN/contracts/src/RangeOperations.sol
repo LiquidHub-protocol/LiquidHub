@@ -196,7 +196,7 @@ library RangeOperations {
     }
 
     function _trustedTwapTick(IUniswapV3Pool pool) private view returns (int24 twapTick) {
-        (, int24 spotTick,,, uint16 observationCardinality,,) = pool.slot0();
+        (, int24 spotTick,,,,,) = pool.slot0();
         uint32[] memory secondsAgos = new uint32[](2);
         secondsAgos[0] = 300;
         try pool.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
@@ -204,7 +204,8 @@ library RangeOperations {
             twapTick = int24(tickDelta / int56(uint56(300)));
             if (tickDelta < 0 && tickDelta % int56(uint56(300)) != 0) twapTick--;
         } catch {
-            require(observationCardinality < 2, "TWAP unavailable");
+            (uint32 oldest,,,) = pool.observations(0);
+            require(block.timestamp < uint256(oldest) + 300, "TWAP unavailable");
             twapTick = spotTick;
         }
     }
@@ -1024,14 +1025,14 @@ library RangeOperations {
     }
 
     function _validateTicks(int24 tickLower, int24 tickUpper, int24 currentTick, int24 tickSpacing) private pure {
-        require(tickLower < tickUpper, "Invalid tick order");
+        require(tickLower < tickUpper, "RT1");
         require(
             _isAlignedToTickSpacing(tickLower, tickSpacing) && _isAlignedToTickSpacing(tickUpper, tickSpacing),
-            "Tick spacing misalignment"
+            "RT2"
         );
-        require(tickLower >= MIN_TICK && tickUpper <= MAX_TICK, "Tick out of bounds");
-        require(tickUpper - tickLower >= int24(int256(tickSpacing) * int256(10)), "Range too narrow");
-        require(tickLower >= currentTick - 50000 && tickUpper <= currentTick + 50000, "Range too wide");
+        require(tickLower >= MIN_TICK && tickUpper <= MAX_TICK, "RT3");
+        require(tickUpper - tickLower >= int24(int256(tickSpacing) * int256(10)), "RT4");
+        require(tickLower >= currentTick - 50000 && tickUpper <= currentTick + 50000, "RT5");
     }
 
     /**

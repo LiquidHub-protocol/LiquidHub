@@ -52,12 +52,14 @@ class Rebalancer {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
     try {
+      await this._syncFeesForActionPlan('rebalance');
       let plan;
       try {
         plan = await this._buildRebalancePlan(await this._readPriceCache());
         await this._simulateRebalance(plan);
       } catch (firstError) {
         if (!this._shouldRefreshForPlanError(firstError)) throw firstError;
+        if (this._isFeePlanError(firstError)) await this._syncFeesForActionPlan('rebalance retry');
         console.log(`  Rebalance plan rejected; refreshing once and recomputing: ${this._errorText(firstError)}`);
         const refreshed = await this._refreshPriceCacheForAction('rebalance stale-plan retry');
         plan = await this._buildRebalancePlan(refreshed);
@@ -69,9 +71,10 @@ class Rebalancer {
       const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
         const signer = this.wallet.connect(provider);
         const rm = this.rangeManager.connect(signer);
+        const request = await rm.rebalance.populateTransaction(plan.swapAmounts, plan.minOuts, plan.tokenIn, plan.tokenOut);
         return {
           wallet: signer,
-          request: await rm.rebalance.populateTransaction(plan.swapAmounts, plan.minOuts, plan.tokenIn, plan.tokenOut),
+          request: await this._boundTransactionGas(provider, signer, request, `rebalance ${plan.chunkCount} chunk(s)`),
         };
       }, 'rebalance');
       console.log(`  Rebalance complete: ${receipt.hash}`);
@@ -94,7 +97,7 @@ class Rebalancer {
   async processDeposit() {
     console.log('\n=== Processing queued deposit (permissionless) ===');
     try {
-      await this._syncFeesForDepositPlan();
+      await this._syncFeesForActionPlan('deposit');
       let plan;
       try {
         plan = await this._buildDepositPlan(await this._readPriceCache());
@@ -112,14 +115,15 @@ class Rebalancer {
       const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
         const signer = this.wallet.connect(provider);
         const vault = this.vault.connect(signer);
+        const request = await vault.processDepositPermissionless.populateTransaction(
+          plan.swapAmounts,
+          plan.minOuts,
+          plan.tokenIn,
+          plan.tokenOut
+        );
         return {
           wallet: signer,
-          request: await vault.processDepositPermissionless.populateTransaction(
-            plan.swapAmounts,
-            plan.minOuts,
-            plan.tokenIn,
-            plan.tokenOut
-          ),
+          request: await this._boundTransactionGas(provider, signer, request, `deposit ${plan.chunkCount} chunk(s)`),
         };
       }, 'processDepositPermissionless');
       console.log(`  Deposit processed: ${receipt.hash}`);
@@ -255,7 +259,25 @@ class Rebalancer {
       .some((marker) => text.includes(marker));
   }
 
-  async _syncFeesForDepositPlan() {
+  _isFeePlanError(error) {
+    return /e93|e94/i.test(this._errorText(error));
+  }
+
+  async _boundTransactionGas(provider, signer, request, label) {
+    const [estimate, block] = await Promise.all([
+      provider.estimateGas({ ...request, from: signer.address }),
+      provider.getBlock('latest'),
+    ]);
+    const blockLimit = BigInt(block.gasLimit);
+    if (estimate >= blockLimit) {
+      throw new Error(`${label} requires ${estimate} gas, above block limit ${blockLimit}`);
+    }
+    const buffered = estimate + estimate / 5n;
+    request.gasLimit = buffered < blockLimit ? buffered : blockLimit - 1n;
+    return request;
+  }
+
+  async _syncFeesForActionPlan(action) {
     try {
       const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
         const signer = this.wallet.connect(provider);
@@ -264,10 +286,10 @@ class Rebalancer {
           wallet: signer,
           request: await vault.syncFeesForDeposits.populateTransaction(),
         };
-      }, 'syncFeesForDeposits');
-      console.log(`  Fees synced before action plan: ${receipt.hash}`);
+      }, `syncFeesForDeposits ${action}`);
+      console.log(`  Fees synced before ${action} plan: ${receipt.hash}`);
     } catch (error) {
-      throw new Error(`Fee sync required before recomputing the plan: ${(error.reason || error.message || '').slice(0, 120)}`);
+      throw new Error(`Fee sync required before ${action} plan: ${(error.reason || error.message || '').slice(0, 120)}`);
     }
   }
 

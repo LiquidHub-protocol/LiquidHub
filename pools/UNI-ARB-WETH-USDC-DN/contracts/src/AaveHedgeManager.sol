@@ -550,11 +550,9 @@ contract AaveHedgeManager is ReentrancyGuard {
         return DnDepositLib.rangeHedgeThresholdBps(rangeManager, divisor, floorBps);
     }
 
-    /// @notice Cible de hedge en bps du token0 LP (10000 = 100% = DN strict). Gouvernance.
-    /// @dev H_opt retire : la cible n'est plus calculee on-chain, elle est gouvernee. Borne 5000..10000
-    ///      (jamais sous 50% : en-dessous ce n'est plus un "Delta Neutral" honnete).
+    /// @notice Cible de hedge du token0 LP. Le mode DN impose 10000 bps (100%).
     function setHedgeTargetBps(uint16 _hedgeTargetBps) external onlyGovernance {
-        if (_hedgeTargetBps < 5000 || _hedgeTargetBps > 10000) revert HedgeCheck(35);
+        if (_hedgeTargetBps != 10000) revert HedgeCheck(35);
         hedgeTargetBps = _hedgeTargetBps;
     }
 

@@ -194,15 +194,15 @@ library RangeOperations {
         secondsAgos[0] = 300;
         try pool.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
             int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
-            int24 twapTick = int24(tickDelta / int56(uint56(300)));
-            if (tickDelta < 0 && tickDelta % int56(uint56(300)) != 0) twapTick--;
+            int24 twapTick = int24(tickDelta / 300);
+            if (tickDelta < 0 && tickDelta % 300 != 0) twapTick--;
             int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
             return uint24(diff) > uint24(maxTwapDeviationBps);
         } catch {
-            // Warm-up only: bypass if Uniswap has not written enough observations yet. Once at least two
-            // observations exist, an observe(300s) failure is treated as unsafe and invalidates the cache.
-            (,,, uint16 observationCardinality,,,) = pool.slot0();
-            return observationCardinality > 1;
+            // Bypass uniquement pendant le warm-up reel des 300 secondes. Une fois cet historique disponible,
+            // tout echec observe() invalide le cache au lieu de masquer une panne du pool.
+            (uint32 oldest,,,) = pool.observations(0);
+            return oldest <= block.timestamp - 300;
         }
     }
 
@@ -1090,14 +1090,14 @@ library RangeOperations {
     }
 
     function _validateTicks(int24 tickLower, int24 tickUpper, int24 currentTick, int24 tickSpacing) private pure {
-        require(tickLower < tickUpper, "Invalid tick order");
+        require(tickLower < tickUpper, "RT1");
         require(
             _isAlignedToTickSpacing(tickLower, tickSpacing) && _isAlignedToTickSpacing(tickUpper, tickSpacing),
-            "Tick spacing misalignment"
+            "RT2"
         );
-        require(tickLower >= MIN_TICK && tickUpper <= MAX_TICK, "Tick out of bounds");
-        require(tickUpper - tickLower >= int24(int256(tickSpacing) * int256(10)), "Range too narrow");
-        require(tickLower >= currentTick - 50000 && tickUpper <= currentTick + 50000, "Range too wide");
+        require(tickLower >= MIN_TICK && tickUpper <= MAX_TICK, "RT3");
+        require(tickUpper - tickLower >= int24(int256(tickSpacing) * int256(10)), "RT4");
+        require(tickLower >= currentTick - 50000 && tickUpper <= currentTick + 50000, "RT5");
     }
 
     /**
