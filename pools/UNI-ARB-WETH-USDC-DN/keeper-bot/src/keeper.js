@@ -6,7 +6,11 @@ const { createContracts, assertKeeperTopology, TREASURY_ABI, ERC20_ABI } = requi
 const { PersistentActionAlerts } = require('./utils/action-alerts');
 const { Rebalancer } = require('./rebalancer');
 
-const CHECK_INTERVAL_MS = (parseInt(process.env.CHECK_INTERVAL_MIN || '10', 10)) * 60 * 1000;
+const CHECK_INTERVAL_MIN = Number(process.env.CHECK_INTERVAL_MIN || '1');
+if (!Number.isFinite(CHECK_INTERVAL_MIN) || CHECK_INTERVAL_MIN <= 0) {
+  throw new Error('CHECK_INTERVAL_MIN must be a finite number greater than 0');
+}
+const CHECK_INTERVAL_MS = CHECK_INTERVAL_MIN * 60 * 1000;
 const CHECK_ONLY = process.argv.includes('--check-only');
 const PRICE_CACHE_MAX_AGE_SEC = parseInt(
   process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || process.env.BOT_PRICE_CACHE_MAX_AGE_SEC || '300',
@@ -264,7 +268,9 @@ async function main() {
         console.log(`  Needs rebalance: ${needsRebalance}`);
       }
 
-      let inflowsPaused = false;
+      // Pause reads fail closed for deposit processing only. Permissionless position
+      // maintenance below remains active even when the controller cannot be read.
+      let inflowsPaused = !pauseController;
       if (pauseController) {
         try {
           inflowsPaused = await rpcPool.executeWithRetry(async (p) => {
@@ -274,8 +280,17 @@ async function main() {
             console.log('  PauseController: inflows paused — skip deposit processing; rebalance and hedge maintenance remain enabled');
           }
         } catch (e) {
-          console.log(`  PauseController: unavailable (${(e.message || '').slice(0, 80)})`);
+          inflowsPaused = true;
+          console.log(
+            `  PauseController: unavailable (${(e.message || '').slice(0, 80)}) — ` +
+            'skip deposits; rebalance, snapshots and hedge maintenance remain enabled'
+          );
         }
+      } else {
+        console.log(
+          '  PauseController: not configured — skip deposits; ' +
+          'rebalance, snapshots and hedge maintenance remain enabled'
+        );
       }
 
       // DN: Show AAVE hedge state. Mirrors the format used by the protocol's

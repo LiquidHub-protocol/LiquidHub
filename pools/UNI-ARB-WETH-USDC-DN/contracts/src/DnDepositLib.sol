@@ -57,6 +57,7 @@ interface IRmDep {
             uint32 maxPos
         );
     function getOwnerPositions() external view returns (uint256[] memory);
+    function calculateTargetTicks() external view returns (int24 tickLower, int24 tickUpper);
     function positionManager() external view returns (INonfungiblePositionManager);
     function pool() external view returns (IUniswapV3Pool);
     function initMultiSwapTvl() external view returns (uint256);
@@ -118,6 +119,7 @@ library DnDepositLib {
     error ProtectedVaultFunds();
     error E70();
     error E_HEDGE_PAUSED();
+    error ExactTransferRequired();
     /// @dev Adresses regroupées (anti stack-too-deep).
 
     struct Addrs {
@@ -130,9 +132,17 @@ library DnDepositLib {
     /// @dev Garde d'entree DN delestee du Vault pour sa marge EIP-170. Les selectors d'erreur restent
     ///      identiques a ceux exposes par le Vault pour conserver le decodage off-chain.
     function requireDepositOpen(address hedgeManager, uint256 amount0) external view {
-        if (hedgeManager == address(0)) return;
         if (amount0 > 0) revert E70();
-        if (IHedgePauseDep(hedgeManager).paused()) revert E_HEDGE_PAUSED();
+        // During local deployment the Vault is configured before the HedgeManager is bound. Keep
+        // token0 deposits forbidden in that short setup window, while allowing token1-only queue tests/setup.
+        if (hedgeManager != address(0) && IHedgePauseDep(hedgeManager).paused()) revert E_HEDGE_PAUSED();
+    }
+
+    function pullExact(address token, address from, uint256 amount) external {
+        IERC20 asset = IERC20(token);
+        uint256 beforeBalance = asset.balanceOf(address(this));
+        asset.safeTransferFrom(from, address(this), amount);
+        if (asset.balanceOf(address(this)) - beforeBalance != amount) revert ExactTransferRequired();
     }
 
     /// @dev Execute en delegatecall depuis le Vault: seuls les soldes locaux au-dela des reserves FIFO
@@ -325,16 +335,21 @@ library DnDepositLib {
 
     /// @dev AUDIT H-03 : part token0 (bps) du NFT EXISTANT au prix courant — c'est le ratio que
     ///      addLiquidityToPosition produira (il ajoute au range du NFT, PAS au range cible dynamique).
-    ///      Fallback sur targetRatio0Bps si pas de NFT (ne devrait pas arriver au dépôt de croissance).
+    ///      Sans NFT, le ratio du premier mint est derive des ticks dynamiques cibles on-chain.
     function _nftRatio0Bps(address rangeManager) private view returns (uint16) {
         IRmDep rm = IRmDep(rangeManager);
         uint256[] memory positions = rm.getOwnerPositions();
         if (positions.length > 0) {
             uint256 r = RangeOperations.nftRatio0BpsForPosition(rm.positionManager(), positions[0], _pc(rm));
-            if (r > 0 && r <= 10000) return uint16(r);
+            // 0 and 10_000 are valid one-sided Uniswap positions, not calculation failures.
+            if (r <= 10000) return uint16(r);
         }
-        uint256 fb = rm.getOptimalSwapParams().targetRatio0Bps; // fallback : range cible dynamique
-        return fb > 10000 ? 10000 : uint16(fb);
+        (int24 tickLower, int24 tickUpper) = rm.calculateTargetTicks();
+        RangeOperations.PriceCache memory pc = _pc(rm);
+        uint256 ratio = RangeOperations.calculateOptimalRatio(
+            tickLower, tickUpper, pc.poolTick, pc.poolSqrtPriceX96
+        );
+        return ratio > 10000 ? 10000 : uint16(ratio);
     }
 
     function _pc(IRmDep rm) private view returns (RangeOperations.PriceCache memory pc) {
@@ -380,7 +395,6 @@ library DnDepositLib {
         if (!valid) return (false, 0);
         (, uint8 dec0, uint8 dec1,,,,,,,) = rmI.config();
         address token0 = rmI.token0();
-        address token1 = rmI.token1();
         address hedgeManager = IVaultDep(rmI.vault()).hedgeManager();
 
         // Collatéral/borrow que openDepositHedge exécutera APRÈS transfert du dépôt (H-02 : on passe le dépôt
@@ -393,14 +407,10 @@ library DnDepositLib {
             );
         }
 
-        // État LIBRE futur (post-transfert dépôt + post-hedge). Il sert à choisir la direction,
-        // mais une asymétrie historique ne doit jamais autoriser le nouveau dépôt à swapper la NAV
-        // des incumbents. Le montant final est donc plafonné à la valeur du dépôt courant.
-        uint256 freeT0 = IERC20(token0).balanceOf(rangeManager) + depositAmount0 + borrowWeth;
-        uint256 freeT1c = IERC20(token1).balanceOf(rangeManager) + depositAmount1;
-        uint256 freeT1 = freeT1c > collateralUsdc ? freeT1c - collateralUsdc : 0;
-        uint256 depositUsd = _toUsd(depositAmount0, price0, dec0) + _toUsd(depositAmount1, price1, dec1);
-        if (depositUsd == 0) return (false, 0);
+        // Incremental state only: this depositor may rebalance its own transferred capital and freshly
+        // borrowed token0, never historical idle balances belonging to existing shareholders.
+        uint256 freeT0 = depositAmount0 + borrowWeth;
+        uint256 freeT1 = depositAmount1 > collateralUsdc ? depositAmount1 - collateralUsdc : 0;
 
         // Valeurs USD (8 déc). AUDIT H-03 : ratio cible = celui du NFT EXISTANT (addLiquidityToPosition ajoute
         // à CE range), pas le range cible dynamique.
@@ -414,15 +424,11 @@ library DnDepositLib {
             // trop de token0 → swap token0→token1 de l'excédent (converti en unités token0)
             uint256 excessUsd = v0 - targetV0;
             amountIn = Math.mulDiv(excessUsd, 10 ** dec0, uint256(price0));
-            uint256 depositCap0 = Math.mulDiv(depositUsd, 10 ** dec0, uint256(price0));
-            if (amountIn > depositCap0) amountIn = depositCap0;
             return (true, amountIn);
         } else if (targetV0 > v0) {
             // pas assez de token0 → swap token1→token0 (excédent token1 en unités token1)
             uint256 deficitUsd = targetV0 - v0;
             amountIn = Math.mulDiv(deficitUsd, 10 ** dec1, uint256(price1));
-            uint256 depositCap1 = Math.mulDiv(depositUsd, 10 ** dec1, uint256(price1));
-            if (amountIn > depositCap1) amountIn = depositCap1;
             return (false, amountIn);
         }
         return (false, 0);

@@ -81,7 +81,7 @@ Edit `.env` with the following variables:
 | `TOKEN1_ADDRESS` | Yes | Token1 address (USDC) |
 | `TOKEN0_DECIMALS` | No | Token0 decimals (default: 18) |
 | `TOKEN1_DECIMALS` | No | Token1 decimals (default: 6) |
-| `CHECK_INTERVAL_MIN` | No | Check interval in minutes (default: 10) |
+| `CHECK_INTERVAL_MIN` | No | Check interval in minutes (default: 1; must be greater than 0) |
 | `INIT_MULTI_SWAP_TVL` | No | Max USD value per swap chunk (default: 10000) |
 
 ### RPC Trust Model
@@ -89,6 +89,8 @@ Edit `.env` with the following variables:
 Community keepers are permissionless and may use any RPC provider they choose. Liquid Hub does not require public keepers to use premium or MEV-protected RPCs. This is intentional: keeper safety is enforced on-chain by oracle/TWAP checks, oracle-floored `minAmountsOut`, cooldowns, caps, and reverts.
 
 A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Configure `RPC_BACKUP_1` and `RPC_BACKUP_2` for reliability.
+
+Signed transactions are populated and signed once. RPC failover rebroadcasts only that exact raw transaction, sequentially, across the configured endpoints; it never introduces another RPC tier. If `PAUSE_CONTROLLER_ADDRESS` is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Snapshots and rebalances remain active.
 
 ### 3. Run the bot
 

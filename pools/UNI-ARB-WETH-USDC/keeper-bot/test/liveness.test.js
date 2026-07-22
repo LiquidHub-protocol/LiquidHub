@@ -16,6 +16,47 @@ test('RPC timeout releases a silent provider call', async () => {
   );
 });
 
+test('signed transaction failover prepares and signs once, then rebroadcasts the same raw tx', async () => {
+  const pool = Object.create(RPCPool.prototype);
+  const broadcasts = [];
+  const first = {
+    getTransactionReceipt: async () => null,
+    broadcastTransaction: async (rawTx) => {
+      broadcasts.push(rawTx);
+      const error = new Error('primary network unavailable');
+      error.code = 'NETWORK_ERROR';
+      throw error;
+    },
+  };
+  const second = {
+    getTransactionReceipt: async () => null,
+    broadcastTransaction: async (rawTx) => { broadcasts.push(rawTx); },
+    waitForTransaction: async (hash) => ({ status: 1, hash }),
+  };
+  pool.providers = [first, second].map((provider) => ({ provider, healthy: true, errorCount: 0 }));
+  pool.currentIndex = 0;
+  pool.withTimeout = () => { throw new Error('signed path must not use Promise.race timeout'); };
+
+  let prepareCount = 0;
+  let populateCount = 0;
+  let signCount = 0;
+  const wallet = {
+    populateTransaction: async (request) => { populateCount += 1; return request; },
+    signTransaction: async () => { signCount += 1; return '0x1234'; },
+  };
+  const receipt = await pool.executeSignedTxWithRetry(async (provider) => {
+    prepareCount += 1;
+    assert.equal(provider, first);
+    return { wallet, request: { to: '0x0000000000000000000000000000000000000001' } };
+  }, 'rebalance');
+
+  assert.equal(receipt.status, 1);
+  assert.equal(prepareCount, 1);
+  assert.equal(populateCount, 1);
+  assert.equal(signCount, 1);
+  assert.deepEqual(broadcasts, ['0x1234', '0x1234']);
+});
+
 test('chunk count and splitting stay in BigInt arithmetic', () => {
   const amountIn = 10n * 10n ** 18n;
   const priceUsd8 = 3_000n * 100_000_000n;

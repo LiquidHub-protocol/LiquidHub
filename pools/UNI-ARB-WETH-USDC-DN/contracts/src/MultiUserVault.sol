@@ -483,11 +483,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (dnMaxDepositUsd > 0 && depositValueUSD > dnMaxDepositUsd) revert E_DEPOSIT_TOO_LARGE();
 
         // Transferer les tokens au vault
-        if (amount0 > 0) {
-            token0.safeTransferFrom(msg.sender, address(this), amount0);
-        }
         if (amount1 > 0) {
-            token1.safeTransferFrom(msg.sender, address(this), amount1);
+            DnDepositLib.pullExact(address(token1), msg.sender, amount1);
         }
 
         // Ajouter a la queue
@@ -697,6 +694,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         (uint128 price0, uint128 price1,,, uint64 ts, bool valid) = rangeManager.priceCache();
         if (!valid || price0 == 0 || price1 == 0) revert E72();
         if (block.timestamp - uint256(ts) > depositMaxCacheAge) revert E72();
+        // Crystallize incumbent fees first. If the tiny balance change invalidates the prepared plan,
+        // validation below reverts atomically and the next bot/keeper cycle recomputes from fresh state.
+        if (hasPosition) rangeManager.collectFeesForVault();
         PendingDeposit memory pdPlan = pendingDeposits[_pendingHead];
         uint256 plannedDepositValue = _calculateDepositValue(pdPlan.amount0, pdPlan.amount1);
         try DnDepositLib.validateDepositSwapPlan(
@@ -715,13 +715,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         } catch (bytes memory) {
             revert E73();
         }
-        // Liveness: le bot/keeper calcule le plan avant la collecte des fees latentes. On valide d'abord
-        // ce plan, puis on cristallise les fees AVANT le hedge/mint/add pour que les anciens holders gardent
-        // bien leurs fees pre-depot.
-        if (hasPosition) {
-            rangeManager.collectFeesForVault();
-        }
-
         // 4. VERROU (un withdraw concurrent revert E32)
         _processingRebalance = true;
         _rebalanceStartedAt = uint64(block.timestamp);
@@ -1050,7 +1043,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      */
     function getCurrentPortfolioValue() public view returns (uint256) {
         uint256 lpValue = _lpPortfolioValue();
-        if (lpValue == 0) return 0; // RM injoignable / cache invalide -> 0 (geres en amont par E25 au depot).
 
         // AAVE hedge net value (collat - dette), en USD 8 dec (meme unite que la valeur LP).
         // Audit V2: sans ce terme, currentTotalValue sous-estime la vraie valeur du protocole (collat AAVE

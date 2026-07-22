@@ -78,6 +78,8 @@ interface IBotNav {
 contract MultiUserVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    error E49(); // token transfer amount differs from the queued accounting amount
+
     error OnlyOperationalExecutor();
     error OnlyEmergencySafe();
     error FirstDepositTooSmall();
@@ -414,10 +416,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         // Transferer les tokens au vault
         if (amount0 > 0) {
-            token0.safeTransferFrom(msg.sender, address(this), amount0);
+            _pullExact(token0, amount0);
         }
         if (amount1 > 0) {
-            token1.safeTransferFrom(msg.sender, address(this), amount1);
+            _pullExact(token1, amount1);
         }
 
         // Ajouter a la queue
@@ -431,6 +433,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         _pendingTotal1 += amount1;
 
         emit PendingDepositAdded(msg.sender, amount0, amount1);
+    }
+
+    function _pullExact(IERC20 asset, uint256 amount) private {
+        uint256 beforeBalance = asset.balanceOf(address(this));
+        asset.safeTransferFrom(msg.sender, address(this), amount);
+        if (asset.balanceOf(address(this)) - beforeBalance != amount) revert E49();
     }
 
     /// @notice Rembourse le dépôt en tête de file s'il reste inexécutable trop longtemps.
@@ -1283,7 +1291,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function setMaxDepositUsd(uint256 _newMaximum) external onlyOwner {
-        require(_newMaximum >= minDepositUSD, "E18");
+        require(
+            _newMaximum >= minDepositUSD && _newMaximum <= rangeManager.initMultiSwapTvl() * 1e9,
+            "E18"
+        );
         uint256 oldMaximum = maxDepositUsd;
         maxDepositUsd = _newMaximum;
         emit MaxDepositUpdated(oldMaximum, _newMaximum);

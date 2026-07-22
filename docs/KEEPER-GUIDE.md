@@ -75,7 +75,7 @@ This prints the current pool state, whether a rebalance is needed, and the curre
 | `RPC_BACKUP_1` | Backup RPC endpoint 1 | — |
 | `RPC_BACKUP_2` | Backup RPC endpoint 2 | — |
 | `TREASURY_ADDRESS` | Treasury address — lets the bot read the USDC balance and warn when a bounty would be skipped (falls back to `vault.treasuryAddress()`) | — |
-| `CHECK_INTERVAL_MIN` | Minutes between checks | 10 |
+| `CHECK_INTERVAL_MIN` | Minutes between checks; must be greater than 0 | 1 |
 | `INIT_MULTI_SWAP_TVL` | Max USD per swap chunk | 10000 |
 
 ### RPC Trust Model
@@ -83,6 +83,8 @@ This prints the current pool state, whether a rebalance is needed, and the curre
 Community keepers are permissionless and may use any RPC provider they choose. Liquid Hub does not require public keepers to use premium or MEV-protected RPCs. This is intentional: keeper safety is enforced on-chain by oracle/TWAP checks, oracle-floored `minAmountsOut`, cooldowns, caps, and DN post-checks.
 
 A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Use `RPC_BACKUP_1` and `RPC_BACKUP_2` for reliability.
+
+The reference keepers populate and sign each transaction once, then fail over sequentially by rebroadcasting only that exact raw transaction across the configured RPC endpoints. They never switch to an implicit public or premium tier. If PauseController state cannot be read, queued deposits are skipped fail-closed while snapshots, rebalances and DN hedge maintenance continue normally.
 
 ### Delta Neutral (DN) Additional Variables
 

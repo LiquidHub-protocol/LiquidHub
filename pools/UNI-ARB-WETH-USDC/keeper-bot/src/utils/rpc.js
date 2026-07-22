@@ -160,56 +160,79 @@ class RPCPool {
   }
 
   async executeSignedTxWithRetry(prepareFn, label = 'transaction', maxRetries = 3) {
-    let txHash = null;
-    let signedTx = null;
-    return await this.executeWithRetry(async (provider) => {
-      if (txHash) {
-        const receipt = await provider.getTransactionReceipt(txHash);
+    const preparationProvider = this.getProvider();
+    const prepared = await prepareFn(preparationProvider);
+    if (!prepared?.wallet || !prepared?.request) {
+      throw new Error(`${label}: prepareFn must return { wallet, request }`);
+    }
+
+    // Populate and sign exactly once. RPC failover only ever rebroadcasts this same
+    // immutable raw transaction, so a timed-out provider cannot later send a second nonce.
+    const populated = await prepared.wallet.populateTransaction(prepared.request);
+    const signedTx = await prepared.wallet.signTransaction(populated);
+    const txHash = ethers.keccak256(signedTx);
+    if (prepared.log) prepared.log(txHash);
+
+    const startIndex = Math.max(
+      0,
+      this.providers.findIndex((entry) => entry.provider === preparationProvider)
+    );
+    const attempts = Math.max(maxRetries, this.providers.length);
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const entry = this.providers[(startIndex + attempt - 1) % this.providers.length];
+      const provider = entry.provider;
+      try {
+        const existing = await provider.getTransactionReceipt(txHash);
+        if (existing) {
+          if (existing.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+          return existing;
+        }
+
+        try {
+          await provider.broadcastTransaction(signedTx);
+          console.log(`${label} raw tx ${attempt === 1 ? 'broadcast' : 'rebroadcast'}: ${txHash}`);
+        } catch (error) {
+          if (!this.isAlreadyKnownTx(error)) throw error;
+        }
+
+        const receipt = await provider.waitForTransaction(txHash, 1, 60_000);
         if (receipt) {
           if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
           return receipt;
         }
-        try {
-          await provider.broadcastTransaction(signedTx);
-          console.log(`${label} raw tx rebroadcast: ${txHash}`);
-        } catch (error) {
-          if (!this.isAlreadyKnownTx(error)) {
-            error.message = `${error.message} (signed rebroadcast tx: ${txHash})`;
-            throw error;
-          }
-        }
-        const waited = await provider.waitForTransaction(txHash, 1, 60_000);
-        if (waited) {
-          if (waited.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
-          return waited;
-        }
-        throw new Error(`${label} receipt pending after signed broadcast: ${txHash}`);
-      }
-
-      const prepared = await prepareFn(provider);
-      if (!prepared?.wallet || !prepared?.request) {
-        throw new Error(`${label}: prepareFn must return { wallet, request }`);
-      }
-      const populated = await prepared.wallet.populateTransaction(prepared.request);
-      signedTx = await prepared.wallet.signTransaction(populated);
-      txHash = ethers.keccak256(signedTx);
-      if (prepared.log) prepared.log(txHash);
-      const tx = await provider.broadcastTransaction(signedTx);
-      try {
-        const receipt = await provider.waitForTransaction(txHash, 1, 60_000);
-        if (!receipt) throw new Error(`${label} receipt pending after signed broadcast: ${txHash}`);
-        if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
-        return receipt;
+        const pendingError = new Error(`${label} receipt pending after signed broadcast: ${txHash}`);
+        pendingError.code = 'TIMEOUT';
+        throw pendingError;
       } catch (error) {
         const receipt = await provider.getTransactionReceipt(txHash).catch(() => null);
         if (receipt) {
           if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
           return receipt;
         }
-        error.message = `${error.message} (signed broadcast tx: ${txHash})`;
-        throw error;
+        if (!this.isProviderError(error) && !this.isAlreadyKnownTx(error)) {
+          error.message = `${error.message} (signed tx: ${txHash})`;
+          throw error;
+        }
+        lastError = error;
+        this.markUnhealthy(provider, true);
+        console.warn(`RPC signed tx attempt ${attempt}/${attempts} failed: ${error.message}`);
       }
-    }, maxRetries, RPC_TX_TIMEOUT_MS);
+    }
+
+    // One final sequential reconciliation across the configured tier. No provider
+    // outside this RPCPool is ever introduced by the signed transaction path.
+    for (const entry of this.providers) {
+      const receipt = await entry.provider.getTransactionReceipt(txHash).catch(() => null);
+      if (receipt) {
+        if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+        return receipt;
+      }
+    }
+    const error = lastError || new Error(`${label} receipt unavailable`);
+    error.message = `${error.message} (signed tx: ${txHash})`;
+    throw error;
   }
 }
 

@@ -270,7 +270,7 @@ class Rebalancer {
 
   _shouldRefreshForPlanError(error) {
     const text = this._errorText(error).toLowerCase();
-    return ['stale', 'cache', 'oracle', 'twap', 'price', 'minout', 'e38', 'e93', 'e94']
+    return ['stale', 'cache', 'oracle', 'twap', 'price', 'minout', 'e38', 'e72', 'e73', 'e93', 'e94']
       .some((marker) => text.includes(marker));
   }
 

@@ -61,21 +61,21 @@ contract AaveHedgeManager is ReentrancyGuard {
     INonfungiblePositionManager public lpPositionManager; // NFT manager Uniswap V3 (setter)
     IUniswapV3Pool public lpPool; // pool LP token0/token1 (setter)
     uint16 public adjustHedgeRangeDivisor; // seuil dynamique = max(1%, rangeWidth / divisor)
-    uint16 public criticalHedgeRangeDivisor; // seuil critique dynamique = max(2.5%, rangeWidth / divisor)
+    uint16 public criticalHedgeRangeDivisor = 2; // seuil critique dynamique = max(2.5%, rangeWidth / divisor)
     uint16 public swapSlippageBps; // slippage max tolere sur le swap token1->token0 (ex 100 = 1%)
     // Reconstitution de reserve apres repay (HF cible). L'USDC libere reste sur ce contrat (reserve).
     uint16 public reserveHfTargetBps; // HF cible apres reconstitution, ex 14000 = 1.4
     uint16 public liqThresholdBps; // seuil de liquidation du collateral (AAVE), ex 8500 = 0.85
     // Cooldown on-chain entre deux reajustements. S'applique de facon identique aux keepers et au bot
     // via adjustHedge(); aucun canal hot-key ne permet de contourner ce garde-fou.
-    uint32 public hedgeAdjustCooldown; // secondes entre deux adjustHedge() (0 = desactive)
+    uint32 public hedgeAdjustCooldown = 1200; // secondes entre deux adjustHedge() (20 min par defaut)
     uint64 public lastHedgeAdjustAt; // timestamp du dernier reajustement (borrow ou repay)
     // audit V1 (V3-R4 Point 2) : ecart MAX tolere entre le prix LP (slot0 du pool) et le ratio ORACLE
     // token0/token1 du RangeManager AVANT de calculer token0InLP dans adjustHedge().
     // adjustHedge() est permissionless : sans cette garde, un prix LP manipule (slot0) gonfle/reduit
     // token0InLP -> borrow/repay inutile -> churn AAVE + bounty vole + exposition MEV. En bps. 0 = desactive
     // (retrocompat / mode urgence). Aucune hypothese stablecoin: price0 ET price1 sont lus dans le cache RM.
-    uint16 public maxHedgeDeviationBps;
+    uint16 public maxHedgeDeviationBps = 50;
     // Decimales des tokens lues directement depuis les contrats au constructeur (zero hard-code,
     // toujours disponibles des le deploiement, generiques WETH/USDC ou WBTC/USDT ou toute paire).
     uint8 public immutable volatileDecimals; // decimales du token volatil emprunte (token0)
@@ -88,7 +88,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     // entierement couvert par la dette short). H_opt (variance-min ~50%) RETIRE : trompeur pour un produit
     // "Delta Neutral". Le token0 emprunte ne doit JAMAIS rester idle (il annule la dette) -> integre a la LP au
     // mint (B1), et le repay over-hedge achete le token0 AU MARCHE (jamais depuis le buffer idle).
-    uint16 public hedgeTargetBps; // cible de hedge en bps du token0 LP (defaut 10000 = 100%, borne 5000..10000)
+    uint16 public hedgeTargetBps = 10000; // cible DN stricte: 100% du token0 LP
     // Seuil dust on-chain (en token0/volatil) : une donation de token0 au RangeManager gonfle idleRM et
     // fausse effectiveShort. En-dessous de ce seuil, le token0 libre du RM est IGNORE (anti-grief donation).
     uint256 public donationDustToken0;
@@ -503,28 +503,27 @@ contract AaveHedgeManager is ReentrancyGuard {
     ///      oracle n'est recâblé ici.
     ///      Parametres groupes en tableaux pour eviter stack-too-deep.
     function setAdjustHedgeConfig(address[4] calldata addrs, uint16[4] calldata params) external onlyGovernance {
-        if (addrs[0] == address(0) || addrs[2] == address(0) || addrs[3] == address(0)) revert HedgeCheck(30);
+        address currentRangeManager = rangeManager;
+        if (
+            addrs[0] == address(0) || addrs[2] == address(0) || addrs[3] == address(0)
+                || (currentRangeManager != address(0) && addrs[0] != currentRangeManager)
+        ) revert HedgeCheck(30);
         if (params[0] < 3 || params[0] > 50) revert HedgeCheck(31); // divisor: default 4 => width/4
         if (params[1] < 10 || params[1] > 500) revert HedgeCheck(32);
         if (params[2] < 11000 || params[2] > 30000) revert HedgeCheck(33); // 1.1 .. 3.0
         if (params[3] < 5000 || params[3] > 9500) revert HedgeCheck(34); // 0.5 .. 0.95
-        rangeManager = addrs[0];
+        // Topology is installed once by the Phase 1 batch. Governance may tune risk parameters later,
+        // but cannot redirect collateral or debt accounting to replacement contracts.
+        // RangeManager is the immutable destination of close/sweep paths after the initial batch.
+        if (currentRangeManager == address(0)) rangeManager = addrs[0];
         treasuryAddress = addrs[1];
         lpPositionManager = INonfungiblePositionManager(addrs[2]);
         lpPool = IUniswapV3Pool(addrs[3]);
         adjustHedgeRangeDivisor = params[0];
-        if (criticalHedgeRangeDivisor == 0) criticalHedgeRangeDivisor = 2;
         if (criticalHedgeRangeDivisor >= adjustHedgeRangeDivisor) revert HedgeCheck(54);
         swapSlippageBps = params[1];
         reserveHfTargetBps = params[2];
         liqThresholdBps = params[3];
-        if (hedgeTargetBps == 0) hedgeTargetBps = 10000; // retrocompat : defaut DN strict
-        // SECURITE (retour audit) : ne JAMAIS laisser ces deux protections desactivees par defaut.
-        // adjustHedge() permissionless est dangereux sans cooldown (drain bounty/churn) ni garde de
-        // deviation slot0 (manipulation de targetShort). On pose des defauts surs si non encore configures
-        // (le setter dedie peut les ajuster ensuite).
-        if (hedgeAdjustCooldown == 0) hedgeAdjustCooldown = 1200; // 20 min par defaut
-        if (maxHedgeDeviationBps == 0) maxHedgeDeviationBps = 50; // 0.5% par defaut
     }
 
     /// @notice Configure le diviseur du seuil critique DN (gouvernance).
@@ -652,7 +651,7 @@ contract AaveHedgeManager is ReentrancyGuard {
         if (tokenId == 0) revert HedgeCheck(42);
         (uint256 token0InLP, int24 tickLower, int24 tickUpper) =
             DnDepositLib.aaveLpToken0AndTicks(tokenId, lpPositionManager, lpPool);
-        if (tickUpper <= tickLower) revert HedgeCheck(42);
+        if (tickUpper <= tickLower) revert HedgeCheck(61);
 
         // 1b. audit V1 (V3-R4 Point 2) : garde anti-manipulation du prix LP. token0InLP derive du slot0 ; si le
         // pool a ete pousse loin du ratio oracle token0/token1, on refuse de reajuster (sinon repay inutile +
@@ -751,9 +750,6 @@ contract AaveHedgeManager is ReentrancyGuard {
         idleUsdc = usdc.balanceOf(address(this));
     }
 
-    /// @dev Distribue au retrait partiel la quote-part des soldes idle deja presents sur le HedgeManager.
-    ///      Sans cela, ces reserves sont comptabilisees dans la NAV mais le premier retrait partiel ne recoit
-    ///      pas sa part; inversement, le callback flash-loan protege `idleWethBefore` pour eviter une subvention.
     function _sendIdleShare(uint256 idleWethBefore, uint256 idleUsdcBefore, uint256 proportionBps, address recipient)
         private
     {
