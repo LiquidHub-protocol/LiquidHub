@@ -172,7 +172,7 @@ async function main() {
     try {
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
 
-      const priceCacheWasStale = await logPriceCacheBeforeDecision(rangeManager, rpcPool);
+      await logPriceCacheBeforeDecision(rangeManager, rpcPool);
 
       let [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
         async (p) => {
@@ -180,7 +180,7 @@ async function main() {
           return await rm.getBotInstructions();
         }
       );
-      if (priceCacheWasStale && hasPosition && !needsRebalance
+      if (hasPosition && !needsRebalance
           && await isLivePositionOutOfRange(rangeManager, tokenId, rpcPool)) {
         needsRebalance = true;
         action = 'REBALANCE';

@@ -160,16 +160,20 @@ class RPCPool {
   }
 
   async executeSignedTxWithRetry(prepareFn, label = 'transaction', maxRetries = 3) {
-    const preparationProvider = this.getProvider();
-    const prepared = await prepareFn(preparationProvider);
-    if (!prepared?.wallet || !prepared?.request) {
-      throw new Error(`${label}: prepareFn must return { wallet, request }`);
-    }
+    const preparedBundle = await this.executeWithRetry(async (provider) => {
+      const prepared = await prepareFn(provider);
+      if (!prepared?.wallet || !prepared?.request) {
+        throw new Error(`${label}: prepareFn must return { wallet, request }`);
+      }
+      const populated = await prepared.wallet.populateTransaction(prepared.request);
+      return { provider, prepared, populated };
+    }, maxRetries, RPC_TX_TIMEOUT_MS);
+    const { provider: preparationProvider, prepared, populated } = preparedBundle;
 
-    // Populate and sign exactly once. RPC failover only ever rebroadcasts this same
-    // immutable raw transaction, so a timed-out provider cannot later send a second nonce.
-    const populated = await prepared.wallet.populateTransaction(prepared.request);
-    const signedTx = await prepared.wallet.signTransaction(populated);
+    // Sign exactly once. Every provider only sees this immutable raw transaction.
+    const signedTx = await this.withTimeout(
+      () => prepared.wallet.signTransaction(populated), RPC_TX_TIMEOUT_MS, `${label} signing`
+    );
     const txHash = ethers.keccak256(signedTx);
     if (prepared.log) prepared.log(txHash);
 
@@ -184,20 +188,26 @@ class RPCPool {
       const entry = this.providers[(startIndex + attempt - 1) % this.providers.length];
       const provider = entry.provider;
       try {
-        const existing = await provider.getTransactionReceipt(txHash);
+        const existing = await this.withTimeout(
+          () => provider.getTransactionReceipt(txHash), RPC_READ_TIMEOUT_MS, `${label} receipt lookup`
+        );
         if (existing) {
           if (existing.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
           return existing;
         }
 
         try {
-          await provider.broadcastTransaction(signedTx);
+          await this.withTimeout(
+            () => provider.broadcastTransaction(signedTx), RPC_READ_TIMEOUT_MS, `${label} broadcast`
+          );
           console.log(`${label} raw tx ${attempt === 1 ? 'broadcast' : 'rebroadcast'}: ${txHash}`);
         } catch (error) {
           if (!this.isAlreadyKnownTx(error)) throw error;
         }
 
-        const receipt = await provider.waitForTransaction(txHash, 1, 60_000);
+        const receipt = await this.withTimeout(
+          () => provider.waitForTransaction(txHash, 1, 60_000), RPC_TX_TIMEOUT_MS, `${label} receipt wait`
+        );
         if (receipt) {
           if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
           return receipt;
@@ -206,7 +216,9 @@ class RPCPool {
         pendingError.code = 'TIMEOUT';
         throw pendingError;
       } catch (error) {
-        const receipt = await provider.getTransactionReceipt(txHash).catch(() => null);
+        const receipt = await this.withTimeout(
+          () => provider.getTransactionReceipt(txHash), RPC_READ_TIMEOUT_MS, `${label} receipt reconciliation`
+        ).catch(() => null);
         if (receipt) {
           if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
           return receipt;
@@ -224,7 +236,9 @@ class RPCPool {
     // One final sequential reconciliation across the configured tier. No provider
     // outside this RPCPool is ever introduced by the signed transaction path.
     for (const entry of this.providers) {
-      const receipt = await entry.provider.getTransactionReceipt(txHash).catch(() => null);
+      const receipt = await this.withTimeout(
+        () => entry.provider.getTransactionReceipt(txHash), RPC_READ_TIMEOUT_MS, `${label} final receipt reconciliation`
+      ).catch(() => null);
       if (receipt) {
         if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
         return receipt;

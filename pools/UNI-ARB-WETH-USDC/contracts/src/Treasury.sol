@@ -446,13 +446,12 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         rescueSafe = newSafe;
     }
 
-    /// @notice Recover ERC-20 tokens accidentally sent here (other than USDC).
+    /// @notice Recover ERC-20 tokens held here in an emergency (other than USDC).
     /// @dev USDC must go through adminWithdraw() to respect the monthly cap.
     ///      Remains available to the rescue Safe after admin withdrawals are disabled in Phase 2.
     function rescueToken(address tokenAddr, address to, uint256 amount) external onlyRescueSafe {
         require(to != address(0), "Invalid recipient");
         require(tokenAddr != address(usdc), "Use adminWithdraw for USDC");
-        require(address(swapFeeds[tokenAddr]) == address(0), "Use bridge flow");
         IERC20(tokenAddr).safeTransfer(to, amount);
         emit TokenRescued(tokenAddr, to, amount);
     }

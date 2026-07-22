@@ -247,7 +247,7 @@ async function main() {
     try {
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
 
-      const priceCacheWasStale = await logPriceCacheBeforeDecision(rangeManager, rpcPool);
+      await logPriceCacheBeforeDecision(rangeManager, rpcPool);
 
       let [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
         async (p) => {
@@ -255,7 +255,7 @@ async function main() {
           return await rm.getBotInstructions();
         }
       );
-      if (priceCacheWasStale && hasPosition && !needsRebalance
+      if (hasPosition && !needsRebalance
           && await isLivePositionOutOfRange(rangeManager, tokenId, rpcPool)) {
         needsRebalance = true;
         action = 'REBALANCE';
@@ -416,6 +416,9 @@ async function main() {
             const message = `${pending} queued deposit(s) waiting for the main bot initial mint`;
             console.log(`  Deposit deferred: ${message}`);
             await trackAction(actionAlerts, 'failure', 'mint', message);
+          } else if (needsRebalance && action === 'REBALANCE') {
+            await trackAction(actionAlerts, 'success', 'mint', 'Initial position is available');
+            console.log(`  Deposit deferred: known rebalance is due (${reason || 'on-chain signal'})`);
           } else if (!isRebalancing) {
             await trackAction(actionAlerts, 'success', 'mint', 'Initial position is available');
             const depEnabled = treasury ? await readContract(rpcPool, treasury, 'depositBountyEnabled') : false;

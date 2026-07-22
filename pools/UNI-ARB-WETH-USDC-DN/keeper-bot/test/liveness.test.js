@@ -35,7 +35,11 @@ test('signed transaction failover prepares and signs once, then rebroadcasts the
   };
   pool.providers = [first, second].map((provider) => ({ provider, healthy: true, errorCount: 0 }));
   pool.currentIndex = 0;
-  pool.withTimeout = () => { throw new Error('signed path must not use Promise.race timeout'); };
+  const timeoutLabels = [];
+  pool.withTimeout = async (fn, _timeoutMs, label) => {
+    timeoutLabels.push(label);
+    return await fn();
+  };
 
   let prepareCount = 0;
   let populateCount = 0;
@@ -55,6 +59,8 @@ test('signed transaction failover prepares and signs once, then rebroadcasts the
   assert.equal(populateCount, 1);
   assert.equal(signCount, 1);
   assert.deepEqual(broadcasts, ['0x1234', '0x1234']);
+  assert.ok(timeoutLabels.some((label) => label.includes('broadcast')));
+  assert.ok(timeoutLabels.some((label) => label.includes('receipt')));
 });
 
 test('chunk count and splitting stay in BigInt arithmetic', () => {
