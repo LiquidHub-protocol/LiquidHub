@@ -127,3 +127,26 @@ test('unrelated rebalance revert does not trigger an isolated price refresh', as
   assert.equal(result.success, false);
   assert.equal(refreshCount, 0);
 });
+
+test('critical hedge fallback refreshes and recomputes a stale rebalance plan once', async () => {
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
+  const events = [];
+  let simulationCount = 0;
+  rebalancer._readPriceCache = async () => ({ valid: true });
+  rebalancer._buildRebalancePlan = async () => {
+    events.push('build');
+    return { swapAmounts: [], minOuts: [] };
+  };
+  rebalancer._simulateRebalance = async () => {
+    events.push('simulate');
+    simulationCount += 1;
+    if (simulationCount === 1) throw new Error('stale price cache');
+  };
+  rebalancer._refreshPriceCacheForAction = async () => {
+    events.push('refresh');
+    return { valid: true };
+  };
+
+  assert.equal(await rebalancer.canExecuteCriticalHedgeRebalance(), true);
+  assert.deepEqual(events, ['build', 'simulate', 'refresh', 'build', 'simulate']);
+});

@@ -199,10 +199,10 @@ library RangeOperations {
             int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
             return uint24(diff) > uint24(maxTwapDeviationBps);
         } catch {
-            // Bypass uniquement pendant le warm-up reel des 300 secondes. Une fois cet historique disponible,
-            // tout echec observe() invalide le cache au lieu de masquer une panne du pool.
-            (uint32 oldest,,,) = pool.observations(0);
-            return oldest <= block.timestamp - 300;
+            // Bypass uniquement au bootstrap (une seule observation initialisee). Des la deuxieme,
+            // tout echec observe() invalide le cache, y compris pendant le reste du warm-up 300s.
+            (,,, uint16 cardinality,,,) = pool.slot0();
+            return cardinality != 1;
         }
     }
 
@@ -1438,7 +1438,8 @@ library RangeOperations {
         uint256 mult = drc.rangeMultiplicatorBps == 0 ? 10000 : uint256(drc.rangeMultiplicatorBps);
         totalBps = (totalBps * mult) / 10000;
 
-        // 7. Arrondir l'amplitude totale au palier rangeStepBps (vers le haut)
+        // 7. Arrondir l'amplitude totale au palier rangeStepBps (vers le haut).
+        //    Le palier effectif par cote vaut donc rangeStepBps / 2.
         uint256 step = drc.rangeStepBps == 0 ? 50 : uint256(drc.rangeStepBps);
         uint256 roundedTotal = ((totalBps + step - 1) / step) * step;
 

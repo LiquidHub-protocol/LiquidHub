@@ -731,15 +731,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             _processOneDeposit();
 
         // 5b. REFONTE DN : ouvrir le hedge ATOMIQUEMENT (avant les swaps, pour que le WETH emprunté soit
-        // sur le RM au moment du calcul/exécution des swaps + addLiquidity). Cible GLOBALE (corrige aussi le
-        // drift existant). Si pas de hedgeManager (std) ou collateral=0 (déjà assez short) → no-op ici.
+        // sur le RM au moment du calcul/exécution des swaps + addLiquidity). Hedge INCRÉMENTAL du dépôt :
+        // le drift historique reste traité par adjustHedge/rebalance, jamais aux frais du nouveau déposant.
         if (hedgeManager != address(0)) {
             DnDepositLib.openDepositHedge(
                 DnDepositLib.Addrs(hedgeManager, address(rangeManager), address(token0), address(token1)),
                 price0,
                 price1,
-                cfg.token0Decimals,
-                cfg.token1Decimals
+                pd.amount0,
+                pd.amount1
             );
         }
 

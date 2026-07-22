@@ -210,16 +210,33 @@ library DnDepositLib {
         }
     }
 
-    /// @notice Ouvre le hedge au dépôt (cible GLOBALE : corrige aussi le drift existant). USD 8 déc.
+    /// @notice Ouvre uniquement le hedge incrémental du dépôt. USD 8 déc.
     /// @param a Adresses (hedge, rm, token0, token1)
     /// @param price0 prix token0 Chainlink (8 déc)
     /// @param price1 prix token1 Chainlink (8 déc)
-    /// @param dec0 décimales token0
-    /// @param dec1 décimales token1
-    function openDepositHedge(Addrs calldata a, uint128 price0, uint128 price1, uint8 dec0, uint8 dec1) external {
-        // Exécution : les fonds du dépôt sont DÉJÀ sur le RM (_processOneDeposit a précédé) → extra0=extra1=0.
-        (uint256 collateralUsdc, uint256 borrowWeth) =
-            _computeDepositHedge(a.hedgeManager, a.rangeManager, a.token0, a.token1, price0, price1, dec0, dec1, 0, 0);
+    /// @param depositAmount0 token0 apporte par le depot courant
+    /// @param depositAmount1 token1 apporte par le depot courant
+    function openDepositHedge(
+        Addrs calldata a,
+        uint128 price0,
+        uint128 price1,
+        uint256 depositAmount0,
+        uint256 depositAmount1
+    ) external {
+        (, uint8 dec0, uint8 dec1,,,,,,,) = IRmDep(a.rangeManager).config();
+        // Les fonds du depot sont deja sur le RM, mais seuls les montants explicites de ce depot
+        // participent au calcul et au plafond de collateral.
+        (uint256 collateralUsdc, uint256 borrowWeth) = _computeDepositHedge(
+            a.hedgeManager,
+            a.rangeManager,
+            a.token0,
+            price0,
+            price1,
+            dec0,
+            dec1,
+            depositAmount0,
+            depositAmount1
+        );
 
         if (collateralUsdc == 0) return; // déjà assez short → dépôt LP-seul (post-check tranchera)
 
@@ -253,52 +270,54 @@ library DnDepositLib {
         effectiveShort = int256(debt) - int256(idleHm) - int256(idleRm);
     }
 
-    /// @dev Calcule (collatéralUsdc, borrowWeth) du hedge au dépôt. Partagé par openDepositHedge (exécution) et
-    ///      getDepositSwapParams (simulation H-01). Formule globale exacte (computeHedgeDeposit). Renvoie (0,0) si
-    ///      déjà assez short.
-    /// @dev AUDIT H-02 : `extra0`/`extra1` = montants du dépôt à venir, à AJOUTER aux soldes RM pour simuler
-    ///      l'état POST-transfert (comme openDepositHedge, appelé après _processOneDeposit). openDepositHedge
-    ///      passe (0,0) (les fonds sont déjà sur le RM) ; getDepositSwapParams passe (deposit0, deposit1).
+    /// @dev Calcule (collatéralUsdc, borrowWeth) du hedge incrémental. Partagé par openDepositHedge (exécution)
+    ///      et getDepositSwapParams (simulation H-01). Le drift historique n'est jamais réparé aux frais du
+    ///      nouveau déposant : adjustHedge/rebalance le traite, et le post-check atomique annule le dépôt si
+    ///      la position globale reste hors tolérance.
+    /// @dev Le calcul ne peut utiliser que la valeur et le token1 du depot courant. Les soldes libres
+    ///      historiques du RM restent dans la NAV existante et ne financent jamais ce nouveau hedge.
     /// @dev AUDIT H-03 : rBps = ratio du NFT EXISTANT au prix courant (addLiquidityToPosition ajoute à CE range),
     ///      pas le range cible dynamique (getOptimalSwapParams, réservé au (re)mint).
     function _computeDepositHedge(
         address hedgeManager,
         address rangeManager,
         address token0,
-        address token1,
         uint128 price0,
         uint128 price1,
         uint8 dec0,
         uint8 dec1,
-        uint256 extra0,
-        uint256 extra1
+        uint256 depositAmount0,
+        uint256 depositAmount1
     ) private view returns (uint256 collateralUsdc, uint256 borrowWeth) {
         IHedgeDep hm = IHedgeDep(hedgeManager);
         IRmDep rm = IRmDep(rangeManager);
-        uint256 dustTok0 = hm.donationDustToken0();
-        uint256 debtUsd = _toUsd(hm.getWethDebt(), price0, dec0);
-        uint256 freeRmWeth = IERC20(token0).balanceOf(rangeManager) + extra0; // + dépôt token0 (post-transfert)
-        uint256 idleHmUsd = _toUsd(_dust(hm.getWethBalance(), dustTok0), price0, dec0);
-        uint256 idleRmUsd = _toUsd(_dust(freeRmWeth, dustTok0), price0, dec0);
+        uint256 freeRmWeth = IERC20(token0).balanceOf(rangeManager);
         (uint256 totalBal0,) = rm.getCurrentBalances();
-        // totalBal0 inclut le NFT + le token0 libre ACTUEL (hors extra0) -> NFT = totalBal0 - libre actuel.
-        uint256 curFreeRmWeth = freeRmWeth - extra0;
-        uint256 nftWeth = totalBal0 > curFreeRmWeth ? totalBal0 - curFreeRmWeth : 0;
-        uint256 investableUsd = ((IERC20(token1).balanceOf(rangeManager) + extra1) * uint256(price1)) / (10 ** dec1);
+        uint256 nftWeth = totalBal0 > freeRmWeth ? totalBal0 - freeRmWeth : 0;
+        uint256 investableUsd = _toUsd(depositAmount0, price0, dec0)
+            + Math.mulDiv(depositAmount1, uint256(price1), 10 ** dec1);
         uint16 rBps = _nftRatio0Bps(rangeManager); // H-03 : ratio du NFT existant
 
+        uint256 nftUsd = _toUsd(nftWeth, price0, dec0);
+        uint16 hedgeTargetBps = hm.hedgeTargetBps();
+        uint16 ltvBps = uint16((uint256(hm.liqThresholdBps()) * 10000) / uint256(hm.reserveHfTargetBps()));
         (uint256 collateralUsd, uint256 borrowUsd) = RangeOperations.computeHedgeDeposit(
             RangeOperations.HedgeDepositParams({
                 investableUsd: investableUsd,
-                wethLpExistingUsd: _toUsd(nftWeth, price0, dec0),
-                debtUsd: debtUsd,
-                idleHmUsd: idleHmUsd,
-                idleRmUsd: idleRmUsd,
-                hedgeTargetBps: hm.hedgeTargetBps(),
+                wethLpExistingUsd: nftUsd,
+                debtUsd: Math.mulDiv(nftUsd, hedgeTargetBps, 10000),
+                idleHmUsd: 0,
+                idleRmUsd: 0,
+                hedgeTargetBps: hedgeTargetBps,
                 rBps: rBps,
-                ltvBps: uint16((uint256(hm.liqThresholdBps()) * 10000) / uint256(hm.reserveHfTargetBps()))
+                ltvBps: ltvBps
             })
         );
+        uint256 depositToken1Usd = Math.mulDiv(depositAmount1, uint256(price1), 10 ** dec1);
+        if (collateralUsd > depositToken1Usd) {
+            collateralUsd = depositToken1Usd;
+            borrowUsd = Math.mulDiv(collateralUsd, ltvBps, 10000);
+        }
         if (collateralUsd == 0) return (0, 0);
         collateralUsdc = (collateralUsd * (10 ** dec1)) / uint256(price1);
         borrowWeth = (borrowUsd * (10 ** dec0)) / uint256(price0);
@@ -370,7 +389,7 @@ library DnDepositLib {
         uint256 borrowWeth;
         if (hedgeManager != address(0)) {
             (collateralUsdc, borrowWeth) = _computeDepositHedge(
-                hedgeManager, rangeManager, token0, token1, price0, price1, dec0, dec1, depositAmount0, depositAmount1
+                hedgeManager, rangeManager, token0, price0, price1, dec0, dec1, depositAmount0, depositAmount1
             );
         }
 

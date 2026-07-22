@@ -196,7 +196,7 @@ library RangeOperations {
     }
 
     function _trustedTwapTick(IUniswapV3Pool pool) private view returns (int24 twapTick) {
-        (, int24 spotTick,,,,,) = pool.slot0();
+        (, int24 spotTick,, uint16 cardinality,,,) = pool.slot0();
         uint32[] memory secondsAgos = new uint32[](2);
         secondsAgos[0] = 300;
         try pool.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
@@ -204,8 +204,8 @@ library RangeOperations {
             twapTick = int24(tickDelta / int56(uint56(300)));
             if (tickDelta < 0 && tickDelta % int56(uint56(300)) != 0) twapTick--;
         } catch {
-            (uint32 oldest,,,) = pool.observations(0);
-            require(block.timestamp < uint256(oldest) + 300, "TWAP unavailable");
+            // Bootstrap uniquement. Des la deuxieme observation, un echec observe() est fail-closed.
+            require(cardinality == 1, "TWAP unavailable");
             twapTick = spotTick;
         }
     }

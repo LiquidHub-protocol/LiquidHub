@@ -12,6 +12,29 @@ const PRICE_CACHE_MAX_AGE_SEC = parseInt(
   process.env.KEEPER_PRICE_CACHE_MAX_AGE_SEC || process.env.BOT_PRICE_CACHE_MAX_AGE_SEC || '300',
   10
 );
+const HEDGE_ERROR_IFACE = new ethers.Interface(['error HedgeCheck(uint8 code)']);
+const HEDGE_NO_ACTION_CODES = new Set([41, 42, 44]);
+
+function hedgeCheckCode(error) {
+  if (error?.revert?.name === 'HedgeCheck' && error.revert.args?.length) {
+    return Number(error.revert.args[0]);
+  }
+  const candidates = [error?.data, error?.error?.data, error?.info?.error?.data];
+  for (const data of candidates) {
+    if (typeof data !== 'string' || !data.startsWith('0x')) continue;
+    try {
+      const parsed = HEDGE_ERROR_IFACE.parseError(data);
+      if (parsed?.name === 'HedgeCheck') return Number(parsed.args[0]);
+    } catch (_) {}
+  }
+  return null;
+}
+
+function classifyHedgeSimulationError(error, rpcPool) {
+  if (rpcPool.isProviderError(error)) return { kind: 'provider', code: null };
+  const code = hedgeCheckCode(error);
+  return { kind: HEDGE_NO_ACTION_CODES.has(code) ? 'no-action' : 'failure', code };
+}
 
 function needsPriceCacheRefresh(priceCache) {
   if (!priceCache.valid || BigInt(priceCache.price0) === 0n || BigInt(priceCache.price1) === 0n) return true;
@@ -107,11 +130,14 @@ async function executeHedgeIfReady({ hedgeManager, wallet, rpcPool, actionAlerts
       await hedgeManager.connect(provider).adjustHedge.staticCall();
     });
   } catch (error) {
-    console.log(`  ${label}: no action (${(error.reason || error.message || '').slice(0, 80)})`);
-    if (rpcPool.isProviderError(error)) {
-      await trackAction(actionAlerts, 'failure', 'adjustHedge', error.reason || error.message);
-    } else {
+    const classification = classifyHedgeSimulationError(error, rpcPool);
+    const suffix = classification.code === null ? '' : ` [HedgeCheck ${classification.code}]`;
+    if (classification.kind === 'no-action') {
+      console.log(`  ${label}: no action${suffix}`);
       await trackAction(actionAlerts, 'success', 'adjustHedge', 'Adjustment no longer required');
+    } else {
+      console.log(`  ${label}: simulation failed${suffix} (${(error.reason || error.message || '').slice(0, 80)})`);
+      await trackAction(actionAlerts, 'failure', 'adjustHedge', error.reason || error.message);
     }
     return false;
   }
@@ -135,7 +161,7 @@ async function executeHedgeIfReady({ hedgeManager, wallet, rpcPool, actionAlerts
         await hedgeManager.connect(provider).adjustHedge.staticCall();
       });
     } catch (recheckError) {
-      stillRequired = rpcPool.isProviderError(recheckError);
+      stillRequired = classifyHedgeSimulationError(recheckError, rpcPool).kind !== 'no-action';
     }
     if (stillRequired) {
       await trackAction(actionAlerts, 'failure', 'adjustHedge', error.reason || error.message);
@@ -282,6 +308,8 @@ async function main() {
       // --- Hedge/HF priority (permissionless) ---
       // Simuler avant snapshots et depots. Le contrat contourne le cooldown uniquement pour reparer un HF;
       // un drift insuffisant revert ici sans envoyer de transaction.
+      let criticalFallbackAttempted = false;
+      let criticalFallbackFailed = false;
       if (!CHECK_ONLY && hedgeManager && wallet) {
         const hedgeAdjusted = await executeHedgeIfReady({
           hedgeManager,
@@ -292,11 +320,13 @@ async function main() {
         });
         if (!hedgeAdjusted && hasPosition && !needsRebalance
             && await rebalancer.canExecuteCriticalHedgeRebalance()) {
+          criticalFallbackAttempted = true;
           console.log('  -> Critical DN drift permits an atomic rebalance fallback...');
           const fallback = await rebalancer.executeRebalance(tokenId);
           if (fallback.success) {
             await trackAction(actionAlerts, 'success', 'rebalance', `Critical hedge fallback: ${fallback.txHashes[0]}`);
           } else {
+            criticalFallbackFailed = true;
             await trackAction(actionAlerts, 'failure', 'rebalance', fallback.error);
           }
         }
@@ -401,7 +431,11 @@ async function main() {
 
       if (!doRebalance) {
         console.log('  -> No rebalance needed\n');
-        await trackAction(actionAlerts, 'success', 'rebalance', 'Rebalance completed elsewhere or no longer required');
+        if (!criticalFallbackAttempted || !criticalFallbackFailed) {
+          await trackAction(actionAlerts, 'success', 'rebalance', 'Rebalance completed elsewhere or no longer required');
+        } else {
+          console.log('  Critical hedge fallback remains failed; persistent alert state retained');
+        }
       } else if (CHECK_ONLY) {
         console.log('  -> Rebalance needed (check-only, skipping)\n');
       } else {

@@ -78,8 +78,18 @@ class Rebalancer {
 
   async canExecuteCriticalHedgeRebalance() {
     try {
-      const plan = await this._buildRebalancePlan(await this._readPriceCache());
-      await this._simulateRebalance(plan);
+      let plan;
+      try {
+        plan = await this._buildRebalancePlan(await this._readPriceCache());
+        await this._simulateRebalance(plan);
+      } catch (firstError) {
+        if (this._isFeePlanError(firstError)) return true;
+        if (!this._shouldRefreshForPlanError(firstError)) return false;
+        console.log(`  Critical hedge fallback preflight rejected; refreshing and recomputing once: ${this._errorText(firstError)}`);
+        const refreshed = await this._refreshPriceCacheForAction('critical hedge fallback preflight');
+        plan = await this._buildRebalancePlan(refreshed);
+        await this._simulateRebalance(plan);
+      }
       return true;
     } catch (error) {
       // E93/E94 signifie que rebalance() a deja franchi son garde E96 (range/drift critique),
