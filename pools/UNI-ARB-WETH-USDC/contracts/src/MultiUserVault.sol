@@ -68,7 +68,7 @@ interface IRangeManager {
 }
 
 interface ITreasuryDeposit {
-    function payDepositBounty(address keeper, uint256 depositValueUsd) external;
+    function payDepositBounty(address keeper, address depositor, uint256 depositValueUsd) external;
 }
 
 interface IBotNav {
@@ -695,7 +695,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         // 9. Deposit bounty (silent: ne jamais bloquer l'action si treasury vide / desactive)
         if (treasuryAddress != address(0)) {
-            try ITreasuryDeposit(treasuryAddress).payDepositBounty(msg.sender, depositValue) {} catch {}
+            try ITreasuryDeposit(treasuryAddress).payDepositBounty(msg.sender, pd.user, depositValue) {} catch {}
         }
     }
 

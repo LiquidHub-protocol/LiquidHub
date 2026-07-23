@@ -963,8 +963,15 @@ library DnDepositLib {
         uint16 slippageBps,
         bool zeroForOne
     ) private view returns (uint256 amountInMaximum, uint160 sqrtPriceLimitX96) {
-        (uint128 price0, uint128 price1, uint160 sqrtP,,, bool valid) = IRmDep(rangeManager).priceCache();
-        require(valid && price0 > 0 && price1 > 0 && sqrtP > 0, "Bad oracle");
+        (uint128 price0, uint128 price1, uint160 sqrtP,, uint64 timestamp, bool valid) =
+            IRmDep(rangeManager).priceCache();
+        // This exact-output repayment path may bypass only the spot/TWAP validity bit produced by a refresh
+        // in THIS transaction. Invalid/stale feeds return zero values and cannot pass; the Chainlink max-in
+        // and full-fill post-check still bound every settlement and HF repair.
+        require(
+            (valid || timestamp == uint64(block.timestamp)) && price0 > 0 && price1 > 0 && sqrtP > 0,
+            "Bad oracle"
+        );
         uint256 theoretical =
             Math.mulDiv(amount0Out, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0), Math.Rounding.Up);
         amountInMaximum = Math.mulDiv(theoretical, 10000 + uint256(slippageBps), 10000, Math.Rounding.Up);

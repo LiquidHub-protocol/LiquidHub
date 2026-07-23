@@ -767,7 +767,12 @@ contract AaveHedgeManager is ReentrancyGuard {
     {
         _refreshRangePriceCache();
         (amountInMaximum, sqrtPriceLimitX96) = DnDepositLib.aaveOracleMaxToken1ForToken0(
-            wethNeeded, rangeManager, volatileDecimals, stableDecimals, swapSlippageBps, address(usdc) < address(weth)
+            wethNeeded,
+            rangeManager,
+            volatileDecimals,
+            stableDecimals,
+            swapSlippageBps,
+            address(usdc) < address(weth)
         );
     }
 

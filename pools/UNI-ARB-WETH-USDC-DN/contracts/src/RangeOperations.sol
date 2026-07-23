@@ -173,10 +173,14 @@ library RangeOperations {
         // → les require(valid) en aval reverteront. Centralise la protection en un seul point.
         if (maxDeviationBps > 0 && _deviationExceeds(newCache, maxDeviationBps, cfg.token0Decimals, cfg.token1Decimals))
         {
-            return PriceCache(0, 0, 0, 0, 0, false);
+            // Preserve freshly validated oracle values for AAVE exact-output debt repayments only.
+            // Every normal LP/hedge path still requires valid=true and remains blocked by this market guard.
+            newCache.valid = false;
+            return newCache;
         }
         if (twapGuardEnabled && _twapDeviationExceeds(pool, tick, maxTwapDeviationBps)) {
-            return PriceCache(0, 0, 0, 0, 0, false);
+            newCache.valid = false;
+            return newCache;
         }
     }
 

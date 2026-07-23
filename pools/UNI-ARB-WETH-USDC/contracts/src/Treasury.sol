@@ -93,6 +93,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     uint256 public currentMonthWithdrawn;
     uint256 public currentMonthStart;
     bool public adminWithdrawEnabled;
+    bool public distributionsPaused;
     address public rescueSafe;
     address public stakingRewardsAddress;
 
@@ -148,8 +149,9 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
 
     // --- Deposit Bounty (processDepositPermissionless) — paye au keeper qui traite un depot en file ---
     // Le caller est le Vault (pas le RangeManager) -> autorisation dediee authorizedVaults.
-    // Anti-drain: ratio depot/bounty + cooldown/cap quotidien par Vault. Le traitement du depot reste
-    // permissionless; si ces limites revert, le Vault catch et saute seulement le paiement du bounty.
+    // Anti-drain: pas de paiement direct au deposant + ratio depot/bounty + cooldown/cap quotidien par Vault.
+    // Une collusion Sybil reste inherente a une prime permissionless, mais son rendement est strictement borne.
+    // Le traitement reste permissionless; si ces limites revert, le Vault saute seulement la prime.
     bool public depositBountyEnabled;
     uint256 public depositBountyAmount;
     uint64 public depositBountyCooldown; // seconds between two paid deposit bounties per Vault
@@ -171,6 +173,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     // --- Events ---
     event AdminWithdrawal(uint256 amount, address indexed to);
     event AdminWithdrawDisabled(uint256 timestamp);
+    event DistributionsPauseUpdated(bool paused, address indexed caller);
     event RescueSafeUpdated(address indexed oldSafe, address indexed newSafe);
     event StakingRewardsSet(address indexed stakingRewards);
     event FeesDistributed(uint256 amount);
@@ -280,6 +283,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     /// @notice Bridge USDC to staking contract on destination chain via Stargate v2. Callable by anyone.
     /// @dev Uses Taxi mode (immediate delivery). Caller pays native gas for cross-chain fees via msg.value.
     function bridgeToStakers(uint256 amount) external payable nonReentrant {
+        require(!distributionsPaused, "Distributions paused");
         require(bridgeEnabled, "Bridge disabled");
         require(amount > 0, "Zero amount");
         require(bridgeDestinationAddress != address(0), "Destination not set");
@@ -444,6 +448,16 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         require(newSafe != address(0), "Invalid safe");
         emit RescueSafeUpdated(rescueSafe, newSafe);
         rescueSafe = newSafe;
+    }
+
+    /// @notice Emergency stop for revenue distributions. The rescue Safe may pause immediately;
+    ///         only the owner (Safe in Phase 1, Timelock in Phase 2) may resume.
+    function setDistributionsPaused(bool paused_) external {
+        require(
+            paused_ ? (msg.sender == rescueSafe || msg.sender == owner()) : msg.sender == owner(), "Unauthorized"
+        );
+        distributionsPaused = paused_;
+        emit DistributionsPauseUpdated(paused_, msg.sender);
     }
 
     /// @notice Recover ERC-20 tokens held here in an emergency (other than USDC).
@@ -617,8 +631,8 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     /// @notice Pay bounty to keeper who processed a queued user deposit. Called by authorized Vault.
     /// @dev Appele en try/catch depuis le Vault => ne bloque jamais le traitement du depot.
     ///      Anti-drain: le Vault revert si la file est vide, donc paye uniquement sur depot reel.
-    function payDepositBounty(address keeper, uint256 depositValueUsd) external {
-        require(keeper != address(0), "Invalid keeper");
+    function payDepositBounty(address keeper, address depositor, uint256 depositValueUsd) external {
+        require(keeper != address(0) && depositor != address(0) && keeper != depositor, "Self bounty");
         require(authorizedVaults[msg.sender], "Not authorized");
         require(depositBountyEnabled, "Bounty disabled");
         require(depositBountyAmount > 0, "Bounty is zero");
@@ -866,6 +880,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
 
     /// @notice Distribute USDC to local staking contract (same chain). Callable by anyone.
     function distributeToStakers(uint256 amount) external nonReentrant {
+        require(!distributionsPaused, "Distributions paused");
         require(stakingRewardsAddress != address(0), "Staking not configured");
         _requireDistributableUsdc(amount);
         usdc.safeTransfer(stakingRewardsAddress, amount);

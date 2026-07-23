@@ -112,6 +112,7 @@ Both functions are `onlyOwner`.
 | `setMetricsBounty(enabled, amount)` | Configure the snapshot bounty | Active (Phase 1) |
 | `setHedgeBounty(enabled, amount)` | Configure the hedge bounty (DN) | Active (Phase 1) |
 | `setBridgeBounty(enabled, amount)` | Configure the bridge bounty | _Phase 2 — disabled by default_ |
+| `setDistributionsPaused(paused)` | Emergency-stop permissionless staking distributions/bridges; Rescue Safe may pause, owner resumes | Active |
 | `authorizeRangeManager(rm, authorized)` | Whitelist a RangeManager for `payKeeperBounty()` / `payMetricsBounty()` | Active (Phase 1) |
 | `authorizeVault(vault, authorized)` | Whitelist a Vault for `payDepositBounty()` | Active (Phase 1) |
 | `authorizeHedgeManager(hm, authorized)` | Whitelist an AaveHedgeManager for `payHedgeBounty()` | Active (Phase 1) |
@@ -133,6 +134,7 @@ Both functions are `onlyOwner`.
 | `depositBountyCooldown()` / `depositBountyKeeperCooldown()` / `depositBountyDailyCap()` | Deposit bounty anti-drain limits |
 | `metricsBountyEnabled()` / `metricsBountyAmount()` | Snapshot bounty config |
 | `hedgeBountyEnabled()` / `hedgeBountyAmount()` | Hedge bounty config (DN) |
+| `distributionsPaused()` | Whether permissionless staking distributions and bridges are stopped |
 | `usdc()` | Address of the USDC token (used to read the Treasury balance) |
 
 ---
@@ -147,6 +149,7 @@ Both functions are `onlyOwner`.
 | `DepositBountyPaid(keeper, amount)` | `payDepositBounty()` |
 | `DepositBountyConfigured(enabled, amount)` | `setDepositBounty()` |
 | `DepositBountyLimitsConfigured(vaultCooldown, keeperCooldown, dailyCap)` | `setDepositBountyLimits()` |
+| `DistributionsPauseUpdated(paused, caller)` | `setDistributionsPaused()` |
 | `VaultAuthorized(vault, authorized)` | `authorizeVault()` |
 | `MetricsBountyPaid(keeper, amount)` | `payMetricsBounty()` |
 | `MetricsBountyConfigured(enabled, amount)` | `setMetricsBounty()` |
