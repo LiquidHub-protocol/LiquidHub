@@ -225,6 +225,7 @@ async function main() {
       // only so one cycle can both snapshot and rebalance on a fresh price.
       if (!CHECK_ONLY) {
         let snapshotDue = false;
+        let snapshotStateChanged = false;
         try {
           snapshotDue = await rpcPool.executeWithRetry(async (p) => {
             return await rangeManager.connect(p).isSnapshotDue();
@@ -244,12 +245,40 @@ async function main() {
             }, 'recordPriceSnapshot');
             console.log(`  -> Snapshot recorded: ${rcpt.hash}`);
             await trackAction(actionAlerts, 'success', 'snapshot', `Snapshot recorded: ${rcpt.hash}`);
+            snapshotStateChanged = true;
           } else {
             await trackAction(actionAlerts, 'success', 'snapshot', 'Snapshot no longer due');
           }
         } catch (e) {
-          console.log(`  Snapshot: skipped (${(e.reason || e.message || '').slice(0, 80)})`);
-          await trackAction(actionAlerts, 'failure', 'snapshot', e.reason || e.message);
+          let stillDue = true;
+          try {
+            stillDue = await rpcPool.executeWithRetry(async (p) => {
+              return await rangeManager.connect(p).isSnapshotDue();
+            });
+          } catch {
+            // Preserve the original failure if the reconciliation read is also unavailable.
+          }
+          if (!stillDue) {
+            snapshotStateChanged = true;
+            console.log('  Snapshot: completed by another keeper during this attempt');
+            await trackAction(actionAlerts, 'success', 'snapshot', 'Snapshot completed by another keeper');
+          } else {
+            console.log(`  Snapshot: skipped (${(e.reason || e.message || '').slice(0, 80)})`);
+            await trackAction(actionAlerts, 'failure', 'snapshot', e.reason || e.message);
+          }
+        }
+
+        if (snapshotStateChanged) {
+          [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
+            async (p) => await rangeManager.connect(p).getBotInstructions()
+          );
+          if (hasPosition && !needsRebalance
+              && await isLivePositionOutOfRange(rangeManager, tokenId, rpcPool)) {
+            needsRebalance = true;
+            action = 'REBALANCE';
+            reason = 'Live pool tick is outside the current range after snapshot';
+          }
+          console.log(`  Instructions refreshed after snapshot: rebalance=${needsRebalance}, action=${action}`);
         }
       }
 

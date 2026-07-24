@@ -1,6 +1,8 @@
 node_modules/
 .env
 *.log
+.keeper-pending-tx-*.json
+.keeper-pending-tx-*.json.lock
 .DS_Store
 *.code-workspace
 .claude/

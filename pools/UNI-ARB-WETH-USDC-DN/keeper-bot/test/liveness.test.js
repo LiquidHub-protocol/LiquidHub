@@ -1,8 +1,10 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
+const fsSync = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { ethers } = require('ethers');
 
 const { Rebalancer, calculateChunkPlan, divideIntoChunks } = require('../src/rebalancer');
 const { PersistentActionAlerts } = require('../src/utils/action-alerts');
@@ -61,6 +63,40 @@ test('signed transaction failover prepares and signs once, then rebroadcasts the
   assert.deepEqual(broadcasts, ['0x1234', '0x1234']);
   assert.ok(timeoutLabels.some((label) => label.includes('broadcast')));
   assert.ok(timeoutLabels.some((label) => label.includes('receipt')));
+});
+
+test('signed transaction persistence is atomic and hash-bound across restarts', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-pending-tx-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const pool = Object.create(RPCPool.prototype);
+  pool.pendingTxFile = path.join(dir, 'pending.json');
+  const rawTx = '0x1234';
+  const txHash = ethers.keccak256(rawTx);
+
+  pool._persistSignedTx(rawTx, txHash, 'rebalance');
+  assert.deepEqual(pool._readPendingSignedTx(), {
+    schemaVersion: 1,
+    rawTx,
+    txHash,
+    label: 'rebalance',
+    createdAt: pool._readPendingSignedTx().createdAt,
+  });
+  assert.equal(fsSync.statSync(pool.pendingTxFile).mode & 0o777, 0o600);
+  pool._clearPersistedSignedTx(txHash);
+  assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
+});
+
+test('signer state lock rejects a second keeper process', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-signer-lock-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const first = Object.create(RPCPool.prototype);
+  first.pendingTxFile = path.join(dir, 'pending.json');
+  first._acquireProcessLock();
+
+  const second = Object.create(RPCPool.prototype);
+  second.pendingTxFile = first.pendingTxFile;
+  assert.throws(() => second._acquireProcessLock(), /already held/);
+  fsSync.unlinkSync(first.processLockFile);
 });
 
 test('chunk count and splitting stay in BigInt arithmetic', () => {
@@ -173,6 +209,28 @@ test('unrelated rebalance revert does not trigger an isolated price refresh', as
   const result = await rebalancer.executeRebalance(1n);
   assert.equal(result.success, false);
   assert.equal(refreshCount, 0);
+});
+
+test('deposit is deferred when the final on-chain instruction requires a rebalance', async () => {
+  let feeSyncCount = 0;
+  let signedTxCount = 0;
+  const rangeManager = {
+    connect: () => ({
+      getBotInstructions: async () => [true, 1n, true, 'REBALANCE', 'dynamic range changed'],
+    }),
+  };
+  const rpcPool = {
+    executeWithRetry: async (fn) => await fn({}),
+    executeSignedTxWithRetry: async () => { signedTxCount += 1; },
+  };
+  const rebalancer = new Rebalancer(rangeManager, {}, {}, {}, rpcPool);
+  rebalancer._syncFeesForActionPlan = async () => { feeSyncCount += 1; };
+
+  const result = await rebalancer.processDeposit();
+  assert.equal(result.success, false);
+  assert.equal(result.deferred, true);
+  assert.equal(feeSyncCount, 0);
+  assert.equal(signedTxCount, 0);
 });
 
 test('critical hedge fallback refreshes and recomputes a stale rebalance plan once', async () => {

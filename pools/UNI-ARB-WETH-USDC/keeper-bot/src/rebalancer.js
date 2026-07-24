@@ -97,6 +97,14 @@ class Rebalancer {
   async processDeposit() {
     console.log('\n=== Processing queued deposit (permissionless) ===');
     try {
+      const [, , needsRebalance, action, reason] = await this.rpcPool.executeWithRetry(async (provider) => {
+        return await this.rangeManager.connect(provider).getBotInstructions();
+      });
+      if (needsRebalance) {
+        console.log(`  Deposit deferred: ${action || 'REBALANCE'} is required first (${reason || 'on-chain signal'}).`);
+        return { success: false, deferred: true, error: 'rebalance required before deposit', txHashes: [] };
+      }
+
       await this._syncFeesForActionPlan('deposit');
       let plan;
       try {

@@ -403,14 +403,14 @@ contract AaveHedgeManager is ReentrancyGuard {
 
     /// @notice Supply an EXACT collateral amount and borrow WETH.
     /// @dev REFONTE DN : montant de collatéral EXPLICITE (plus "tout le solde") — sinon une réserve USDC
-    ///      préexistante sur le contrat serait fournie involontairement à AAVE (retour audit). onlySafeOrVault :
-    ///      le Vault l'appelle au dépôt permissionless hedgé. Flow : Vault envoie USDC ici -> supply EXACT ->
+    ///      préexistante sur le contrat serait fournie involontairement à AAVE (retour audit). Le Vault seul
+    ///      l'appelle au dépôt permissionless hedgé. Flow : Vault envoie USDC ici -> supply EXACT ->
     ///      borrow WETH -> WETH reste ici pour sweep (montant exact) vers la LP.
     /// @param collateralAmountUsdc Montant EXACT d'USDC à supply (doit être <= solde présent)
     /// @param borrowAmountWeth Montant de WETH à emprunter (wei)
     function supplyAndBorrow(uint256 collateralAmountUsdc, uint256 borrowAmountWeth)
         external
-        onlySafeOrVault
+        onlyVault
         whenNotPaused
         nonReentrant
     {

@@ -51,7 +51,7 @@ Community keepers are permissionless and may use any RPC provider they choose. L
 
 A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Configure backup RPCs for reliability.
 
-`CHECK_INTERVAL_MIN` defaults to `1` and must be greater than zero. Signed transactions are populated and signed once; RPC failover rebroadcasts only that exact raw transaction, sequentially, across the configured endpoints, without introducing another RPC tier. If the PauseController is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Snapshots, hedge maintenance and rebalances remain active.
+`CHECK_INTERVAL_MIN` defaults to `1` and must be greater than zero. Signed transactions are populated and signed once. The exact raw transaction is persisted before broadcast, and RPC failover or a later process restart only rebroadcasts that same payload until its receipt is resolved. `KEEPER_PENDING_TX_FILE` can override the default pool-specific state path. A process lock prevents two keeper instances from sharing the same signing state. If the PauseController is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Snapshots, hedge maintenance and rebalances remain active.
 
 ## Keeper Bounties
 
