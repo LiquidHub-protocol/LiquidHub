@@ -128,6 +128,36 @@ async function trackAction(alerts, method, ...args) {
   }
 }
 
+function persistedActionName(label) {
+  const value = String(label || '').toLowerCase();
+  if (value.includes('snapshot')) return 'snapshot';
+  if (value.includes('deposit')) return 'deposit';
+  if (value.includes('rebalance')) return 'rebalance';
+  if (value.includes('hedge')) return 'adjustHedge';
+  if (value.includes('syncfees')) return 'deposit';
+  return 'cycle';
+}
+
+async function reconcileSignerState(rpcPool, actionAlerts) {
+  const recovered = await rpcPool.reconcilePendingSignedTx();
+  if (!recovered) return;
+
+  const origin = recovered.poolName || 'unknown pool';
+  const action = persistedActionName(recovered.label);
+  console.log(
+    `  Shared signer recovery: ${recovered.status} ${recovered.label || 'transaction'} ` +
+    `from ${origin} (${recovered.txHash})`
+  );
+  if (origin !== rpcPool.poolName) return;
+  if (recovered.status === 'confirmed') {
+    await trackAction(actionAlerts, 'success', action, `Recovered transaction confirmed: ${recovered.txHash}`);
+  } else if (recovered.status === 'failed') {
+    await trackAction(actionAlerts, 'failure', action, `Recovered transaction failed: ${recovered.txHash}`);
+  }
+  // "replaced" means the nonce was mined by another transaction. The cycle now
+  // rereads every decision on-chain instead of attributing an unknown tx to this action.
+}
+
 async function executeHedgeIfReady({ hedgeManager, wallet, rpcPool, actionAlerts, label, beforeSend }) {
   try {
     await rpcPool.executeWithRetry(async (provider) => {
@@ -245,6 +275,7 @@ async function main() {
 
   while (true) {
     try {
+      await reconcileSignerState(rpcPool, actionAlerts);
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
 
       await logPriceCacheBeforeDecision(rangeManager, rpcPool);

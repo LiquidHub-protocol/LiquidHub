@@ -506,7 +506,13 @@ contract AaveHedgeManager is ReentrancyGuard {
         address currentRangeManager = rangeManager;
         if (
             addrs[0] == address(0) || addrs[2] == address(0) || addrs[3] == address(0)
-                || (currentRangeManager != address(0) && addrs[0] != currentRangeManager)
+                || (
+                    currentRangeManager != address(0)
+                        && (
+                            addrs[0] != currentRangeManager || addrs[2] != address(lpPositionManager)
+                                || addrs[3] != address(lpPool)
+                        )
+                )
         ) revert HedgeCheck(30);
         if (params[0] < 3 || params[0] > 50) revert HedgeCheck(31); // divisor: default 4 => width/4
         if (params[1] < 10 || params[1] > 500) revert HedgeCheck(32);

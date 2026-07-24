@@ -18,7 +18,19 @@ test('RPC timeout releases a silent provider call', async () => {
   );
 });
 
-test('signed transaction failover prepares and signs once, then rebroadcasts the same raw tx', async () => {
+function configureSignerState(pool, { dir, wallet, poolName = 'POOL' }) {
+  pool.stateDir = dir;
+  pool.configuredPendingTxFile = null;
+  pool.pendingTxFile = null;
+  pool.processLockFile = null;
+  pool.signerAddress = wallet.address.toLowerCase();
+  pool.chainId = '42161';
+  pool.poolName = poolName;
+}
+
+test('signed transaction failover prepares and signs once, then rebroadcasts the same raw tx', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-shared-signer-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const pool = Object.create(RPCPool.prototype);
   const broadcasts = [];
   const first = {
@@ -37,6 +49,8 @@ test('signed transaction failover prepares and signs once, then rebroadcasts the
   };
   pool.providers = [first, second].map((provider) => ({ provider, healthy: true, errorCount: 0 }));
   pool.currentIndex = 0;
+  const signingWallet = ethers.Wallet.createRandom();
+  configureSignerState(pool, { dir, wallet: signingWallet });
   const timeoutLabels = [];
   pool.withTimeout = async (fn, _timeoutMs, label) => {
     timeoutLabels.push(label);
@@ -47,8 +61,21 @@ test('signed transaction failover prepares and signs once, then rebroadcasts the
   let populateCount = 0;
   let signCount = 0;
   const wallet = {
-    populateTransaction: async (request) => { populateCount += 1; return request; },
-    signTransaction: async () => { signCount += 1; return '0x1234'; },
+    address: signingWallet.address,
+    populateTransaction: async (request) => {
+      populateCount += 1;
+      return {
+        ...request,
+        chainId: 42161,
+        nonce: 7,
+        gasLimit: 21_000n,
+        gasPrice: 1n,
+      };
+    },
+    signTransaction: async (request) => {
+      signCount += 1;
+      return await signingWallet.signTransaction(request);
+    },
   };
   const receipt = await pool.executeSignedTxWithRetry(async (provider) => {
     prepareCount += 1;
@@ -60,7 +87,8 @@ test('signed transaction failover prepares and signs once, then rebroadcasts the
   assert.equal(prepareCount, 1);
   assert.equal(populateCount, 1);
   assert.equal(signCount, 1);
-  assert.deepEqual(broadcasts, ['0x1234', '0x1234']);
+  assert.equal(broadcasts.length, 2);
+  assert.equal(broadcasts[0], broadcasts[1]);
   assert.ok(timeoutLabels.some((label) => label.includes('broadcast')));
   assert.ok(timeoutLabels.some((label) => label.includes('receipt')));
 });
@@ -70,15 +98,29 @@ test('signed transaction persistence is atomic and hash-bound across restarts', 
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const pool = Object.create(RPCPool.prototype);
   pool.pendingTxFile = path.join(dir, 'pending.json');
-  const rawTx = '0x1234';
+  pool.chainId = '42161';
+  pool.poolName = 'POOL';
+  const wallet = ethers.Wallet.createRandom();
+  pool.signerAddress = wallet.address.toLowerCase();
+  const rawTx = await wallet.signTransaction({
+    chainId: 42161,
+    nonce: 9,
+    gasLimit: 21_000n,
+    gasPrice: 1n,
+    to: '0x0000000000000000000000000000000000000001',
+  });
   const txHash = ethers.keccak256(rawTx);
 
-  pool._persistSignedTx(rawTx, txHash, 'rebalance');
+  pool._persistSignedTx(rawTx, txHash, 'rebalance', 9);
   assert.deepEqual(pool._readPendingSignedTx(), {
-    schemaVersion: 1,
+    schemaVersion: 2,
     rawTx,
     txHash,
     label: 'rebalance',
+    poolName: 'POOL',
+    signer: wallet.address.toLowerCase(),
+    chainId: '42161',
+    nonce: 9,
     createdAt: pool._readPendingSignedTx().createdAt,
   });
   assert.equal(fsSync.statSync(pool.pendingTxFile).mode & 0o777, 0o600);
@@ -86,17 +128,64 @@ test('signed transaction persistence is atomic and hash-bound across restarts', 
   assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
 });
 
-test('signer state lock rejects a second keeper process', async (t) => {
+test('same signer on two pools shares state and serializes signed actions', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-signer-lock-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const wallet = ethers.Wallet.createRandom();
   const first = Object.create(RPCPool.prototype);
-  first.pendingTxFile = path.join(dir, 'pending.json');
-  first._acquireProcessLock();
-
   const second = Object.create(RPCPool.prototype);
-  second.pendingTxFile = first.pendingTxFile;
-  assert.throws(() => second._acquireProcessLock(), /already held/);
-  fsSync.unlinkSync(first.processLockFile);
+  configureSignerState(first, { dir, wallet, poolName: 'STANDARD' });
+  configureSignerState(second, { dir, wallet, poolName: 'DN' });
+  const provider = {};
+  await first._ensureSignerState(provider);
+  await second._ensureSignerState(provider);
+  assert.equal(first.pendingTxFile, second.pendingTxFile);
+  assert.equal(first.processLockFile, second.processLockFile);
+
+  const order = [];
+  await Promise.all([
+    first._withSignerLock(provider, async () => {
+      order.push('first-start');
+      await new Promise(resolve => setTimeout(resolve, 30));
+      order.push('first-end');
+    }),
+    second._withSignerLock(provider, async () => {
+      order.push('second-start');
+      order.push('second-end');
+    }),
+  ]);
+  assert.deepEqual(order, ['first-start', 'first-end', 'second-start', 'second-end']);
+});
+
+test('persisted transaction is cleared when its nonce was mined by a replacement', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-replaced-nonce-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const wallet = ethers.Wallet.createRandom();
+  const pool = Object.create(RPCPool.prototype);
+  configureSignerState(pool, { dir, wallet });
+  const provider = {
+    getTransactionReceipt: async () => null,
+    getTransactionCount: async () => 12,
+  };
+  pool.providers = [{ provider, healthy: true, errorCount: 0 }];
+  pool.currentIndex = 0;
+  pool.withTimeout = async (fn) => await fn();
+  await pool._ensureSignerState(provider);
+
+  const rawTx = await wallet.signTransaction({
+    chainId: 42161,
+    nonce: 11,
+    gasLimit: 21_000n,
+    gasPrice: 1n,
+    to: '0x0000000000000000000000000000000000000001',
+  });
+  const txHash = ethers.keccak256(rawTx);
+  pool._persistSignedTx(rawTx, txHash, 'rebalance', 11);
+
+  const recovered = await pool.reconcilePendingSignedTx();
+  assert.equal(recovered.status, 'replaced');
+  assert.equal(recovered.label, 'rebalance');
+  assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
 });
 
 test('chunk count and splitting stay in BigInt arithmetic', () => {

@@ -74,7 +74,8 @@ Edit `.env` with the following variables:
 | `RPC_BACKUP_1` | No | Backup RPC endpoint |
 | `RPC_BACKUP_2` | No | Second backup RPC endpoint |
 | `KEEPER_PRIVATE_KEY` | Yes* | Private key for the keeper wallet (*not needed for check-only mode) |
-| `KEEPER_PENDING_TX_FILE` | No | Optional path for the persisted signed-transaction state. Defaults to a pool-specific hidden file in the keeper working directory. |
+| `KEEPER_STATE_DIR` | No | Shared local signer-state directory. Defaults to `~/.liquidhub-keeper-state`. |
+| `KEEPER_PENDING_TX_FILE` | No | Advanced override for the persisted signed-transaction file. Keep the same value for every local process that uses the same signer and network. |
 | `RANGEMANAGER_ADDRESS` | Yes | RangeManager contract address |
 | `VAULT_ADDRESS` | Yes | MultiUserVault contract address |
 | `TREASURY_ADDRESS` | No | Treasury address (from the Contracts page). Lets the bot read the Treasury USDC balance and warn when a bounty would be skipped. Falls back to `vault.treasuryAddress()` if blank. |
@@ -91,7 +92,7 @@ Community keepers are permissionless and may use any RPC provider they choose. L
 
 A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Configure `RPC_BACKUP_1` and `RPC_BACKUP_2` for reliability.
 
-Signed transactions are populated and signed once. The exact raw transaction is persisted before broadcast, and RPC failover or a later process restart only rebroadcasts that same payload until its receipt is resolved. A pool-specific process lock prevents two keeper instances from sharing the same signing state. Run one process per pending-transaction file and do not delete that file while a transaction is unresolved. If `PAUSE_CONTROLLER_ADDRESS` is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Snapshots and rebalances remain active.
+Signed transactions are populated and signed once. The exact raw transaction is persisted before broadcast, and RPC failover or a later process restart only rebroadcasts that same payload until its receipt is resolved. Local processes derive one shared lock and journal from `chainId + signer address`, so the same test key can safely run several pool keepers without nonce collisions. The lock is held only while a transaction is prepared, signed and reconciled; other pool loops remain active and wait their turn. A nonce mined by a replacement is detected, cleared and followed by a full on-chain decision refresh. Do not delete signer state while a transaction is unresolved. If `PAUSE_CONTROLLER_ADDRESS` is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Snapshots and rebalances remain active.
 
 ### 3. Run the bot
 

@@ -65,7 +65,7 @@ class PersistentActionAlerts {
 
     if (next.consecutiveFailures >= this.threshold && !next.alerted) {
       const sent = await this.sender(
-        `[${this.poolName}] Keeper ${action} failed for ${next.consecutiveFailures} consecutive cycles.\n` +
+        `[${this.poolName}] Keeper ${action} failed for ${next.consecutiveFailures} consecutive attempts.\n` +
         `Last error: ${next.lastError}`
       );
       if (sent) {
@@ -81,7 +81,7 @@ class PersistentActionAlerts {
 
     if (previous.alerted) {
       const sent = await this.sender(
-        `[${this.poolName}] Keeper ${action} recovered after ${previous.consecutiveFailures} failed cycles.\n${details}`
+        `[${this.poolName}] Keeper ${action} recovered after ${previous.consecutiveFailures} failed attempts.\n${details}`
       );
       if (!sent) return;
     }
