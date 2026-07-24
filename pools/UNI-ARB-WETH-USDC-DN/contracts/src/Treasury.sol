@@ -411,7 +411,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         nativeFee = fee.nativeFee;
     }
 
-    // --- Admin Functions (onlyOwner = Safe) ---
+    // --- Admin Functions (onlyOwner: Safe Phase 1 / Timelock Phase 2) ---
 
     function adminWithdraw(uint256 amount, address to) external onlyOwner {
         require(adminWithdrawEnabled, "Admin withdraw disabled");
@@ -759,7 +759,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         emit RangeManagerAuthorized(_rangeManager, _authorized);
     }
 
-    // --- Swap oracle floor config (onlyOwner = Safe) — audit V1 ---
+    // --- Swap oracle floor config (onlyOwner: Safe Phase 1 / Timelock Phase 2) ---
 
     /// @notice Déclare/maj le feed Chainlink (prix USD) d'un token swappable + le slippage et heartbeat tolérés.
     /// @dev Utiliser removeSwapFeed(token) pour retirer explicitement une configuration. Slippage borné [10..1000] bps.
@@ -851,7 +851,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         return cap > 0 && cap <= 1_000_000 * (10 ** uint256(usdcDecimals));
     }
 
-    // --- Bridge Configuration (onlyOwner = Safe) ---
+    // --- Bridge Configuration (onlyOwner: Safe Phase 1 / Timelock Phase 2) ---
 
     function setBridgeConfig(bool _enabled, uint32 _dstEid, address _destination) external onlyOwner {
         if (_enabled) {

@@ -1,18 +1,20 @@
 # Security Model
 
-## Gnosis Safe Multisig (2/3)
+## Governance and emergency authority
 
-The Gnosis Safe multisig is the root authority for all Liquid Hub contracts. It requires 2-of-3 signers for any transaction.
+In Phase 1, the Gnosis Safe multisig is the governance authority and requires 2-of-3 signers. In Phase 2,
+governance and ownership are transferred to the Governor-controlled Timelock. The Safe then remains only as
+the fast emergency guardian for the explicitly retained pause, recovery and rescue functions.
 
 **Capabilities:**
 
-- Controls all admin functions on all contracts
-- Owner of `Treasury` and `MultiUserVault`
-- Holds the "Authorized" role on `RangeManager`
-- Can configure ranges, slippage tolerances, and oracle addresses
-- Can enable/disable keeper bounty
-- Can set the monthly withdrawal cap on Treasury
-- Can permanently disable admin withdrawals (**irreversible**)
+- **Phase 1 Safe:** owns and configures the Vault, Treasury, SecureBotModule, PauseController and DN hedge
+  governance paths.
+- **Phase 2 Timelock:** owns governance settings such as ranges, slippage, oracle addresses, Treasury routes,
+  caps and keeper bounties.
+- **Phase 2 Safe:** can trigger only the emergency actions retained in each contract. It cannot change strategy
+  parameters or unpause governance-owned controls.
+- Treasury admin withdrawals are permanently disabled by the final Phase 2 lock (**irreversible**).
 
 ---
 
@@ -27,7 +29,7 @@ The `SecureBotModule` is a Gnosis Safe module that whitelists specific function 
 - Both pool variants use the atomic public `RangeManager.rebalance(...)` entrypoint. Legacy multi-transaction
   primitives are excluded from the module core-selector set and cannot be re-enabled through `allowFunction()`.
 - Refresh the price cache (`refreshPriceCache`, no address change) — oracle **addresses** themselves can only be
-  set by the Safe (`configurePriceFeeds` / `setOracleParams` are Safe-only, not in the module)
+  set through the Vault governance relay (Safe in Phase 1, Timelock in Phase 2; never the module)
 - Record price snapshots (dynamic-range ring buffer; bot fallback when no keeper acts)
 - Delta-Neutral routine hedge adjustment uses the public `adjustHedge()` path; broad AAVE sweep/repay/withdraw
   operations are not part of the public keeper/module allowlist.
@@ -133,14 +135,17 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 
 ## Emergency controls
 
-- **Targeted module pause**: `SecureBotModule.setPaused(true)` (Safe-only) stops bot-mediated inflow processing
-  and Treasury distribution, while preserving bot and keeper maintenance such as `rebalance()`,
-  `recordPriceSnapshot()`, `refreshPriceCache()` and `adjustHedge()` under their on-chain guards. If the bot key
-  itself is compromised, the Safe can separately revoke/disable the module.
+- **Targeted module pause**: `SecureBotModule.setPaused(true)` stops every privileged operation routed through
+  that module, including module-routed maintenance. It does not pause the public, permissionless maintenance
+  entrypoints (`rebalance()`, snapshots, deposit processing and, on DN pools, `adjustHedge()`), which remain
+  protected by their on-chain guards and callable by bot/keepers. In Phase 2 the Safe can pause immediately,
+  but only the Timelock owner can unpause. The Safe can also revoke/disable a compromised module.
 - **PauseController**: controls user flows. Inflow pause blocks new deposit processing; withdrawal pause also
-  blocks inflows. Position-maintenance actions remain available by design.
-- **Hedge pause** (DN): `AaveHedgeManager.setPaused(true)` (Safe-only) blocks new hedge openings
-  (`supplyAndBorrow`) but deliberately leaves risk-reduction and position-maintenance paths available.
+  blocks inflows. Position-maintenance actions remain available by design. In Phase 2 the Safe remains the
+  pause guardian, while manual unpause belongs to the Timelock governance.
+- **Hedge pause** (DN): `AaveHedgeManager.setPaused(true)` blocks new hedge openings (`supplyAndBorrow`) but
+  deliberately leaves risk-reduction and position-maintenance paths available. In Phase 2 the Safe can pause,
+  while only Timelock governance can unpause.
 - **ReentrancyGuard** on all state-changing entry points of the vault, RangeManager and hedge manager.
 
 ---
@@ -162,8 +167,8 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 
 | Function | Access | Description |
 |----------|--------|-------------|
-| `swapToUSDC()` | `onlyOwner` (Safe / governance owner) | Converts configured ERC-20 tokens to USDC; the fee tier is fixed on-chain by the pool batch |
-| `adminWithdraw()` | `onlyOwner` (Safe) | Monthly cap enforced |
+| `swapToUSDC()` | `onlyOwner` (Safe Phase 1 / Timelock Phase 2) | Converts configured ERC-20 tokens to USDC; the fee tier is fixed on-chain by the pool batch |
+| `adminWithdraw()` | `onlyOwner` (Safe Phase 1 / Timelock Phase 2) | Monthly cap enforced until the irreversible final Phase 2 lock disables it |
 | `payKeeperBounty()` | Authorized RangeManagers only | Called automatically after rebalance |
 | `disableAdminWithdraw()` | `onlyOwner` | **IRREVERSIBLE** |
 | `setBridgeConfig()` | `onlyOwner` | Configure cross-chain bridge |
@@ -176,7 +181,7 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 | `deposit()` / `withdraw()` | Public | Any user can deposit or withdraw |
 | `startRebalance()` / `endRebalance()` | `onlyBot` | Safe, module, or RangeManager |
 | `collectCommissions()` | `onlyBot` | Collect LP fees for Treasury |
-| `updateTreasuryAddress()` | `onlyOwner` (Safe) | Update the Treasury address |
+| `updateTreasuryAddress()` | `onlyOwner` (Safe Phase 1 / Timelock Phase 2) | Update the Treasury address |
 
 ---
 
@@ -189,4 +194,5 @@ The protocol is designed so that user funds are protected even if the keeper wal
 - **LP position NFTs are owned by the vault contract**, not by any individual.
 - **Withdrawals go directly to the user's wallet** — there is no intermediary step where funds can be redirected.
 - **No admin can redirect user withdrawals** — the withdrawal function sends tokens to `msg.sender`.
-- **The Safe multisig** provides an additional layer of protection: even admin operations require 2-of-3 signer approval.
+- **Governance changes** require 2-of-3 Safe approval in Phase 1 and Governor/Timelock execution in Phase 2;
+  the Safe then retains only the documented emergency guardian powers.
