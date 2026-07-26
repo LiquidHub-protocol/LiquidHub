@@ -16,7 +16,7 @@ The protocol is currently in **Phase 1 of its decentralization roadmap**. What t
 |--------|-------------------|-------------------|
 | Governance | Gnosis Safe multisig controls configuration | Timelock governance controls configuration; the Safe keeps only the separately documented emergency/recovery powers |
 | Admin withdrawals | Enabled, capped by a configurable monthly limit | `disableAdminWithdraw()` called irreversibly — Treasury locked against any admin withdrawal |
-| Keeper / deposit / metrics / hedge bounties | **Enabled** — configurable by the multisig | Permissionless, fully active |
+| Keeper / deposit / metrics / hedge bounties | **Enabled** — configured by the Safe | Permissionless triggers, configuration controlled by the Timelock |
 | Bridge to stakers | Mechanism deployed, **bounty disabled** (no staking contract yet) | `bridgeToStakers()` live, fees routed to the governed destination |
 
 We believe clarity on what is and isn't decentralized matters more than marketing claims. Every function described below already exists on-chain and is verified on the block explorer — the table above states what is *enabled* today versus what is planned.
@@ -63,7 +63,7 @@ USDC. There is no permissionless function that can choose when or how Treasury-h
 
 ## Keeper Bounties
 
-The Treasury rewards community keepers who execute the protocol's permissionless actions, with USDC paid directly from the Treasury to whoever sends the transaction. Four bounties are **active** today; the bridge bounty is reserved for Phase 2. Each is configurable by the multisig and is a **silent no-op** when disabled or when the Treasury balance is insufficient — it never blocks the underlying action.
+The Treasury rewards community keepers who execute the protocol's permissionless actions, with USDC paid directly from the Treasury to whoever sends the transaction. Four bounties are **active** today; the bridge bounty is reserved for Phase 2. Each is configured by the Safe in Phase 1 or Timelock governance in Phase 2 and is a **silent no-op** when disabled or when the Treasury balance is insufficient — it never blocks the underlying action.
 
 | Bounty | Triggered by | Configured via |
 |--------|--------------|----------------|
@@ -86,7 +86,7 @@ The payment uses a best-effort safety pattern: if a bounty cannot be paid (disab
 This guarantees:
 - **No revert** of the action if the bounty cannot be paid
 - **Predictable experience** for community keepers (bounty is best-effort, action is guaranteed)
-- **Multisig safety** — enabling or disabling a bounty during a configuration change cannot lock anything
+- **Governance safety** — enabling or disabling a bounty cannot lock the underlying permissionless action
 
 ---
 

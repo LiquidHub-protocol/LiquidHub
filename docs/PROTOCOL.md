@@ -37,7 +37,7 @@ The range is computed entirely by `RangeManager` — no off-chain bot or databas
 
 - `RangeManager` keeps a ring buffer of token0/token1 oracle-ratio snapshots. `recordPriceSnapshot()` is **permissionless** and stores `token0/USD ÷ token1/USD`, normalized to 8 decimals; this remains correct when token1 is not a stablecoin. The contract spaces snapshots regularly (`24h / maxSnapshotsPerDay`) and reverts if one is not yet due.
 - On each mint/rebalance, the contract takes the pure high/low amplitude over the last `volatMoyDay` days — `(highest − lowest) / current price`, the real dispersion of the window independent of the instantaneous price — (trimming the `volatTrimDay` most extreme days), scales it by a governance multiplier `RANGE_MULTIPLICATOR`, and produces a symmetric range rounded up to the nearest `RANGE_STEP_BPS`. The final half-range is bounded per side by `RANGE_MIN_BPS` and `RANGE_MAX_BPS` (for example `100` means at least -1%/+1%, not 1% total width). The freshly computed range is applied on every rebalance (the position is recreated regardless), so it always tracks current volatility while staying within governance bounds.
-- When `DYNAMIC_RANGE_ENABLED` is `false` (e.g. stablecoin pools), the range stays fixed at `RANGE_UP_BASE` / `RANGE_DOWN_BASE` (in basis points), configured by the multisig.
+- When `DYNAMIC_RANGE_ENABLED` is `false` (e.g. stablecoin pools), the range stays fixed at `RANGE_UP_BASE` / `RANGE_DOWN_BASE` (in basis points), configured by the Safe in Phase 1 or Timelock governance in Phase 2.
 
 ---
 
