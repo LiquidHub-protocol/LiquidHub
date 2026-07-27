@@ -103,8 +103,9 @@ contract SecureBotModule {
 
         // Autoriser les fonctions essentielles au deploiement
         // Fonctions RangeManager
-        // configurePriceFeeds (0x6509c2dd) RETIRÉ (audit V1) : repointage des oracles = gouvernance Safe
-        // uniquement (une clé bot compromise pourrait empoisonner les prix). Le bot rafraîchit le cache
+        // configurePriceFeeds (0x6509c2dd) RETIRÉ (audit V1) : repointage des oracles = gouvernance uniquement
+        // (Safe Phase 1 / Timelock Phase 2). Une clé bot compromise ne peut pas empoisonner les prix.
+        // Le bot rafraîchit le cache
         // via refreshPriceCache() ci-dessous, qui ne change aucune adresse.
         allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
         allowedFunctions[0x6ecfe0f8] = true; // recordPriceSnapshot() - snapshot de prix (fallback bot si aucun keeper)

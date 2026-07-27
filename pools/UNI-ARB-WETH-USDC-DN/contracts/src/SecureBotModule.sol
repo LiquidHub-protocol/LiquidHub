@@ -90,7 +90,8 @@ contract SecureBotModule {
         // par processDepositPermissionless(), qui ouvre/ajuste le hedge AAVE et applique le post-check dans le
         // meme chemin. L'ancien chemin multi-tx burn/swap/mint/add n'est donc pas whitelisté par défaut.
         // Fonctions RangeManager
-        // configurePriceFeeds (0x6509c2dd) RETIRÉ (audit V1) : repointage oracles = gouvernance Safe.
+        // configurePriceFeeds (0x6509c2dd) RETIRÉ (audit V1) : repointage oracles = gouvernance
+        // (Safe Phase 1 / Timelock Phase 2).
         // Le bot rafraîchit le cache via refreshPriceCache() (ne change aucune adresse).
         allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
         allowedFunctions[0x6ecfe0f8] = true; // recordPriceSnapshot() - snapshot de prix (fallback bot si aucun keeper)

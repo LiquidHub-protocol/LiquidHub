@@ -241,10 +241,11 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     // --- Public Functions ---
 
     /// @notice Swap an approved ERC-20 held by this Treasury to USDC through an owner-authorized route.
-    // SÉCURITÉ (audit V1) : restreint à onlyOwner (Safe). Avant, swapToUSDC était public : n'importe qui
+    // SÉCURITÉ (audit V1) : restreint à onlyOwner (Safe Phase 1 / Timelock Phase 2).
+    // Avant, swapToUSDC était public : n'importe qui
     // pouvait déclencher un swap des tokens de la Treasury avec un minAmountOut faible / une route
     // défavorable et sandwicher la conversion des fees. C'est une opération de gestion de trésorerie
-    // (rare, déclenchée via la Safe) — pas un point d'entrée permissionless.
+    // rare, déclenchée par l'owner de gouvernance, pas un point d'entrée permissionless.
     function swapToUSDC(address tokenIn, uint24 fee, uint256 amountIn, uint256 minAmountOut)
         external
         onlyOwner
