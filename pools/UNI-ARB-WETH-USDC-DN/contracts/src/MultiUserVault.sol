@@ -474,7 +474,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // DN pools: dépôts USDC uniquement (token0/WETH non accepté en dépôt direct)
         // AaveHedgeManager.paused bloque uniquement les NOUVELLES ouvertures AAVE. Refuser ici
         // evite d'empiler une entree FIFO inexecutable; settlement/withdraw/maintenance restent ouverts.
-        DnDepositLib.requireDepositOpen(hedgeManager, amount0);
+        RangeOperations.requireDepositOpen(hedgeManager, amount0);
         if (hasPendingDeposit[msg.sender]) revert E22();
 
         rangeManager.refreshPriceCache();

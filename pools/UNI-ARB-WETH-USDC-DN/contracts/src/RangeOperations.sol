@@ -15,6 +15,10 @@ interface IRangeVaultComm {
     function recordFeesCollected(uint256 fees0, uint256 fees1, uint256 commission0, uint256 commission1) external;
 }
 
+interface IHedgePauseRange {
+    function paused() external view returns (bool);
+}
+
 /**
  * @title RangeOperations
  * @notice Library externe pour les operations complexes du RangeManager
@@ -24,12 +28,20 @@ library RangeOperations {
 
     error PartialFill();
     error LiquidityCheck();
+    error E70();
+    error E_HEDGE_PAUSED();
 
     int24 private constant MIN_TICK = -887272;
     int24 private constant MAX_TICK = 887272;
 
     function mulDivUp(uint256 x, uint256 y, uint256 denominator) external pure returns (uint256) {
         return Math.mulDiv(x, y, denominator, Math.Rounding.Up);
+    }
+
+    /// @dev DN deposit entry guard. Error signatures remain identical to the Vault ABI.
+    function requireDepositOpen(address hedgeManager, uint256 amount0) external view {
+        if (amount0 > 0) revert E70();
+        if (hedgeManager != address(0) && IHedgePauseRange(hedgeManager).paused()) revert E_HEDGE_PAUSED();
     }
 
     // ===== STRUCTS (partages) =====

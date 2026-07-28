@@ -70,10 +70,6 @@ interface IVaultDep {
     function hedgeManager() external view returns (address);
 }
 
-interface IHedgePauseDep {
-    function paused() external view returns (bool);
-}
-
 interface IHedgeRepairContext {
     function pool() external view returns (address);
     function usdc() external view returns (address);
@@ -117,8 +113,6 @@ library DnDepositLib {
     using SafeERC20 for IERC20;
 
     error ProtectedVaultFunds();
-    error E70();
-    error E_HEDGE_PAUSED();
     error ExactTransferRequired();
     /// @dev Adresses regroupées (anti stack-too-deep).
 
@@ -127,15 +121,6 @@ library DnDepositLib {
         address rangeManager;
         address token0;
         address token1;
-    }
-
-    /// @dev Garde d'entree DN delestee du Vault pour sa marge EIP-170. Les selectors d'erreur restent
-    ///      identiques a ceux exposes par le Vault pour conserver le decodage off-chain.
-    function requireDepositOpen(address hedgeManager, uint256 amount0) external view {
-        if (amount0 > 0) revert E70();
-        // During local deployment the Vault is configured before the HedgeManager is bound. Keep
-        // token0 deposits forbidden in that short setup window, while allowing token1-only queue tests/setup.
-        if (hedgeManager != address(0) && IHedgePauseDep(hedgeManager).paused()) revert E_HEDGE_PAUSED();
     }
 
     function pullExact(address token, address from, uint256 amount) external {
@@ -172,30 +157,51 @@ library DnDepositLib {
     /// @notice Exact debt-token amount to repay through the existing flash-loan path when HF is below target.
     /// @dev Solves the repay-first equation while accounting for the collateral needed to buy back the flash
     ///      principal and premium. A small 10 bps HF buffer absorbs Aave/base-unit rounding.
-    function aaveHfRepairAmount() external view returns (uint256 amount) {
+    /// @dev Sizes the idle repayment first, then the residual flash repair against the conservative
+    ///      post-repay debt estimate. The caller executes both atomically and verifies the final HF.
+    function aaveHfRepairAmounts() external view returns (uint256 directAmount, uint256 flashAmount) {
         IHedgeRepairContext context = IHedgeRepairContext(address(this));
         address aavePool = context.pool();
         address debtToken = context.variableDebtWeth();
         uint16 targetHfBps = context.reserveHfTargetBps();
         uint16 swapSlippageBps = context.swapSlippageBps();
-        (uint256 collateralBase, uint256 debtBase,, uint256 liveThreshold,, uint256 hf) =
-            IAavePoolDep(aavePool).getUserAccountData(address(this));
-        if (debtBase == 0 || collateralBase == 0 || liveThreshold == 0) return 0;
         uint256 bufferedTarget = uint256(targetHfBps) + 10;
-        if (hf >= bufferedTarget * 1e14) return 0;
-
         uint256 premiumBps = IAavePoolDep(aavePool).FLASHLOAN_PREMIUM_TOTAL();
         uint256 costBps = 10000 + uint256(swapSlippageBps) + premiumBps + 5;
+        (uint256 collateralBase, uint256 debtBase,, uint256 liveThreshold,, uint256 hf) =
+            IAavePoolDep(aavePool).getUserAccountData(address(this));
+        if (debtBase == 0 || collateralBase == 0 || liveThreshold == 0 || hf >= bufferedTarget * 1e14) return (0, 0);
+
+        uint256 protectedCollateral = uint256(liveThreshold) * collateralBase;
+        uint256 required = bufferedTarget * debtBase;
+        if (required <= protectedCollateral) return (0, 0);
+
+        uint256 debtBalance = IERC20(debtToken).balanceOf(address(this));
+        uint256 directNeeded = Math.mulDiv(
+            debtBalance, required - protectedCollateral, bufferedTarget * debtBase, Math.Rounding.Up
+        );
+        uint256 roundingBuffer = debtBalance / debtBase + 1;
+        directNeeded =
+            debtBalance - directNeeded < roundingBuffer ? debtBalance : directNeeded + roundingBuffer;
+        uint256 idle = IERC20(context.weth()).balanceOf(address(this));
+        directAmount = idle < directNeeded ? idle : directNeeded;
+
+        uint256 remainingDebtBase = debtBase;
+        uint256 remainingDebtBalance = debtBalance;
+        if (directAmount > 0) {
+            uint256 repaidBase = Math.mulDiv(debtBase, directAmount, debtBalance);
+            remainingDebtBase -= repaidBase;
+            remainingDebtBalance -= directAmount;
+        }
+        required = bufferedTarget * remainingDebtBase;
+        if (required <= protectedCollateral || remainingDebtBase == 0) return (directAmount, 0);
+
         uint256 collateralCost = Math.mulDiv(uint256(liveThreshold), costBps, 10000, Math.Rounding.Up);
         if (bufferedTarget <= collateralCost) revert InvalidSwapPlan();
-        uint256 required = bufferedTarget * debtBase;
-        uint256 protectedCollateral = uint256(liveThreshold) * collateralBase;
-        if (required <= protectedCollateral) return 0;
         uint256 repayBase =
             Math.mulDiv(required - protectedCollateral, 1, bufferedTarget - collateralCost, Math.Rounding.Up);
-        uint256 debtBalance = IERC20(debtToken).balanceOf(address(this));
-        amount = Math.mulDiv(debtBalance, repayBase, debtBase, Math.Rounding.Up);
-        if (amount > debtBalance) amount = debtBalance;
+        flashAmount = Math.mulDiv(remainingDebtBalance, repayBase, remainingDebtBase, Math.Rounding.Up);
+        if (flashAmount > remainingDebtBalance) flashAmount = remainingDebtBalance;
     }
 
     function executeDepositSwaps(
@@ -825,36 +831,16 @@ library DnDepositLib {
         return _rangeHedgeThresholdBps(rangeManager, rangeDivisor, floorBps);
     }
 
-    /// @notice Calcule un seuil hedge dynamique depuis la largeur du range courant.
-    /// @dev threshold = max(floorBps, (rangeUpBps + rangeDownBps) / rangeDivisor).
-    ///      Exemple: divisor=4 => range ±2% (400 bps wide) => 100 bps ; range ±5% => 250 bps.
-    function dynamicHedgeThresholdBps(uint16 rangeUpBps, uint16 rangeDownBps, uint16 rangeDivisor, uint16 floorBps)
-        external
-        pure
-        returns (uint16)
-    {
-        return _dynamicHedgeThresholdBps(rangeUpBps, rangeDownBps, rangeDivisor, floorBps);
-    }
-
     function _rangeHedgeThresholdBps(address rangeManager, uint16 rangeDivisor, uint16 floorBps)
         private
         view
         returns (uint16)
     {
-        if (rangeManager == address(0)) return floorBps;
+        if (rangeManager == address(0) || rangeDivisor == 0) return floorBps;
         (bool ok, bytes memory data) = rangeManager.staticcall(abi.encodeWithSelector(IRmDep.config.selector));
         if (!ok || data.length < 320) return floorBps;
         (,,,,,,, uint16 rangeUpBps, uint16 rangeDownBps,) =
             abi.decode(data, (uint24, uint8, uint8, uint16, uint24, uint64, bool, uint16, uint16, uint32));
-        return _dynamicHedgeThresholdBps(rangeUpBps, rangeDownBps, rangeDivisor, floorBps);
-    }
-
-    function _dynamicHedgeThresholdBps(uint16 rangeUpBps, uint16 rangeDownBps, uint16 rangeDivisor, uint16 floorBps)
-        private
-        pure
-        returns (uint16)
-    {
-        if (rangeDivisor == 0) return floorBps;
         uint256 threshold = (uint256(rangeUpBps) + uint256(rangeDownBps)) / uint256(rangeDivisor);
         if (threshold < uint256(floorBps)) threshold = uint256(floorBps);
         if (threshold > type(uint16).max) threshold = type(uint16).max;

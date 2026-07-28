@@ -627,20 +627,24 @@ contract AaveHedgeManager is ReentrancyGuard {
     function adjustHedge() external nonReentrant {
         if (rangeManager == address(0) || adjustHedgeRangeDivisor == 0) revert HedgeCheck(40);
 
-        // HF repair is a safety action, not strategy churn: it must remain available even during cooldown.
+        // HF repair is a safety action, not strategy churn: consume idle token0 first so the
+        // effective short is preserved, then flash only the residual still required by Aave.
         uint256 debtBefore = variableDebtWeth.balanceOf(address(this));
-        uint256 hfRepair = DnDepositLib.aaveHfRepairAmount();
-        if (hfRepair > 0) {
-            _refreshRangePriceCache();
-            _flashLoanActive = true;
-            pool.flashLoanSimple(
-                address(this), address(weth), hfRepair, abi.encode(hfRepair, 0, false, address(0), 0), 0
-            );
-            _flashLoanActive = false;
+        (uint256 directRepair, uint256 flashRepair) = DnDepositLib.aaveHfRepairAmounts();
+        if (directRepair > 0 || flashRepair > 0) {
+            if (directRepair > 0) _doRepayDebt(directRepair);
+            if (flashRepair > 0) {
+                _refreshRangePriceCache();
+                _flashLoanActive = true;
+                pool.flashLoanSimple(
+                    address(this), address(weth), flashRepair, abi.encode(flashRepair, 0, false, address(0), 0), 0
+                );
+                _flashLoanActive = false;
+            }
             _requireHfMin();
-            lastHedgeAdjustAt = uint64(block.timestamp);
             // Le HF bas est un signal de securite AAVE independant des soldes idle/donnes: conserver
-            // l'incitation keeper sur ce chemin urgent, apres reparation et post-check HF.
+            // l'incitation keeper sur ce chemin urgent, apres reparation et post-check HF. Ne pas
+            // armer le cooldown: une correction delta peut suivre immediatement si elle reste necessaire.
             if (treasuryAddress != address(0)) {
                 try IHedgeTreasury(treasuryAddress).payHedgeBounty(msg.sender) {} catch {}
             }
