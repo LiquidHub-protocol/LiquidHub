@@ -231,6 +231,11 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         stargatePool = IStargate(_stargatePool);
     }
 
+    /// @dev Prevent a Safe/Timelock proposal from permanently orphaning protocol revenue.
+    function renounceOwnership() public pure override {
+        revert();
+    }
+
     receive() external payable {}
 
     modifier onlyRescueSafe() {

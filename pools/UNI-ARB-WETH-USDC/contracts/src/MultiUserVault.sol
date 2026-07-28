@@ -299,6 +299,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // audit V1 (M3-B-fix) : plus d'init time-weighted (modele accFeePerShare, accumulateurs a 0 par defaut).
     }
 
+    /// @dev Governance must always remain transferable to a valid Safe or Timelock.
+    function renounceOwnership() public pure override {
+        revert();
+    }
+
     // ===== FONCTIONS DE CONFIGURATION RANGEMANAGER =====
     // Ces fonctions permettent a la Safe (owner de MultiUserVault)
     // de configurer RangeManager dont MultiUserVault est l'owner
