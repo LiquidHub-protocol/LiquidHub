@@ -108,9 +108,9 @@ async function trackAction(alerts, method, ...args) {
 function persistedActionName(label) {
   const value = String(label || '').toLowerCase();
   if (value.includes('snapshot')) return 'snapshot';
-  if (value.includes('deposit')) return 'deposit';
   if (value.includes('rebalance')) return 'rebalance';
   if (value.includes('hedge')) return 'adjustHedge';
+  if (value.includes('deposit')) return 'deposit';
   if (value.includes('syncfees')) return 'deposit';
   return 'cycle';
 }
@@ -153,6 +153,7 @@ async function main() {
   }
 
   const rpcPool = new RPCPool();
+  await rpcPool.verifyProviderChains();
   const provider = rpcPool.getProvider();
   const { rangeManager, vault, pauseController } = createContracts(provider);
   await assertKeeperTopology(rpcPool, { rangeManager, vault });
@@ -381,9 +382,14 @@ async function main() {
         await checkBountyFunding('rebalance', keeperEnabled, keeperAmount, treasuryAddr, usdc, rpcPool);
         console.log('  -> Executing REBALANCE...');
         const result = await rebalancer.executeRebalance(tokenId);
-        if (result.success) {
+        if (result.noAction) {
+          console.log('  -> Rebalance completed elsewhere or no longer required\n');
+          await trackAction(actionAlerts, 'success', 'rebalance', 'Rebalance no longer required after simulation');
+        } else if (result.success) {
           console.log(`  -> Success (${result.txHashes.length} txs)\n`);
           await trackAction(actionAlerts, 'success', 'rebalance', `Rebalance executed: ${result.txHashes[0]}`);
+        } else if (result.deferred) {
+          console.log(`  -> Deferred: ${result.error}\n`);
         } else {
           console.error(`  -> Failed: ${result.error}\n`);
           await trackAction(actionAlerts, 'failure', 'rebalance', result.error);

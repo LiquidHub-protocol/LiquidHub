@@ -23,7 +23,9 @@ class RPCPool {
       url,
       provider: new ethers.JsonRpcProvider(url),
       healthy: true,
-      errorCount: 0
+      errorCount: 0,
+      chainVerified: false,
+      chainMismatch: false
     }));
     this.currentIndex = 0;
     this.poolName = String(process.env.POOL_NAME || path.basename(process.cwd()));
@@ -31,9 +33,10 @@ class RPCPool {
       ? new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY).address.toLowerCase()
       : null;
     const configuredChainId = process.env.CHAINID || process.env.CHAIN_ID;
-    this.chainId = configuredChainId && /^\d+$/.test(configuredChainId)
-      ? String(BigInt(configuredChainId))
-      : null;
+    if (!configuredChainId || !/^\d+$/.test(configuredChainId) || BigInt(configuredChainId) === 0n) {
+      throw new Error('CHAINID/CHAIN_ID must be a positive integer');
+    }
+    this.chainId = String(BigInt(configuredChainId));
     this.stateDir = process.env.KEEPER_STATE_DIR
       ? path.resolve(process.env.KEEPER_STATE_DIR)
       : path.join(os.homedir(), '.liquidhub-keeper-state');
@@ -48,14 +51,8 @@ class RPCPool {
     if (!this.signerAddress) {
       throw new Error('KEEPER_PRIVATE_KEY is required for signed keeper transactions');
     }
-    if (!this.chainId) {
-      const network = await this.withTimeout(
-        () => provider.getNetwork(),
-        RPC_READ_TIMEOUT_MS,
-        'keeper signer network'
-      );
-      this.chainId = String(network.chainId);
-    }
+    const providerEntry = this.providers.find(entry => entry.provider === provider);
+    if (!providerEntry?.chainVerified) await this._verifyProviderChain(providerEntry);
     if (!this.pendingTxFile) {
       const signerKey = `${this.chainId}-${this.signerAddress}`;
       this.pendingTxFile = this.configuredPendingTxFile ||
@@ -63,6 +60,48 @@ class RPCPool {
       this.processLockFile = path.join(this.stateDir, `signer-${signerKey}.lock`);
       fs.mkdirSync(path.dirname(this.pendingTxFile), { recursive: true, mode: 0o700 });
       fs.mkdirSync(path.dirname(this.processLockFile), { recursive: true, mode: 0o700 });
+    }
+  }
+
+  async _verifyProviderChain(entry) {
+    if (!entry) throw new Error('Keeper RPC entry missing');
+    const rawChainId = await this.withTimeout(
+      () => entry.provider.send('eth_chainId', []),
+      RPC_READ_TIMEOUT_MS,
+      'keeper RPC chain authentication'
+    );
+    const actual = String(BigInt(rawChainId));
+    if (actual !== this.chainId) {
+      entry.healthy = false;
+      entry.chainVerified = false;
+      entry.chainMismatch = true;
+      const error = new Error(`RPC chain mismatch: got ${actual}, expected ${this.chainId}`);
+      error.code = 'RPC_CHAIN_MISMATCH';
+      throw error;
+    }
+    entry.chainMismatch = false;
+    entry.chainVerified = true;
+    return actual;
+  }
+
+  async verifyProviderChains() {
+    let authenticated = 0;
+    for (const entry of this.providers) {
+      try {
+        await this._verifyProviderChain(entry);
+        entry.healthy = true;
+        authenticated++;
+      } catch (error) {
+        if (error.code === 'RPC_CHAIN_MISMATCH') {
+          console.error(`Keeper RPC excluded: ${error.message}`);
+          continue;
+        }
+        entry.healthy = false;
+        console.warn(`Keeper RPC unavailable at startup: ${error.message}`);
+      }
+    }
+    if (authenticated === 0) {
+      throw new Error(`No RPC authenticated on expected chain ${this.chainId}`);
     }
   }
 
@@ -213,9 +252,10 @@ class RPCPool {
       }
     }
     // Reset all and return first
-    this.providers.forEach(p => { p.healthy = true; p.errorCount = 0; });
+    this.providers.forEach(p => { p.healthy = !p.chainMismatch; p.errorCount = 0; });
     this.currentIndex = 0;
-    return this.providers[0].provider;
+    const fallback = this.providers.find(p => !p.chainMismatch);
+    return fallback?.provider || null;
   }
 
   markUnhealthy(provider, force = false) {
@@ -260,9 +300,7 @@ class RPCPool {
     const msg = `${error?.shortMessage || ''} ${error?.message || ''}`.toLowerCase();
     return msg.includes('already known') ||
       msg.includes('already imported') ||
-      msg.includes('known transaction') ||
-      msg.includes('nonce too low') ||
-      msg.includes('nonce has already been used');
+      msg.includes('known transaction');
   }
 
   async withTimeout(fn, timeoutMs, label = 'RPC request') {
@@ -289,9 +327,16 @@ class RPCPool {
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const provider = this.getProvider();
       try {
+        if (!provider) throw new Error('No keeper RPC available on the expected chain');
+        const entry = this.providers.find(candidate => candidate.provider === provider);
+        if (!entry?.chainVerified) await this._verifyProviderChain(entry);
         return await this.withTimeout(() => fn(provider), timeoutMs, `RPC attempt ${attempt}`);
       } catch (error) {
         lastError = error;
+        if (error.code === 'RPC_CHAIN_MISMATCH') {
+          console.error(`Keeper RPC excluded: ${error.message}`);
+          continue;
+        }
         if (!this.isProviderError(error)) throw error;
         this.markUnhealthy(provider, true);
         console.warn(`RPC attempt ${attempt}/${attempts} failed: ${error.message}`);

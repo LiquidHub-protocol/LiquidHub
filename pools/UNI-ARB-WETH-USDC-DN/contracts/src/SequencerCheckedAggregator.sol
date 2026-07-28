@@ -39,7 +39,7 @@ contract SequencerCheckedAggregator is AggregatorV3Interface {
     /// @param _gracePeriod Fenêtre de grâce en secondes (ex: 3600).
     constructor(address _underlyingFeed, address _sequencerUptimeFeed, uint256 _gracePeriod) {
         require(_underlyingFeed != address(0) && _sequencerUptimeFeed != address(0), "zero feed");
-        require(_gracePeriod > 0 && _gracePeriod <= 86400, "bad grace"); // borne 0<g<=24h
+        require(_gracePeriod >= 3600 && _gracePeriod <= 86400, "bad grace"); // 1h<=g<=24h
         AggregatorV3Interface feed = AggregatorV3Interface(_underlyingFeed);
         uint8 dec = feed.decimals();
         require(dec <= 18, "bad dec");

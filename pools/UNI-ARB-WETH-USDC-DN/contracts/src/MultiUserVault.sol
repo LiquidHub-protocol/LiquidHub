@@ -1443,12 +1443,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice Recupere les fonds d'un utilisateur depuis RangeManager ou le Vault
      * @notice Precision : Les tokens de pool ne peuvent etre recuperes que par le depositaire
      * @param userAddress L'adresse de l'utilisateur a recuperer
-     * @dev audit V1 (M3-B-fix5, retour Codex — Low gas) : ce chemin Safe-only ITERE sur la file des depots EN
-     *      ATTENTE (pendingDeposits, de _pendingHead a la fin). Cout O(taille file). En pratique la file est
-     *      drainee a chaque cycle bot (~10 min) donc elle reste petite ; mais si elle devait devenir tres
-     *      grande, DRAINER la file (processDepositPermissionless) AVANT d'appeler cette
-     *      fonction d'urgence. Non bloquant (pas le chemin normal), pas optimise on-chain pour ne pas alourdir
-     *      le bytecode du vault (contrainte EIP-170).
+     * @dev Le depot pending est retrouve par index 1-based puis retire par swap-and-pop. Le chemin reste O(1)
+     *      quelle que soit la longueur de la file et ne demande aucun drainage prealable.
      */
     function EmergencyRecoverUser(address userAddress) external onlyEmergencySafe nonReentrant {
         if (userAddress == address(0)) revert E43();

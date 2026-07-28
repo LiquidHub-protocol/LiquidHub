@@ -52,18 +52,36 @@ class Rebalancer {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
     try {
-      await this._syncFeesForActionPlan('rebalance');
-      let plan;
+      let plan = null;
       try {
         plan = await this._buildRebalancePlan(await this._readPriceCache());
         await this._simulateRebalance(plan);
       } catch (firstError) {
-        if (!this._shouldRefreshForPlanError(firstError)) throw firstError;
-        if (this._isFeePlanError(firstError)) await this._syncFeesForActionPlan('rebalance retry');
-        console.log(`  Rebalance plan rejected; refreshing once and recomputing: ${this._errorText(firstError)}`);
-        const refreshed = await this._refreshPriceCacheForAction('rebalance stale-plan retry');
-        plan = await this._buildRebalancePlan(refreshed);
-        await this._simulateRebalance(plan);
+        plan = null;
+        const controlResult = this._rebalanceControlResult(firstError);
+        if (controlResult) return controlResult;
+
+        let retryError = firstError;
+        if (this._isFeePlanError(firstError)) {
+          await this._syncFeesForActionPlan('rebalance retry');
+          try {
+            plan = await this._buildRebalancePlan(await this._readPriceCache());
+            await this._simulateRebalance(plan);
+          } catch (postFeeError) {
+            plan = null;
+            retryError = postFeeError;
+          }
+        }
+
+        if (!plan) {
+          const retryControl = this._rebalanceControlResult(retryError);
+          if (retryControl) return retryControl;
+          if (!this._shouldRefreshForPlanError(retryError)) throw retryError;
+          console.log(`  Rebalance plan rejected; refreshing once and recomputing: ${this._errorText(retryError)}`);
+          const refreshed = await this._refreshPriceCacheForAction('rebalance stale-plan retry');
+          plan = await this._buildRebalancePlan(refreshed);
+          await this._simulateRebalance(plan);
+        }
       }
 
       this._logPlan(plan);
@@ -263,8 +281,21 @@ class Rebalancer {
 
   _shouldRefreshForPlanError(error) {
     const text = this._errorText(error).toLowerCase();
-    return ['stale', 'cache', 'oracle', 'twap', 'price', 'minout', 'e38', 'e93', 'e94']
+    return ['stale', 'cache', 'oracle', 'twap', 'price', 'minout', 'e38', 'e90', 'e96', 'e93', 'e94']
       .some((marker) => text.includes(marker));
+  }
+
+  _rebalanceControlResult(error) {
+    const text = this._errorText(error);
+    if (/e90|e96/i.test(text)) {
+      console.log('  Rebalance no longer required after on-chain simulation; no transaction sent.');
+      return { success: true, noAction: true, txHashes: [] };
+    }
+    if (/e03/i.test(text)) {
+      console.log('  Rebalance cooldown is still active; retry deferred to the next keeper cycle.');
+      return { success: false, deferred: true, error: text, txHashes: [] };
+    }
+    return null;
   }
 
   _isFeePlanError(error) {

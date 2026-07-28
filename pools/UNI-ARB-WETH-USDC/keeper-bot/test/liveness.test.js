@@ -18,6 +18,59 @@ test('RPC timeout releases a silent provider call', async () => {
   );
 });
 
+test('RPC chain authentication rejects an endpoint from another network', async () => {
+  const pool = Object.create(RPCPool.prototype);
+  pool.chainId = '42161';
+  pool.withTimeout = async (fn) => await fn();
+  const entry = {
+    provider: { send: async () => '0x1' },
+    healthy: true,
+    chainVerified: false,
+    chainMismatch: false,
+  };
+
+  await assert.rejects(
+    pool._verifyProviderChain(entry),
+    (error) => error.code === 'RPC_CHAIN_MISMATCH'
+  );
+  assert.equal(entry.healthy, false);
+  assert.equal(entry.chainVerified, false);
+  assert.equal(entry.chainMismatch, true);
+});
+
+test('a wrong-chain endpoint is excluded while an authenticated fallback remains usable', async () => {
+  const pool = Object.create(RPCPool.prototype);
+  pool.chainId = '42161';
+  pool.withTimeout = async (fn) => await fn();
+  const wrong = {
+    provider: { send: async () => '0x1' },
+    healthy: true,
+    chainVerified: false,
+    chainMismatch: false,
+  };
+  const correct = {
+    provider: { send: async () => '0xa4b1' },
+    healthy: true,
+    chainVerified: false,
+    chainMismatch: false,
+  };
+  pool.providers = [wrong, correct];
+
+  await pool.verifyProviderChains();
+
+  assert.equal(wrong.healthy, false);
+  assert.equal(wrong.chainMismatch, true);
+  assert.equal(correct.chainVerified, true);
+  assert.equal(correct.healthy, true);
+});
+
+test('nonce conflicts are not treated as an already-known raw transaction', () => {
+  const pool = Object.create(RPCPool.prototype);
+  assert.equal(pool.isAlreadyKnownTx(new Error('already known')), true);
+  assert.equal(pool.isAlreadyKnownTx(new Error('nonce too low')), false);
+  assert.equal(pool.isAlreadyKnownTx(new Error('nonce has already been used')), false);
+});
+
 function configureSignerState(pool, { dir, wallet, poolName = 'POOL' }) {
   pool.stateDir = dir;
   pool.configuredPendingTxFile = null;
@@ -34,6 +87,7 @@ test('signed transaction failover prepares and signs once, then rebroadcasts the
   const pool = Object.create(RPCPool.prototype);
   const broadcasts = [];
   const first = {
+    send: async () => '0xa4b1',
     getTransactionReceipt: async () => null,
     broadcastTransaction: async (rawTx) => {
       broadcasts.push(rawTx);
@@ -43,6 +97,7 @@ test('signed transaction failover prepares and signs once, then rebroadcasts the
     },
   };
   const second = {
+    send: async () => '0xa4b1',
     getTransactionReceipt: async () => null,
     broadcastTransaction: async (rawTx) => { broadcasts.push(rawTx); },
     waitForTransaction: async (hash) => ({ status: 1, hash }),
@@ -136,7 +191,9 @@ test('same signer on two pools shares state and serializes signed actions', asyn
   const second = Object.create(RPCPool.prototype);
   configureSignerState(first, { dir, wallet, poolName: 'STANDARD' });
   configureSignerState(second, { dir, wallet, poolName: 'DN' });
-  const provider = {};
+  const provider = { send: async () => '0xa4b1' };
+  first.providers = [{ provider, healthy: true, chainVerified: false, chainMismatch: false }];
+  second.providers = [{ provider, healthy: true, chainVerified: false, chainMismatch: false }];
   await first._ensureSignerState(provider);
   await second._ensureSignerState(provider);
   assert.equal(first.pendingTxFile, second.pendingTxFile);
@@ -164,6 +221,7 @@ test('persisted transaction is cleared when its nonce was mined by a replacement
   const pool = Object.create(RPCPool.prototype);
   configureSignerState(pool, { dir, wallet });
   const provider = {
+    send: async () => '0xa4b1',
     getTransactionReceipt: async () => null,
     getTransactionCount: async () => 12,
   };
@@ -276,7 +334,6 @@ test('rebalance syncs fees before planning and refreshes only for a retryable re
   const result = await rebalancer.executeRebalance(1n);
   assert.equal(result.success, true);
   assert.deepEqual(events, [
-    'sync:rebalance',
     'build:1',
     'simulate:1',
     'refresh',
@@ -297,6 +354,23 @@ test('unrelated rebalance revert does not trigger an isolated price refresh', as
 
   const result = await rebalancer.executeRebalance(1n);
   assert.equal(result.success, false);
+  assert.equal(refreshCount, 0);
+});
+
+test('rebalance no longer needed does not sync fees, refresh, or send a tx', async () => {
+  const rebalancer = new Rebalancer({}, {}, {}, {});
+  let feeSyncCount = 0;
+  let refreshCount = 0;
+  rebalancer._readPriceCache = async () => ({ valid: true });
+  rebalancer._buildRebalancePlan = async () => ({ swapAmounts: [], minOuts: [] });
+  rebalancer._simulateRebalance = async () => { throw new Error('E90'); };
+  rebalancer._syncFeesForActionPlan = async () => { feeSyncCount += 1; };
+  rebalancer._refreshPriceCacheForAction = async () => { refreshCount += 1; };
+
+  const result = await rebalancer.executeRebalance(1n);
+  assert.equal(result.success, true);
+  assert.equal(result.noAction, true);
+  assert.equal(feeSyncCount, 0);
   assert.equal(refreshCount, 0);
 });
 

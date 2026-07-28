@@ -674,7 +674,9 @@ contract AaveHedgeManager is ReentrancyGuard {
         );
 
         // 2. Cible de SHORT (DN strict par defaut) : targetShort = hedgeTargetBps/10000 * token0InLP.
-        //    Si token0InLP tombe a zero, la cible est zero et adjustHedge() doit pouvoir repay l'over-hedge.
+        //    Hors range haut, token0InLP peut etre nul. Le repay courant est alors refuse : le rebalance
+        //    atomique doit conserver la dette existante et reconstruire la position centree. La reparation
+        //    urgente du HF reste disponible plus haut, independamment de cette garde.
         //    token0 peut etre WETH, WBTC ou tout autre volatil de la pool ; les decimales viennent de la config.
         uint256 targetShort = (token0InLP * uint256(hedgeTargetBps)) / 10000;
 
@@ -693,12 +695,9 @@ contract AaveHedgeManager is ReentrancyGuard {
         uint256 diff =
             borrowed ? uint256(int256(targetShort) - effectiveShort) : uint256(effectiveShort - int256(targetShort));
         uint16 minDriftBps = _dynamicHedgeBps(adjustHedgeRangeDivisor, 100);
-        if (targetShort == 0) {
-            if (diff <= donationDustToken0) revert HedgeCheck(44);
-        } else {
-            uint256 driftBps = (diff * 10000) / targetShort;
-            if (driftBps < uint256(minDriftBps)) revert HedgeCheck(44);
-        }
+        if (targetShort == 0) revert HedgeCheck(44);
+        uint256 driftBps = (diff * 10000) / targetShort;
+        if (driftBps < uint256(minDriftBps)) revert HedgeCheck(44);
         // La maintenance reste pilotee par effectiveShort, mais une donation/solde idle ne doit jamais
         // suffire a gagner un bounty. Celui-ci exige aussi un drift DETTE BRUTE vs cible LP.
         bool bountyEligible =
