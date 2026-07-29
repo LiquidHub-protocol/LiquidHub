@@ -64,6 +64,37 @@ test('a wrong-chain endpoint is excluded while an authenticated fallback remains
   assert.equal(correct.healthy, true);
 });
 
+test('signed nonce and broadcast paths never consult a rejected wrong-chain endpoint', async () => {
+  const pool = Object.create(RPCPool.prototype);
+  pool.chainId = '42161';
+  pool.signerAddress = '0x0000000000000000000000000000000000000011';
+  pool.withTimeout = async (fn) => await fn();
+  let wrongChainCalls = 0;
+  let correctBroadcasts = 0;
+  const wrong = {
+    getTransactionCount: async () => { wrongChainCalls += 1; return 999; },
+    getTransactionReceipt: async () => { wrongChainCalls += 1; return null; },
+    broadcastTransaction: async () => { wrongChainCalls += 1; },
+  };
+  const correct = {
+    getTransactionCount: async () => 7,
+    getTransactionReceipt: async () => null,
+    broadcastTransaction: async () => { correctBroadcasts += 1; },
+    waitForTransaction: async (hash) => ({ status: 1, hash }),
+  };
+  pool.providers = [
+    { provider: wrong, healthy: false, errorCount: 0, chainVerified: false, chainMismatch: true },
+    { provider: correct, healthy: true, errorCount: 0, chainVerified: true, chainMismatch: false },
+  ];
+
+  assert.equal(await pool._latestSignerNonce(), 7);
+  const receipt = await pool._broadcastSignedTransaction('0x1234', '0xabcd', 'rebalance', 0, 1);
+
+  assert.equal(receipt.status, 1);
+  assert.equal(correctBroadcasts, 1);
+  assert.equal(wrongChainCalls, 0);
+});
+
 test('nonce conflicts are not treated as an already-known raw transaction', () => {
   const pool = Object.create(RPCPool.prototype);
   assert.equal(pool.isAlreadyKnownTx(new Error('already known')), true);

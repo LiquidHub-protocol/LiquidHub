@@ -99,13 +99,13 @@ contract PauseController {
         emit WithdrawalsPaused(until);
     }
 
-    function unpauseInflows() external onlyGovernance {
+    function unpauseInflows() external onlyPauseGuardianOrGovernance {
         require(block.timestamp >= withdrawalsPausedUntil, "E_WITHDRAWALS");
         inflowsPausedUntil = 0;
         emit InflowsUnpaused();
     }
 
-    function unpauseWithdrawals() external onlyGovernance {
+    function unpauseWithdrawals() external onlyPauseGuardianOrGovernance {
         withdrawalsPausedUntil = 0;
         emit WithdrawalsUnpaused();
     }

@@ -105,6 +105,32 @@ class RPCPool {
     }
   }
 
+  async _authenticatedProviderEntries() {
+    const authenticated = [];
+    for (const entry of this.providers) {
+      if (entry.chainMismatch) continue;
+      if (!entry.chainVerified) {
+        try {
+          await this._verifyProviderChain(entry);
+          entry.healthy = true;
+        } catch (error) {
+          entry.healthy = false;
+          if (error.code === 'RPC_CHAIN_MISMATCH') {
+            console.error(`Keeper RPC excluded: ${error.message}`);
+          } else {
+            console.warn(`Keeper RPC unavailable during signed reconciliation: ${error.message}`);
+          }
+          continue;
+        }
+      }
+      if (entry.chainVerified && !entry.chainMismatch) authenticated.push(entry);
+    }
+    if (authenticated.length === 0) {
+      throw new Error(`No RPC authenticated on expected chain ${this.chainId}`);
+    }
+    return authenticated;
+  }
+
   _isLockOwnerAlive(lock) {
     if (!Number.isInteger(lock?.pid) || lock.pid <= 0) return false;
     try {
@@ -347,7 +373,8 @@ class RPCPool {
 
   async _latestSignerNonce() {
     let latestNonce = null;
-    for (const entry of this.providers) {
+    const entries = await this._authenticatedProviderEntries();
+    for (const entry of entries) {
       const nonce = await this.withTimeout(
         () => entry.provider.getTransactionCount(this.signerAddress, 'latest'),
         RPC_READ_TIMEOUT_MS,
@@ -369,7 +396,8 @@ class RPCPool {
       `for ${pending.poolName || 'unknown pool'}: ${pending.txHash}`
     );
 
-    for (const entry of this.providers) {
+    const entries = await this._authenticatedProviderEntries();
+    for (const entry of entries) {
       const receipt = await this.withTimeout(
         () => entry.provider.getTransactionReceipt(pending.txHash),
         RPC_READ_TIMEOUT_MS,
@@ -484,11 +512,17 @@ class RPCPool {
   }
 
   async _broadcastSignedTransaction(signedTx, txHash, label, startIndex, maxRetries) {
-    const attempts = Math.max(maxRetries, this.providers.length);
+    const entries = await this._authenticatedProviderEntries();
+    const preferredProvider = this.providers[startIndex]?.provider;
+    const authenticatedStartIndex = Math.max(
+      0,
+      entries.findIndex((entry) => entry.provider === preferredProvider)
+    );
+    const attempts = Math.max(maxRetries, entries.length);
     let lastError = null;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
-      const entry = this.providers[(startIndex + attempt - 1) % this.providers.length];
+      const entry = entries[(authenticatedStartIndex + attempt - 1) % entries.length];
       const provider = entry.provider;
       try {
         const existing = await this.withTimeout(
@@ -538,7 +572,7 @@ class RPCPool {
 
     // One final sequential reconciliation across the configured tier. No provider
     // outside this RPCPool is ever introduced by the signed transaction path.
-    for (const entry of this.providers) {
+    for (const entry of entries) {
       const receipt = await this.withTimeout(
         () => entry.provider.getTransactionReceipt(txHash), RPC_READ_TIMEOUT_MS, `${label} final receipt reconciliation`
       ).catch(() => null);

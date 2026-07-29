@@ -142,7 +142,8 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
   but only the Timelock owner can unpause. The Safe can also revoke/disable a compromised module.
 - **PauseController**: controls user flows. Inflow pause blocks new deposit processing; withdrawal pause also
   blocks inflows. Position-maintenance actions remain available by design. In Phase 2 the Safe remains the
-  pause guardian, while manual unpause belongs to the Timelock governance.
+  pause guardian and can both trigger and lift these bounded user-flow pauses; Timelock governance retains
+  parameter control and can also administer the controller.
 - **Hedge pause** (DN): `AaveHedgeManager.setPaused(true)` blocks new hedge openings (`supplyAndBorrow`) but
   deliberately leaves risk-reduction and position-maintenance paths available. In Phase 2 the Safe can pause,
   while only Timelock governance can unpause.
