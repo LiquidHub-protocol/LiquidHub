@@ -124,7 +124,7 @@ async function trackAction(alerts, method, ...args) {
   try {
     await alerts[method](...args);
   } catch (error) {
-    console.log(`  Keeper alert state error: ${(error.message || '').slice(0, 100)}`);
+    console.log(`  Keeper incident state error: ${(error.message || '').slice(0, 100)}`);
   }
 }
 
@@ -517,7 +517,7 @@ async function main() {
         if (!criticalFallbackAttempted || !criticalFallbackFailed) {
           await trackAction(actionAlerts, 'success', 'rebalance', 'Rebalance completed elsewhere or no longer required');
         } else {
-          console.log('  Critical hedge fallback remains failed; persistent alert state retained');
+          console.log('  Critical hedge fallback remains failed; persistent incident state retained');
         }
       } else if (CHECK_ONLY) {
         console.log('  -> Rebalance needed (check-only, skipping)\n');

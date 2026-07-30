@@ -101,7 +101,7 @@ async function trackAction(alerts, method, ...args) {
   try {
     await alerts[method](...args);
   } catch (error) {
-    console.log(`  Keeper alert state error: ${(error.message || '').slice(0, 100)}`);
+    console.log(`  Keeper incident state error: ${(error.message || '').slice(0, 100)}`);
   }
 }
 

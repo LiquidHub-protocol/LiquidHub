@@ -3,35 +3,14 @@ const path = require('path');
 
 const DEFAULT_THRESHOLD = 3;
 
-async function sendTelegram(message) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) {
-    console.log('  Telegram alert not sent: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not configured');
-    return false;
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: message }),
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`Telegram HTTP ${response.status}`);
-    return true;
-  } catch (error) {
-    console.log(`  Telegram alert failed: ${(error.message || '').slice(0, 120)}`);
-    return false;
-  } finally {
-    clearTimeout(timeout);
-  }
+// Community/test keepers are local-only observers. Telegram and AWS secrets belong exclusively to the protocol bot.
+async function reportLocally(message) {
+  console.log(`  Keeper incident: ${String(message).replace(/\s*\n\s*/g, ' | ')}`);
+  return true;
 }
 
 class PersistentActionAlerts {
-  constructor({ poolName, stateFile, threshold = DEFAULT_THRESHOLD, sender = sendTelegram }) {
+  constructor({ poolName, stateFile, threshold = DEFAULT_THRESHOLD, sender = reportLocally }) {
     this.poolName = poolName;
     this.stateFile = stateFile || path.join(__dirname, '..', '..', '.keeper-action-failures.json');
     this.threshold = threshold;
@@ -96,4 +75,4 @@ class PersistentActionAlerts {
   }
 }
 
-module.exports = { PersistentActionAlerts, sendTelegram };
+module.exports = { PersistentActionAlerts };

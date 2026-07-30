@@ -325,6 +325,22 @@ test('failure threshold and recovery survive a restart', async (t) => {
   assert.match(messages[1], /^\[POOL\] Keeper deposit recovered/);
 });
 
+function readJavaScriptTree(dir) {
+  return fsSync.readdirSync(dir, { withFileTypes: true }).map((entry) => {
+    const target = path.join(dir, entry.name);
+    if (entry.isDirectory()) return readJavaScriptTree(target);
+    return entry.name.endsWith('.js') ? fsSync.readFileSync(target, 'utf8') : '';
+  }).join('\n');
+}
+
+test('community keeper source has no protocol Telegram or AWS secret transport', () => {
+  const source = readJavaScriptTree(path.join(__dirname, '..', 'src'));
+  assert.doesNotMatch(
+    source,
+    /TELEGRAM_|api\.telegram\.org|sendTelegram|aws-sdk|SecretsManager|secrets-manager|AWS_SECRET/i
+  );
+});
+
 test('rebalance syncs fees before planning and refreshes only for a retryable rejection', async () => {
   const events = [];
   const wallet = { connect: () => wallet };
