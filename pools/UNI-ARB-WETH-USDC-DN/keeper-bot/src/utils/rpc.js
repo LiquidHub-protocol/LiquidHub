@@ -9,6 +9,48 @@ const RPC_TX_TIMEOUT_MS = 90_000;
 const SIGNER_LOCK_TIMEOUT_MS = 5 * 60_000;
 const SIGNER_LOCK_POLL_MS = 250;
 
+function redactRpcErrorDetails(value) {
+  return String(value ?? 'unknown error')
+    .replace(/\b(?:https?|wss?):\\\/\\\/[^\s"'`<>]+/gi, '[REDACTED_RPC_URL]')
+    .replace(/\b(?:https?|wss?):\/\/[^\s"'`<>]+/gi, '[REDACTED_RPC_URL]')
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 [REDACTED_CREDENTIAL]')
+    .replace(
+      /((?:authorization|proxy-authorization|x-api-key|api[-_]?key|access[-_]?token)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi,
+      '$1[REDACTED_CREDENTIAL]'
+    );
+}
+
+function safeErrorMessage(error) {
+  return redactRpcErrorDetails(error?.message ?? error);
+}
+
+function sanitizeRpcError(error) {
+  if (!error || typeof error !== 'object') return new Error(safeErrorMessage(error));
+  const seen = new WeakSet();
+  const scrub = (value, depth = 0) => {
+    if (!value || typeof value !== 'object' || seen.has(value) || depth > 4) return;
+    seen.add(value);
+    const keys = new Set([...Object.keys(value).slice(0, 100), 'message', 'stack', 'shortMessage']);
+    for (const key of keys) {
+      let current;
+      try { current = value[key]; } catch { continue; }
+      if (typeof current === 'string') {
+        try { value[key] = redactRpcErrorDetails(current); } catch {}
+      } else if (current && typeof current === 'object') {
+        scrub(current, depth + 1);
+      }
+    }
+  };
+  const cleanMessage = safeErrorMessage(error);
+  scrub(error);
+  if (error.message !== cleanMessage) {
+    const replacement = new Error(cleanMessage);
+    if (error.code !== undefined) replacement.code = error.code;
+    return replacement;
+  }
+  return error;
+}
+
 class RPCPool {
   constructor() {
     const urls = [
@@ -65,11 +107,16 @@ class RPCPool {
 
   async _verifyProviderChain(entry) {
     if (!entry) throw new Error('Keeper RPC entry missing');
-    const rawChainId = await this.withTimeout(
-      () => entry.provider.send('eth_chainId', []),
-      RPC_READ_TIMEOUT_MS,
-      'keeper RPC chain authentication'
-    );
+    let rawChainId;
+    try {
+      rawChainId = await this.withTimeout(
+        () => entry.provider.send('eth_chainId', []),
+        RPC_READ_TIMEOUT_MS,
+        'keeper RPC chain authentication'
+      );
+    } catch (error) {
+      throw sanitizeRpcError(error);
+    }
     const actual = String(BigInt(rawChainId));
     if (actual !== this.chainId) {
       entry.healthy = false;
@@ -93,11 +140,11 @@ class RPCPool {
         authenticated++;
       } catch (error) {
         if (error.code === 'RPC_CHAIN_MISMATCH') {
-          console.error(`Keeper RPC excluded: ${error.message}`);
+          console.error(`Keeper RPC excluded: ${safeErrorMessage(error)}`);
           continue;
         }
         entry.healthy = false;
-        console.warn(`Keeper RPC unavailable at startup: ${error.message}`);
+        console.warn(`Keeper RPC unavailable at startup: ${safeErrorMessage(error)}`);
       }
     }
     if (authenticated === 0) {
@@ -116,9 +163,9 @@ class RPCPool {
         } catch (error) {
           entry.healthy = false;
           if (error.code === 'RPC_CHAIN_MISMATCH') {
-            console.error(`Keeper RPC excluded: ${error.message}`);
+            console.error(`Keeper RPC excluded: ${safeErrorMessage(error)}`);
           } else {
-            console.warn(`Keeper RPC unavailable during signed reconciliation: ${error.message}`);
+            console.warn(`Keeper RPC unavailable during signed reconciliation: ${safeErrorMessage(error)}`);
           }
           continue;
         }
@@ -202,7 +249,7 @@ class RPCPool {
     try {
       parsed = JSON.parse(fs.readFileSync(this.pendingTxFile, 'utf8'));
     } catch (error) {
-      throw new Error(`Invalid persisted keeper transaction: ${error.message}`);
+      throw new Error(`Invalid persisted keeper transaction: ${safeErrorMessage(error)}`);
     }
     if (parsed?.schemaVersion === 1) {
       try {
@@ -216,7 +263,7 @@ class RPCPool {
           nonce: legacyTx.nonce,
         };
       } catch (error) {
-        throw new Error(`Invalid legacy persisted keeper transaction: ${error.message}`);
+        throw new Error(`Invalid legacy persisted keeper transaction: ${safeErrorMessage(error)}`);
       }
     }
     if (
@@ -360,15 +407,15 @@ class RPCPool {
       } catch (error) {
         lastError = error;
         if (error.code === 'RPC_CHAIN_MISMATCH') {
-          console.error(`Keeper RPC excluded: ${error.message}`);
+          console.error(`Keeper RPC excluded: ${safeErrorMessage(error)}`);
           continue;
         }
-        if (!this.isProviderError(error)) throw error;
+        if (!this.isProviderError(error)) throw sanitizeRpcError(error);
         this.markUnhealthy(provider, true);
-        console.warn(`RPC attempt ${attempt}/${attempts} failed: ${error.message}`);
+        console.warn(`RPC attempt ${attempt}/${attempts} failed: ${safeErrorMessage(error)}`);
       }
     }
-    throw lastError;
+    throw sanitizeRpcError(lastError);
   }
 
   async _latestSignerNonce() {
@@ -432,7 +479,7 @@ class RPCPool {
     } catch (error) {
       if (String(error.message || '').includes('failed on-chain')) {
         this._clearPersistedSignedTx(pending.txHash);
-        return { status: 'failed', receipt: null, error: error.message, ...pending };
+        return { status: 'failed', receipt: null, error: safeErrorMessage(error), ...pending };
       }
       const latestNonceAfter = await this._latestSignerNonce();
       if (latestNonceAfter !== null && latestNonceAfter > pending.nonce) {
@@ -441,7 +488,7 @@ class RPCPool {
       }
       error.pendingLabel = pending.label;
       error.pendingPoolName = pending.poolName;
-      throw error;
+      throw sanitizeRpcError(error);
     }
   }
 
@@ -466,7 +513,7 @@ class RPCPool {
         );
         error.code = 'KEEPER_STATE_REFRESH_REQUIRED';
         error.recoveredTransaction = recovered;
-        throw error;
+        throw sanitizeRpcError(error);
       }
 
       const preparedBundle = await this.executeWithRetry(async (currentProvider) => {
@@ -561,12 +608,13 @@ class RPCPool {
           return receipt;
         }
         if (!this.isProviderError(error) && !this.isAlreadyKnownTx(error)) {
-          error.message = `${error.message} (signed tx: ${txHash})`;
+          error = sanitizeRpcError(error);
+          error.message = `${safeErrorMessage(error)} (signed tx: ${txHash})`;
           throw error;
         }
         lastError = error;
         this.markUnhealthy(provider, true);
-        console.warn(`RPC signed tx attempt ${attempt}/${attempts} failed: ${error.message}`);
+        console.warn(`RPC signed tx attempt ${attempt}/${attempts} failed: ${safeErrorMessage(error)}`);
       }
     }
 
@@ -582,8 +630,8 @@ class RPCPool {
       }
     }
     const error = lastError || new Error(`${label} receipt unavailable`);
-    error.message = `${error.message} (signed tx: ${txHash})`;
-    throw error;
+    error.message = `${safeErrorMessage(error)} (signed tx: ${txHash})`;
+    throw sanitizeRpcError(error);
   }
 }
 
