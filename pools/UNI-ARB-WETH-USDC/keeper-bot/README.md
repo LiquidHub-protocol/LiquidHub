@@ -84,7 +84,8 @@ Edit `.env` with the following variables:
 | `TOKEN0_DECIMALS` | No | Token0 decimals (default: 18) |
 | `TOKEN1_DECIMALS` | No | Token1 decimals (default: 6) |
 | `CHECK_INTERVAL_MIN` | No | Check interval in minutes (default: 1; must be greater than 0) |
-| `INIT_MULTI_SWAP_TVL` | No | Max USD value per swap chunk (default: 10000) |
+
+The swap-chunk ceiling is not a keeper setting: the keeper reads `initMultiSwapTvl()` directly from the deployed RangeManager before building each atomic plan.
 
 ### RPC Trust Model
 

@@ -8,11 +8,11 @@ The DN keeper bot performs the same rebalancing, deposit-processing and on-chain
 
 At each polling cycle the bot:
 
-1. Records a price snapshot if `isSnapshotDue()` (metrics bounty) — done first so the rest reads a fresh price
-2. Processes a queued deposit if one is pending and a position NFT exists (deposit bounty)
-3. Adjusts the hedge if its drift exceeds the on-chain threshold (hedge bounty — see below)
-4. Rebalances if `needsRebalance` (keeper bounty)
-5. Displays the current AAVE V3 collateral / debt / health factor
+1. Reads the current RangeManager instructions, PauseController state and AAVE collateral/debt/health factor
+2. Simulates `adjustHedge()` first; if the contract accepts it, executes the hedge maintenance (hedge bounty), with the atomic rebalance as the bounded critical fallback
+3. Records a price snapshot when `isSnapshotDue()` (metrics bounty)
+4. Refreshes the instructions and processes one queued deposit when inflows are available and no rebalance is already due (deposit bounty)
+5. Executes the atomic `rebalance()` when the refreshed on-chain instructions require it (keeper bounty)
 
 All steps are independent. Note: processing a deposit **opens the AAVE hedge atomically** in the same transaction (`processDepositPermissionless` → `DnDepositLib.openDepositHedge` + a strict post-check) — the keeper does not touch AAVE directly, and the transaction reverts if the resulting hedge drifts beyond tolerance.
 
