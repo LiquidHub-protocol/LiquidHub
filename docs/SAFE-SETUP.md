@@ -143,5 +143,5 @@ MultiUserVault.executeRangeManagerGovernance(
 
 - **All steps require Safe multisig approval** (2-of-3 signers must sign each transaction).
 - Steps should be executed in order, as later steps may depend on earlier configuration.
-- For **Delta Neutral (DN) pools**, the normal initial hedge is opened atomically by `processDepositPermissionless()` through `DnDepositLib`. Direct `supplyAndBorrow()` remains a Safe-only recovery/setup primitive, not a keeper/module action.
+- For **Delta Neutral (DN) pools**, the initial hedge is opened atomically by `processDepositPermissionless()` through `DnDepositLib`. Direct `supplyAndBorrow()` is Vault-only and is intentionally absent from Safe and keeper command tooling.
 - After completing all steps, run the keeper in check-only mode (`npm run check`) to verify the configuration is correct before enabling automated rebalancing.

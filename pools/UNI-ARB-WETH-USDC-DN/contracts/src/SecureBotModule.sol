@@ -114,7 +114,7 @@ contract SecureBotModule {
         // are NOT whitelisted here — they can only be called directly from the Safe
 
         // Fonctions AaveHedgeManager (Delta Neutral AAVE V3)
-        // supplyAndBorrow(uint256,uint256) reste exposée sur le HedgeManager pour le Vault/Safe,
+        // supplyAndBorrow(uint256,uint256) reste exposée sur le HedgeManager pour le Vault,
         // mais n'est pas une action bot/keeper récurrente : DnDepositLib l'appelle depuis le Vault pendant les
         // dépôts DN atomiques. Elle n'est donc PAS whitelistée dans le module bot.
         // AUDIT H-02 : adjustHedge() permissionless — whitelisté pour que le bot puisse le déclencher en surge
