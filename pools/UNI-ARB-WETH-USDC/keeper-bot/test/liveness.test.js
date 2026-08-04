@@ -108,9 +108,65 @@ function configureSignerState(pool, { dir, wallet, poolName = 'POOL' }) {
   pool.pendingTxFile = null;
   pool.processLockFile = null;
   pool.signerAddress = wallet.address.toLowerCase();
+  pool.signerWallet = wallet;
+  pool.maxGasPriceWei = ethers.parseUnits('10', 'gwei');
   pool.chainId = '42161';
   pool.poolName = poolName;
 }
+
+test('nonce reconciliation requires agreement and ignores one high outlier', async () => {
+  const pool = Object.create(RPCPool.prototype);
+  pool.signerAddress = '0x0000000000000000000000000000000000000011';
+  pool.withTimeout = async (fn) => await fn();
+  pool._authenticatedProviderEntries = async () => [7, 7, 999].map((nonce) => ({
+    provider: { getTransactionCount: async () => nonce },
+  }));
+  assert.equal(await pool._latestSignerNonce(), 7);
+});
+
+test('keeper rejects RPC fee suggestions above its env-defined ceiling', () => {
+  const pool = Object.create(RPCPool.prototype);
+  pool.maxGasPriceWei = ethers.parseUnits('10', 'gwei');
+  assert.throws(
+    () => pool._assertFeeCap({ maxFeePerGas: ethers.parseUnits('11', 'gwei') }, 'rebalance'),
+    /above KEEPER_MAX_GAS_PRICE_GWEI/
+  );
+});
+
+test('pending transaction can be replaced with the same nonce and a bounded fee bump', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-fee-replacement-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const wallet = ethers.Wallet.createRandom();
+  const pool = Object.create(RPCPool.prototype);
+  configureSignerState(pool, { dir, wallet });
+  const provider = { send: async () => '0xa4b1', getFeeData: async () => ({ gasPrice: 2n }) };
+  pool.providers = [{ provider, healthy: true, chainVerified: true, chainMismatch: false }];
+  pool.withTimeout = async (fn) => await fn();
+  await pool._ensureSignerState(provider);
+
+  const rawTx = await wallet.signTransaction({
+    chainId: 42161,
+    nonce: 4,
+    gasLimit: 21_000n,
+    gasPrice: 1n,
+    to: '0x0000000000000000000000000000000000000001',
+  });
+  const txHash = ethers.keccak256(rawTx);
+  pool._persistSignedTx(rawTx, txHash, 'rebalance', 4);
+  let replacementRaw;
+  pool._broadcastSignedTransaction = async (raw) => {
+    replacementRaw = raw;
+    return { status: 1 };
+  };
+
+  const result = await pool._replacePendingSignedTx(pool._readPendingSignedTx(), 1);
+  const replacement = ethers.Transaction.from(replacementRaw);
+  assert.equal(result.status, 'confirmed');
+  assert.equal(replacement.nonce, 4);
+  assert.ok(replacement.gasPrice > 1n);
+  assert.ok(replacement.gasPrice <= pool.maxGasPriceWei);
+  assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
+});
 
 test('signed transaction failover prepares and signs once, then rebroadcasts the same raw tx', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-shared-signer-'));

@@ -9,6 +9,14 @@ const RPC_TX_TIMEOUT_MS = 90_000;
 const SIGNER_LOCK_TIMEOUT_MS = 5 * 60_000;
 const SIGNER_LOCK_POLL_MS = 250;
 
+function readPositiveGweiEnv(name) {
+  const raw = String(process.env[name] || '').trim();
+  if (!/^\d+(?:\.\d+)?$/.test(raw)) throw new Error(`${name} must be a positive gwei value`);
+  const value = ethers.parseUnits(raw, 'gwei');
+  if (value <= 0n) throw new Error(`${name} must be greater than zero`);
+  return value;
+}
+
 function redactRpcErrorDetails(value) {
   return String(value ?? 'unknown error')
     .replace(/\b(?:https?|wss?):\\\/\\\/[^\s"'`<>]+/gi, '[REDACTED_RPC_URL]')
@@ -78,9 +86,11 @@ class RPCPool {
     }));
     this.currentIndex = 0;
     this.poolName = String(process.env.POOL_NAME || path.basename(process.cwd()));
-    this.signerAddress = process.env.KEEPER_PRIVATE_KEY
-      ? new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY).address.toLowerCase()
+    this.signerWallet = process.env.KEEPER_PRIVATE_KEY
+      ? new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY)
       : null;
+    this.signerAddress = this.signerWallet?.address.toLowerCase() || null;
+    this.maxGasPriceWei = readPositiveGweiEnv('KEEPER_MAX_GAS_PRICE_GWEI');
     const configuredChainId = process.env.CHAINID || process.env.CHAIN_ID;
     if (!configuredChainId || !/^\d+$/.test(configuredChainId) || BigInt(configuredChainId) === 0n) {
       throw new Error('CHAINID/CHAIN_ID must be a positive integer');
@@ -459,19 +469,102 @@ class RPCPool {
   }
 
   async _latestSignerNonce() {
-    let latestNonce = null;
     const entries = await this._authenticatedProviderEntries();
+    const counts = new Map();
     for (const entry of entries) {
       const nonce = await this.withTimeout(
         () => entry.provider.getTransactionCount(this.signerAddress, 'latest'),
         RPC_READ_TIMEOUT_MS,
         'keeper signer nonce reconciliation'
       ).catch(() => null);
-      if (nonce !== null && (latestNonce === null || nonce > latestNonce)) {
-        latestNonce = nonce;
+      if (nonce !== null) counts.set(nonce, (counts.get(nonce) || 0) + 1);
+    }
+    const expectedProviders = Array.isArray(this.providers)
+      ? this.providers.filter((entry) => !entry.chainMismatch).length
+      : entries.length;
+    const quorum = expectedProviders === 1 ? 1 : 2;
+    const confirmed = [...counts.entries()]
+      .filter(([, count]) => count >= quorum)
+      .map(([nonce]) => nonce);
+    return confirmed.length > 0 ? Math.max(...confirmed) : null;
+  }
+
+  _assertFeeCap(transaction, label) {
+    if (!this.maxGasPriceWei) throw new Error('KEEPER_MAX_GAS_PRICE_GWEI is not configured');
+    for (const [field, value] of [
+      ['gasPrice', transaction.gasPrice],
+      ['maxFeePerGas', transaction.maxFeePerGas],
+      ['maxPriorityFeePerGas', transaction.maxPriorityFeePerGas],
+    ]) {
+      if (value !== null && value !== undefined && BigInt(value) > this.maxGasPriceWei) {
+        throw new Error(
+          `${label}: provider proposed ${field}=${ethers.formatUnits(value, 'gwei')} gwei, ` +
+          `above KEEPER_MAX_GAS_PRICE_GWEI=${ethers.formatUnits(this.maxGasPriceWei, 'gwei')}`
+        );
       }
     }
-    return latestNonce;
+  }
+
+  _isReplacementCandidate(error) {
+    const message = `${error?.shortMessage || ''} ${error?.message || ''}`.toLowerCase();
+    return message.includes('replacement transaction underpriced') ||
+      message.includes('transaction underpriced') ||
+      message.includes('fee too low') ||
+      message.includes('receipt pending after') ||
+      message.includes('receipt unavailable');
+  }
+
+  async _replacePendingSignedTx(pending, maxRetries) {
+    if (!this.signerWallet) throw new Error('KEEPER_PRIVATE_KEY is required to replace a pending transaction');
+    const previous = ethers.Transaction.from(pending.rawTx);
+    const entries = await this._authenticatedProviderEntries();
+    let feeData = null;
+    for (const entry of entries) {
+      feeData = await this.withTimeout(
+        () => entry.provider.getFeeData(), RPC_READ_TIMEOUT_MS, 'keeper replacement fee data'
+      ).catch(() => null);
+      if (feeData) break;
+    }
+    if (!feeData) throw new Error(`${pending.label}: no authenticated RPC returned replacement fee data`);
+
+    const bump = (value) => value > 0n ? (value * 1125n) / 1000n + 1n : 0n;
+    const request = {
+      type: previous.type,
+      chainId: previous.chainId,
+      nonce: previous.nonce,
+      gasLimit: previous.gasLimit,
+      to: previous.to,
+      value: previous.value,
+      data: previous.data,
+      accessList: previous.accessList,
+    };
+    if (previous.type === 2) {
+      request.maxPriorityFeePerGas = [
+        bump(previous.maxPriorityFeePerGas || 0n),
+        feeData.maxPriorityFeePerGas || 0n,
+      ].reduce((highest, value) => value > highest ? value : highest, 0n);
+      request.maxFeePerGas = [
+        bump(previous.maxFeePerGas || 0n),
+        feeData.maxFeePerGas || 0n,
+        request.maxPriorityFeePerGas,
+      ].reduce((highest, value) => value > highest ? value : highest, 0n);
+    } else {
+      request.gasPrice = [
+        bump(previous.gasPrice || 0n),
+        feeData.gasPrice || 0n,
+      ].reduce((highest, value) => value > highest ? value : highest, 0n);
+    }
+    this._assertFeeCap(request, `${pending.label} replacement`);
+
+    const replacementRaw = await this.signerWallet.signTransaction(request);
+    const replacementHash = ethers.keccak256(replacementRaw);
+    this._persistSignedTx(replacementRaw, replacementHash, pending.label, pending.nonce);
+    console.warn(`Replacing pending ${pending.label}: ${pending.txHash} -> ${replacementHash}`);
+    const receipt = await this._broadcastSignedTransaction(
+      replacementRaw, replacementHash, `${pending.label} replacement`, 0, maxRetries
+    );
+    this._clearPersistedSignedTx(replacementHash);
+    return { ...pending, status: 'confirmed', receipt, replacedTxHash: pending.txHash, txHash: replacementHash };
   }
 
   async _reconcilePendingSignedTxLocked(maxRetries = 3) {
@@ -526,6 +619,9 @@ class RPCPool {
         this._clearPersistedSignedTx(pending.txHash);
         return { status: 'replaced', receipt: null, ...pending };
       }
+      if (this._isReplacementCandidate(error)) {
+        return await this._replacePendingSignedTx(pending, maxRetries);
+      }
       error.pendingLabel = pending.label;
       error.pendingPoolName = pending.poolName;
       throw sanitizeRpcError(error);
@@ -562,6 +658,7 @@ class RPCPool {
           throw new Error(`${label}: prepareFn must return { wallet, request }`);
         }
         const populated = await prepared.wallet.populateTransaction(prepared.request);
+        this._assertFeeCap(populated, label);
         return { provider: currentProvider, prepared, populated };
       }, maxRetries, RPC_TX_TIMEOUT_MS);
       const { provider: preparationProvider, prepared, populated } = preparedBundle;

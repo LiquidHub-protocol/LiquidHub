@@ -131,7 +131,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     error E46();
     error E70(); // DN pools: token0 deposits not allowed, use token1 only
     error E72(); // processDepositPermissionless: oracle cache stale / invalid / swap pair-cap-floor
-    error E73(); // getCurrentPortfolioValue: lecture hedge AAVE en echec alors qu'un hedgeManager existe (fail-closed)
+    error E73(); // getCurrentPortfolioValue: source NAV indisponible (fail-closed)
     error E_SAME_BLOCK(); // withdraw in the same block as a deposit processing (anti flash-loan, V1+V3 audit)
     // REFONTE DN — dépôt permissionless hedgé
     // AUDIT (nettoyage code mort) : E_PRE_ADJUST_REQUIRED + E_INSUFFICIENT_COLLATERAL RETIRÉES du Vault
@@ -1087,17 +1087,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         return lpValue;
     }
 
-    /// @dev Valeur LP seule (tokens libres + position) en USD 8 dec. try/catch internes : si le RangeManager
-    ///      est injoignable ou le cache invalide, retourne 0 (jamais de revert ici — c'est la garde hedge
-    ///      au-dessus qui porte le fail-closed). Separe de getCurrentPortfolioValue pour que le revert E73
-    ///      (fail-closed hedge) ne soit pas capture par ces catch.
+    /// @dev Valeur LP seule (tokens libres + position) en USD 8 dec. Une lecture impossible doit bloquer
+    ///      tout calcul de shares : une NAV partielle sous-evaluerait le denominateur d'un nouveau depot.
     function _lpPortfolioValue() private view returns (uint256) {
         address module = botModule;
-        if (module == address(0)) return 0;
+        if (module == address(0)) revert E73();
         try IBotNav(module).getOracleLpValueUsd() returns (uint256 valueUsd) {
             return valueUsd;
         } catch {
-            return 0;
+            revert E73();
         }
     }
 
