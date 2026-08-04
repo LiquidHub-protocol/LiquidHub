@@ -32,6 +32,7 @@ Each cycle the keeper simulates `adjustHedge()` before sending. The contract its
 cp ../.env.example .env
 # Fill in your values
 npm install
+chmod 600 .env
 ```
 
 ## Environment Variables
@@ -51,7 +52,7 @@ Community keepers are permissionless and may use any RPC provider they choose. L
 
 A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Configure backup RPCs for reliability.
 
-`CHECK_INTERVAL_MIN` defaults to `1` and must be greater than zero. Signed transactions are populated and signed once. The exact raw transaction is persisted before broadcast, and RPC failover or a later process restart only rebroadcasts that same payload until its receipt is resolved. Local processes derive one shared lock and journal from `chainId + signer address`; using the same local test key for standard and DN keepers is supported without nonce collisions. `KEEPER_STATE_DIR` can relocate the shared directory, while `KEEPER_PENDING_TX_FILE` is an advanced override that must remain common to processes sharing a signer/network. If the PauseController is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Snapshots, hedge maintenance and rebalances remain active.
+`CHECK_INTERVAL_MIN` defaults to `1` and must be greater than zero. Signed transactions are populated and signed once. The exact raw transaction is persisted before broadcast, and RPC failover or a later process restart only rebroadcasts that same payload until its receipt is resolved. Pool and bridge processes derive one shared lock and journal from `chainId + signer address`; using the same local test key for standard, DN and bridge keepers is supported without nonce collisions when they share `KEEPER_STATE_DIR`. Public keepers with their own keys remain independent. `KEEPER_PENDING_TX_FILE` is accepted only as a deprecated one-time migration source; new journals always use the canonical filename. This community code never reads protocol Telegram or AWS Secrets Manager credentials. If the PauseController is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Snapshots, hedge maintenance and rebalances remain active.
 
 ## Keeper Bounties
 

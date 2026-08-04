@@ -214,6 +214,48 @@ test('signed transaction persistence is atomic and hash-bound across restarts', 
   assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
 });
 
+test('legacy custom pending journal migrates under the canonical signer lock', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-canonical-state-'));
+  const legacyDir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-legacy-state-'));
+  t.after(() => Promise.all([
+    fs.rm(dir, { recursive: true, force: true }),
+    fs.rm(legacyDir, { recursive: true, force: true }),
+  ]));
+  const wallet = ethers.Wallet.createRandom();
+  const pool = Object.create(RPCPool.prototype);
+  configureSignerState(pool, { dir, wallet });
+  pool.configuredPendingTxFile = path.join(legacyDir, 'custom-pending.json');
+  const provider = { send: async () => '0xa4b1' };
+  pool.providers = [{ provider, healthy: true, chainVerified: true, chainMismatch: false }];
+  await pool._ensureSignerState(provider);
+
+  const rawTx = await wallet.signTransaction({
+    chainId: 42161,
+    nonce: 10,
+    gasLimit: 21_000n,
+    gasPrice: 1n,
+    to: '0x0000000000000000000000000000000000000001',
+  });
+  const txHash = ethers.keccak256(rawTx);
+  fsSync.writeFileSync(pool.configuredPendingTxFile, `${JSON.stringify({
+    schemaVersion: 2,
+    rawTx,
+    txHash,
+    label: 'legacy pool action',
+    poolName: 'POOL',
+    signer: wallet.address.toLowerCase(),
+    chainId: '42161',
+    nonce: 10,
+    createdAt: new Date().toISOString(),
+  })}\n`, { mode: 0o600 });
+
+  const migrated = await pool._withSignerLock(provider, async () => pool._readPendingSignedTx());
+  assert.equal(migrated.txHash, txHash);
+  assert.equal(fsSync.existsSync(pool.configuredPendingTxFile), false);
+  assert.equal(fsSync.existsSync(pool.pendingTxFile), true);
+  assert.equal(fsSync.statSync(pool.pendingTxFile).mode & 0o777, 0o600);
+});
+
 test('same signer on two pools shares state and serializes signed actions', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-signer-lock-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));

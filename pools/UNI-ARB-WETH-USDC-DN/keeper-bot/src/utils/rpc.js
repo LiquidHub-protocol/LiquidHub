@@ -24,6 +24,13 @@ function safeErrorMessage(error) {
   return redactRpcErrorDetails(error?.message ?? error);
 }
 
+function resolveStatePath(configured, fallback) {
+  const value = String(configured || fallback);
+  if (value === '~') return os.homedir();
+  if (value.startsWith('~/')) return path.join(os.homedir(), value.slice(2));
+  return path.resolve(value);
+}
+
 function sanitizeRpcError(error) {
   if (!error || typeof error !== 'object') return new Error(safeErrorMessage(error));
   const seen = new WeakSet();
@@ -79,11 +86,14 @@ class RPCPool {
       throw new Error('CHAINID/CHAIN_ID must be a positive integer');
     }
     this.chainId = String(BigInt(configuredChainId));
-    this.stateDir = process.env.KEEPER_STATE_DIR
-      ? path.resolve(process.env.KEEPER_STATE_DIR)
-      : path.join(os.homedir(), '.liquidhub-keeper-state');
+    this.stateDir = resolveStatePath(
+      process.env.KEEPER_STATE_DIR,
+      path.join(os.homedir(), '.liquidhub-keeper-state')
+    );
+    // Legacy migration source only. New journals always use the canonical
+    // chain+signer filename so every keeper family coordinates the same nonce.
     this.configuredPendingTxFile = process.env.KEEPER_PENDING_TX_FILE
-      ? path.resolve(process.env.KEEPER_PENDING_TX_FILE)
+      ? resolveStatePath(process.env.KEEPER_PENDING_TX_FILE)
       : null;
     this.pendingTxFile = null;
     this.processLockFile = null;
@@ -97,12 +107,33 @@ class RPCPool {
     if (!providerEntry?.chainVerified) await this._verifyProviderChain(providerEntry);
     if (!this.pendingTxFile) {
       const signerKey = `${this.chainId}-${this.signerAddress}`;
-      this.pendingTxFile = this.configuredPendingTxFile ||
-        path.join(this.stateDir, `pending-${signerKey}.json`);
+      this.pendingTxFile = path.join(this.stateDir, `pending-${signerKey}.json`);
       this.processLockFile = path.join(this.stateDir, `signer-${signerKey}.lock`);
       fs.mkdirSync(path.dirname(this.pendingTxFile), { recursive: true, mode: 0o700 });
       fs.mkdirSync(path.dirname(this.processLockFile), { recursive: true, mode: 0o700 });
     }
+  }
+
+  _migrateLegacyPendingTx() {
+    const legacyFile = this.configuredPendingTxFile;
+    if (!legacyFile || legacyFile === this.pendingTxFile || !fs.existsSync(legacyFile)) return;
+    if (fs.existsSync(this.pendingTxFile)) {
+      throw new Error('Both canonical and legacy keeper transaction journals exist; reconcile them manually');
+    }
+    const stat = fs.statSync(legacyFile);
+    if (!stat.isFile()) throw new Error('Legacy keeper transaction journal is not a regular file');
+    try {
+      fs.renameSync(legacyFile, this.pendingTxFile);
+    } catch (error) {
+      if (error.code !== 'EXDEV') throw error;
+      try {
+        fs.copyFileSync(legacyFile, this.pendingTxFile, fs.constants.COPYFILE_EXCL);
+      } catch (copyError) {
+        throw new Error(`Unable to migrate legacy keeper transaction journal: ${safeErrorMessage(copyError)}`);
+      }
+      fs.unlinkSync(legacyFile);
+    }
+    fs.chmodSync(this.pendingTxFile, 0o600);
   }
 
   async _verifyProviderChain(entry) {
@@ -204,6 +235,7 @@ class RPCPool {
         })}\n`);
         fs.closeSync(fd);
         try {
+          this._migrateLegacyPendingTx();
           return await fn();
         } finally {
           try {
@@ -251,16 +283,21 @@ class RPCPool {
     } catch (error) {
       throw new Error(`Invalid persisted keeper transaction: ${safeErrorMessage(error)}`);
     }
+    let rawTransaction;
+    try {
+      rawTransaction = ethers.Transaction.from(parsed?.rawTx);
+    } catch (error) {
+      throw new Error(`Invalid persisted keeper raw transaction: ${safeErrorMessage(error)}`);
+    }
     if (parsed?.schemaVersion === 1) {
       try {
-        const legacyTx = ethers.Transaction.from(parsed.rawTx);
         parsed = {
           ...parsed,
           schemaVersion: 2,
           poolName: parsed.poolName || 'legacy keeper',
-          signer: legacyTx.from?.toLowerCase(),
-          chainId: String(legacyTx.chainId),
-          nonce: legacyTx.nonce,
+          signer: rawTransaction.from?.toLowerCase(),
+          chainId: String(rawTransaction.chainId),
+          nonce: rawTransaction.nonce,
         };
       } catch (error) {
         throw new Error(`Invalid legacy persisted keeper transaction: ${safeErrorMessage(error)}`);
@@ -274,6 +311,9 @@ class RPCPool {
       parsed.nonce < 0 ||
       String(parsed.chainId) !== String(this.chainId) ||
       String(parsed.signer).toLowerCase() !== this.signerAddress ||
+      String(rawTransaction.chainId) !== String(this.chainId) ||
+      rawTransaction.from?.toLowerCase() !== this.signerAddress ||
+      rawTransaction.nonce !== parsed.nonce ||
       ethers.keccak256(parsed.rawTx).toLowerCase() !== parsed.txHash.toLowerCase()
     ) {
       throw new Error('Persisted keeper transaction identity/hash/raw payload mismatch');
