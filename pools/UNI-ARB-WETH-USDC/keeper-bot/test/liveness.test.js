@@ -404,6 +404,12 @@ test('unrelated rebalance revert does not trigger an isolated price refresh', as
   assert.equal(refreshCount, 0);
 });
 
+test('router fill errors trigger one action-coupled refresh and plan recompute', () => {
+  const rebalancer = new Rebalancer({}, {}, {}, {});
+  assert.equal(rebalancer._shouldRefreshForPlanError(new Error('Too little received')), true);
+  assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: PartialFill()')), true);
+});
+
 test('rebalance no longer needed does not sync fees, refresh, or send a tx', async () => {
   const rebalancer = new Rebalancer({}, {}, {}, {});
   let feeSyncCount = 0;

@@ -471,3 +471,9 @@ test('DN deposit plan errors E72 and E73 trigger refresh and recompute', () => {
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: E72')), true);
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: E73')), true);
 });
+
+test('router fill errors trigger one action-coupled refresh and plan recompute', () => {
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
+  assert.equal(rebalancer._shouldRefreshForPlanError(new Error('Too little received')), true);
+  assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: PartialFill()')), true);
+});
