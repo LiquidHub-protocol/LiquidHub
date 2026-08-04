@@ -1055,6 +1055,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // audit V1 (M3-B-fix, retour Codex) — le bloc hedge est SORTI des try/catch internes : un revert ici
         // (FAIL-CLOSED) ne doit PAS etre avale par un catch englobant et rendre une valeur LP-seule fausse.
         if (hedgeManager != address(0)) {
+            // Les soldes idle du HedgeManager font partie des actifs du Vault. Ils doivent etre ajoutes AVANT
+            // la dette AAVE : saturer LP - deficit a zero plus tot sous-estimerait la NAV alors que ces actifs
+            // peuvent encore couvrir une partie du deficit. Les controles HF restent appliques aux actions DN.
+            try DnDepositLib.idleHedgeValueUsd(hedgeManager, address(rangeManager)) returns (uint256 idleUsd) {
+                lpValue += idleUsd;
+            } catch {
+                revert E73();
+            }
+
             try IAaveHedgeSettlement(hedgeManager).getHedgeData() returns (
                 uint256 totalCollateralBase, uint256 totalDebtBase, uint256, uint256
             ) {
@@ -1071,12 +1080,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 // FAIL-CLOSED : hedgeManager present mais getHedgeData() en echec -> on ne peut pas evaluer
                 // correctement. Retourner la valeur LP seule SOUS-ESTIMERAIT le denominateur du mint de shares
                 // (hedge net positif ignore). On revert ; mint/withdraw retenteront quand AAVE repondra.
-                revert E73();
-            }
-
-            try DnDepositLib.idleHedgeValueUsd(hedgeManager, address(rangeManager)) returns (uint256 idleUsd) {
-                lpValue += idleUsd;
-            } catch {
                 revert E73();
             }
         }
