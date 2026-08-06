@@ -654,22 +654,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (!hasPosition) {
             require(msg.sender == botModule || msg.sender == owner(), "E71");
         }
-        // 3. Refresh oracle atomique. audit V1 (V3-R4 Point 3, retour Codex) : on REFRESH d'abord le cache
-        // (slot0+oracle LIVE) de façon INCONDITIONNELLE — avant ne se faisait que via recordPriceSnapshot()
-        // qui revert si le snapshot n'est pas dû (catché), laissant le check depositMaxCacheAge buter sur un
-        // cache ancien et BLOQUER le chemin permissionless. refreshPriceCache() ne dépend pas du timing snapshot.
-        rangeManager.refreshPriceCache();
-        // AUDIT MED-2 : on NE rappelle PLUS recordPriceSnapshot() ici. Son bounty metrics irait à msg.sender =
-        // le VAULT (pas au keeper déclencheur) → fuite/incohérence. La fraîcheur est déjà assurée par
-        // refreshPriceCache() ; le ring-buffer est entretenu par la cadence keeper/bot dédiée.
-        (uint128 price0, uint128 price1,,, uint64 ts, bool valid) = rangeManager.priceCache();
-        require(valid && price0 > 0 && price1 > 0, "E38");
-        require(block.timestamp - uint256(ts) <= depositMaxCacheAge, "stale");
+        // _processOneDeposit() refresh le cache juste avant le calcul NAV et le transfert. Il n'y a donc
+        // aucun refresh isole ou duplique dans ce chemin atomique.
         if (hasPosition) rangeManager.collectFeesForVault();
-        PendingDeposit memory pdPlan = pendingDeposits[_pendingHead];
-        rangeManager.validateDepositSwapPlan(
-            pdPlan.amount0, pdPlan.amount1, swapAmountsIn, minAmountsOut, tokenIn, tokenOut
-        );
         // 4. VERROU (un withdraw concurrent revert E32 ; pose pendant toute la modification de position)
         _processingRebalance = true;
         _rebalanceStartedAt = uint64(block.timestamp);
@@ -677,6 +664,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // 5. Transfert des fonds au RangeManager. Shares finalisees APRES swaps/addLiquidity (H-01).
         (PendingDeposit memory pd, uint256 depositValue, uint256 valueBefore, uint256 sharesBefore) =
             _processOneDeposit();
+        rangeManager.validateDepositSwapPlan(pd.amount0, pd.amount1, swapAmountsIn, minAmountsOut, tokenIn, tokenOut);
 
         // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk
         uint256 n = swapAmountsIn.length;
@@ -685,6 +673,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             for (uint256 i = 0; i < n; i++) {
                 uint256 amountOut = rangeManager.executeSwap(tokenIn, tokenOut, swapAmountsIn[i], minAmountsOut[i]);
                 totalSwapLossUsd += _swapLossUsd(tokenIn == address(token0), swapAmountsIn[i], amountOut);
+            }
+            if (hasPosition) {
+                (uint256 fees0, uint256 fees1) = rangeManager.collectFeesForVault();
+                valueBefore += (_calculateDepositValue(fees0, fees1) * (10000 - commissionRate)) / 10000;
             }
         }
 
@@ -1296,10 +1288,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function setMaxDepositUsd(uint256 _newMaximum) external onlyOwner {
-        require(
-            _newMaximum >= minDepositUSD && _newMaximum <= rangeManager.initMultiSwapTvl() * 1e9,
-            "E18"
-        );
+        require(_newMaximum >= minDepositUSD && _newMaximum <= rangeManager.initMultiSwapTvl() * 1e9, "E18");
         uint256 oldMaximum = maxDepositUsd;
         maxDepositUsd = _newMaximum;
         emit MaxDepositUpdated(oldMaximum, _newMaximum);

@@ -742,9 +742,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
 
         // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk
-        DnDepositLib.executeDepositSwaps(
+        valueBefore += DnDepositLib.executeDepositSwaps(
             address(rangeManager),
-            address(token0),
             swapAmountsIn,
             minAmountsOut,
             tokenIn,
@@ -752,7 +751,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             price0,
             price1,
             cfg.token0Decimals,
-            cfg.token1Decimals
+            cfg.token1Decimals,
+            commissionRate
         );
 
         // 7. Ajouter a la position existante, ou minter la position initiale après hedge + swaps.

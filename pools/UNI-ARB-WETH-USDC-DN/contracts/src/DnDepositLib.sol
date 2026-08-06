@@ -64,6 +64,7 @@ interface IRmDep {
     function executeSwap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut)
         external
         returns (uint256 amountOut);
+    function collectFeesForVault() external returns (uint256 fees0, uint256 fees1);
 }
 
 interface IVaultDep {
@@ -177,12 +178,10 @@ library DnDepositLib {
         if (required <= protectedCollateral) return (0, 0);
 
         uint256 debtBalance = IERC20(debtToken).balanceOf(address(this));
-        uint256 directNeeded = Math.mulDiv(
-            debtBalance, required - protectedCollateral, bufferedTarget * debtBase, Math.Rounding.Up
-        );
+        uint256 directNeeded =
+            Math.mulDiv(debtBalance, required - protectedCollateral, bufferedTarget * debtBase, Math.Rounding.Up);
         uint256 roundingBuffer = debtBalance / debtBase + 1;
-        directNeeded =
-            debtBalance - directNeeded < roundingBuffer ? debtBalance : directNeeded + roundingBuffer;
+        directNeeded = debtBalance - directNeeded < roundingBuffer ? debtBalance : directNeeded + roundingBuffer;
         uint256 idle = IERC20(context.weth()).balanceOf(address(this));
         directAmount = idle < directNeeded ? idle : directNeeded;
 
@@ -206,7 +205,6 @@ library DnDepositLib {
 
     function executeDepositSwaps(
         address rangeManager,
-        address token0,
         uint256[] calldata amountsIn,
         uint256[] calldata minAmountsOut,
         address tokenIn,
@@ -214,15 +212,17 @@ library DnDepositLib {
         uint128 price0,
         uint128 price1,
         uint8 dec0,
-        uint8 dec1
-    ) external returns (uint256 totalLossUsd) {
-        bool zeroForOne = tokenIn == token0;
+        uint8 dec1,
+        uint256 commissionRate
+    ) external returns (uint256 incumbentFeesValueUsd) {
         uint256 n = amountsIn.length;
         for (uint256 i; i < n; i++) {
-            uint256 amountOut = IRmDep(rangeManager).executeSwap(tokenIn, tokenOut, amountsIn[i], minAmountsOut[i]);
-            uint256 valueIn = zeroForOne ? _toUsd(amountsIn[i], price0, dec0) : _toUsd(amountsIn[i], price1, dec1);
-            uint256 valueOut = zeroForOne ? _toUsd(amountOut, price1, dec1) : _toUsd(amountOut, price0, dec0);
-            if (valueIn > valueOut) totalLossUsd += valueIn - valueOut;
+            IRmDep(rangeManager).executeSwap(tokenIn, tokenOut, amountsIn[i], minAmountsOut[i]);
+        }
+        if (n > 0) {
+            (uint256 fees0, uint256 fees1) = IRmDep(rangeManager).collectFeesForVault();
+            incumbentFeesValueUsd =
+                ((_toUsd(fees0, price0, dec0) + _toUsd(fees1, price1, dec1)) * (10000 - commissionRate)) / 10000;
         }
     }
 
@@ -243,15 +243,7 @@ library DnDepositLib {
         // Les fonds du depot sont deja sur le RM, mais seuls les montants explicites de ce depot
         // participent au calcul et au plafond de collateral.
         (uint256 collateralUsdc, uint256 borrowWeth) = _computeDepositHedge(
-            a.hedgeManager,
-            a.rangeManager,
-            a.token0,
-            price0,
-            price1,
-            dec0,
-            dec1,
-            depositAmount0,
-            depositAmount1
+            a.hedgeManager, a.rangeManager, a.token0, price0, price1, dec0, dec1, depositAmount0, depositAmount1
         );
 
         if (collateralUsdc == 0) return; // déjà assez short → dépôt LP-seul (post-check tranchera)
@@ -310,8 +302,8 @@ library DnDepositLib {
         uint256 freeRmWeth = IERC20(token0).balanceOf(rangeManager);
         (uint256 totalBal0,) = rm.getCurrentBalances();
         uint256 nftWeth = totalBal0 > freeRmWeth ? totalBal0 - freeRmWeth : 0;
-        uint256 investableUsd = _toUsd(depositAmount0, price0, dec0)
-            + Math.mulDiv(depositAmount1, uint256(price1), 10 ** dec1);
+        uint256 investableUsd =
+            _toUsd(depositAmount0, price0, dec0) + Math.mulDiv(depositAmount1, uint256(price1), 10 ** dec1);
         uint16 rBps = _nftRatio0Bps(rangeManager); // H-03 : ratio du NFT existant
 
         uint256 nftUsd = _toUsd(nftWeth, price0, dec0);
@@ -352,9 +344,7 @@ library DnDepositLib {
         }
         (int24 tickLower, int24 tickUpper) = rm.calculateTargetTicks();
         RangeOperations.PriceCache memory pc = _pc(rm);
-        uint256 ratio = RangeOperations.calculateOptimalRatio(
-            tickLower, tickUpper, pc.poolTick, pc.poolSqrtPriceX96
-        );
+        uint256 ratio = RangeOperations.calculateOptimalRatio(tickLower, tickUpper, pc.poolTick, pc.poolSqrtPriceX96);
         return ratio > 10000 ? 10000 : uint16(ratio);
     }
 
@@ -954,10 +944,7 @@ library DnDepositLib {
         // This exact-output repayment path may bypass only the spot/TWAP validity bit produced by a refresh
         // in THIS transaction. Invalid/stale feeds return zero values and cannot pass; the Chainlink max-in
         // and full-fill post-check still bound every settlement and HF repair.
-        require(
-            (valid || timestamp == uint64(block.timestamp)) && price0 > 0 && price1 > 0 && sqrtP > 0,
-            "Bad oracle"
-        );
+        require((valid || timestamp == uint64(block.timestamp)) && price0 > 0 && price1 > 0 && sqrtP > 0, "Bad oracle");
         uint256 theoretical =
             Math.mulDiv(amount0Out, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0), Math.Rounding.Up);
         amountInMaximum = Math.mulDiv(theoretical, 10000 + uint256(slippageBps), 10000, Math.Rounding.Up);
