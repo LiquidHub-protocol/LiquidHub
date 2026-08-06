@@ -2,6 +2,7 @@
 pragma solidity 0.8.19;
 
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
+import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -69,7 +70,7 @@ interface IStargate {
 /// @notice Dedicated treasury for frontend Velora swap commissions.
 /// @dev It intentionally contains no pool bounty logic. Its only permissionless
 ///      surface is bridging accumulated fees to the Phase 2 staking destination.
-contract SwapTreasury is Ownable {
+contract SwapTreasury is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     error BridgeBountyCooldownZero();
@@ -155,7 +156,7 @@ contract SwapTreasury is Ownable {
         amountOut = _swapToUSDC(tokenIn, fee, amountIn, minAmountOut);
     }
 
-    function bridgeToStakers(uint256 amount) external payable {
+    function bridgeToStakers(uint256 amount) external payable nonReentrant {
         require(!adminWithdrawEnabled, "Phase 1");
         require(bridgeEnabled, "Bridge disabled");
         require(amount > 0, "Zero amount");
@@ -257,6 +258,7 @@ contract SwapTreasury is Ownable {
         if (_enabled) {
             require(_dstEid != 0, "Invalid dstEid");
             require(_destination != address(0), "Invalid destination");
+            require(bridgeMinReceivedBps >= 9500, "Bridge min not configured");
         }
         bridgeEnabled = _enabled;
         bridgeDestinationEid = _dstEid;
@@ -266,6 +268,7 @@ contract SwapTreasury is Ownable {
 
     function setBridgeMinReceivedBps(uint16 _minReceivedBps) external onlyOwner {
         require(_minReceivedBps == 0 || (_minReceivedBps >= 9500 && _minReceivedBps <= 10000), "Bad min received");
+        if (bridgeEnabled) require(_minReceivedBps >= 9500, "Bridge active");
         bridgeMinReceivedBps = _minReceivedBps;
         emit BridgeMinReceivedConfigured(_minReceivedBps);
     }
