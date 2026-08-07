@@ -459,9 +459,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     /// @notice Emergency stop for revenue distributions. The rescue Safe may pause immediately;
     ///         only the owner (Safe in Phase 1, Timelock in Phase 2) may resume.
     function setDistributionsPaused(bool paused_) external {
-        require(
-            paused_ ? (msg.sender == rescueSafe || msg.sender == owner()) : msg.sender == owner(), "Unauthorized"
-        );
+        require(paused_ ? (msg.sender == rescueSafe || msg.sender == owner()) : msg.sender == owner(), "Unauthorized");
         distributionsPaused = paused_;
         emit DistributionsPauseUpdated(paused_, msg.sender);
     }
@@ -751,6 +749,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     /// @dev 0 disables the check. Otherwise the value must stay in [9000, 10000] bps.
     function setBridgeMinReceivedBps(uint16 _minReceivedBps) external onlyOwner {
         require(_minReceivedBps == 0 || (_minReceivedBps >= 9000 && _minReceivedBps <= 10000), "Invalid bridge min");
+        if (bridgeEnabled) require(_minReceivedBps >= 9000, "Bridge active");
         bridgeMinReceivedBps = _minReceivedBps;
         emit BridgeMinReceivedConfigured(_minReceivedBps);
     }

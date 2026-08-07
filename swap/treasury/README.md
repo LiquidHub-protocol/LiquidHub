@@ -3,11 +3,12 @@
 This folder exposes the dedicated frontend swap-fee treasury contract for public audit.
 
 The frontend Velora integration sends partner fees to a chain-specific `SwapTreasury` address. This treasury is intentionally separate from LP pool treasuries, so swap revenue is not mixed with strategy revenue.
+It holds protocol commission revenue only: user deposit principal never passes through this contract.
 
 Main responsibilities:
 
 - hold frontend swap fees received through Velora `partnerAddress`
-- convert configured non-USDC fee tokens to the chain USDC through the owner-only, oracle-bounded `swapToUSDC()` path
+- convert configured non-USDC fee tokens to the chain USDC through the owner-only, oracle-bounded `swapToUSDC()` path and its governance-approved fee tier
 - bridge USDC permissionlessly to the governed Phase 2 destination through Stargate
 - pay the existing permissionless Bridge Bounty when on-chain cooldown and minimum-ratio conditions are met
 

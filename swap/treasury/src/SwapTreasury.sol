@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.19;
 
-import "openzeppelin-contracts/contracts/access/Ownable.sol";
+import "openzeppelin-contracts/contracts/access/Ownable2Step.sol";
 import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
@@ -70,13 +71,15 @@ interface IStargate {
 /// @notice Dedicated treasury for frontend Velora swap commissions.
 /// @dev It intentionally contains no pool bounty logic. Its only permissionless
 ///      surface is bridging accumulated fees to the Phase 2 staking destination.
-contract SwapTreasury is Ownable, ReentrancyGuard {
+contract SwapTreasury is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using Math for uint256;
 
     error BridgeBountyCooldownZero();
     error BridgeBountyMinRatioZero();
 
-    uint256 private constant USD_SCALE = 1e8;
+    uint160 private constant MIN_SQRT_RATIO = 4295128739;
+    uint160 private constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
 
     IERC20 public immutable usdc;
     uint8 public immutable usdcDecimals;
@@ -87,12 +90,14 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
     uint256 public currentMonthWithdrawn;
     uint256 public currentMonthStart;
     bool public adminWithdrawEnabled;
+    bool public distributionsPaused;
     address public rescueSafe;
     address public stakingRewardsAddress;
 
     mapping(address => AggregatorV3Interface) public swapFeeds;
     mapping(address => uint32) public swapFeedMaxAges;
     mapping(address => uint16) public swapSlippageBps;
+    mapping(address => uint24) public swapPoolFees;
 
     bool public bridgeEnabled;
     uint32 public bridgeDestinationEid;
@@ -107,11 +112,13 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
 
     event AdminWithdrawal(uint256 amount, address indexed to);
     event AdminWithdrawDisabled(uint256 timestamp);
+    event DistributionsPauseUpdated(bool paused, address indexed caller);
     event RescueSafeUpdated(address indexed oldSafe, address indexed newSafe);
     event MonthlyCapUpdated(uint256 oldCap, uint256 newCap);
     event StakingRewardsSet(address indexed stakingRewards);
     event FeesDistributed(uint256 amount);
     event SwapFeedConfigured(address indexed token, address feed, uint16 swapSlippageBps, uint32 maxAge);
+    event SwapPoolFeeConfigured(address indexed token, uint24 fee);
     event SwappedToUSDC(address indexed tokenIn, uint24 fee, uint256 amountIn, uint256 usdcOut);
     event BridgeConfigured(bool enabled, uint32 dstEid, address destination);
     event BridgeMinReceivedConfigured(uint16 minReceivedBps);
@@ -127,6 +134,7 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
         usdc = IERC20(_usdc);
         usdcDecimals = IERC20Metadata(_usdc).decimals();
         require(usdcDecimals <= 18, "Invalid decimals");
+        require(_validMonthlyCap(_monthlyCap), "Invalid cap");
         swapRouter = ISwapRouter(_swapRouter);
         stargatePool = IStargate(_stargatePool);
         monthlyCap = _monthlyCap;
@@ -136,6 +144,11 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
     }
 
     receive() external payable {}
+
+    /// @dev Protocol commissions must never become inaccessible through an accidental governance renunciation.
+    function renounceOwnership() public pure override {
+        revert();
+    }
 
     modifier onlyRescueSafe() {
         require(msg.sender == rescueSafe, "Only rescue safe");
@@ -151,6 +164,7 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
     function swapToUSDC(address tokenIn, uint24 fee, uint256 amountIn, uint256 minAmountOut)
         external
         onlyOwner
+        nonReentrant
         returns (uint256 amountOut)
     {
         amountOut = _swapToUSDC(tokenIn, fee, amountIn, minAmountOut);
@@ -158,6 +172,7 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
 
     function bridgeToStakers(uint256 amount) external payable nonReentrant {
         require(!adminWithdrawEnabled, "Phase 1");
+        require(!distributionsPaused, "Distributions paused");
         require(bridgeEnabled, "Bridge disabled");
         require(amount > 0, "Zero amount");
         require(bridgeDestinationAddress != address(0), "Destination not set");
@@ -178,8 +193,9 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
         nativeFee = fee.nativeFee;
     }
 
-    function adminWithdraw(uint256 amount, address to) external onlyOwner {
+    function adminWithdraw(uint256 amount, address to) external onlyOwner nonReentrant {
         require(adminWithdrawEnabled, "Admin withdraw disabled");
+        require(amount > 0, "Zero amount");
         require(to != address(0), "Invalid recipient");
 
         if (block.timestamp >= currentMonthStart + 30 days) {
@@ -194,6 +210,7 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
     }
 
     function setMonthlyCap(uint256 newCap) external onlyOwner {
+        require(_validMonthlyCap(newCap), "Invalid cap");
         emit MonthlyCapUpdated(monthlyCap, newCap);
         monthlyCap = newCap;
     }
@@ -209,7 +226,15 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
         rescueSafe = newSafe;
     }
 
-    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyRescueSafe {
+    /// @notice Emergency stop for Phase 2 revenue distributions.
+    /// @dev The rescue Safe may pause immediately; only governance may resume.
+    function setDistributionsPaused(bool paused_) external {
+        require(paused_ ? (msg.sender == rescueSafe || msg.sender == owner()) : msg.sender == owner(), "Unauthorized");
+        distributionsPaused = paused_;
+        emit DistributionsPauseUpdated(paused_, msg.sender);
+    }
+
+    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyRescueSafe nonReentrant {
         require(to != address(0), "Invalid recipient");
         require(tokenAddr != address(usdc), "Use adminWithdraw for USDC");
         require(address(swapFeeds[tokenAddr]) == address(0), "Use bridge flow");
@@ -217,7 +242,7 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
         emit TokenRescued(tokenAddr, to, amount);
     }
 
-    function rescueETH(address payable to, uint256 amount) external onlyRescueSafe {
+    function rescueETH(address payable to, uint256 amount) external onlyRescueSafe nonReentrant {
         require(to != address(0), "Invalid recipient");
         (bool ok,) = to.call{value: amount}("");
         require(ok, "ETH transfer failed");
@@ -230,7 +255,8 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
         emit StakingRewardsSet(_stakingRewards);
     }
 
-    function distributeToStakers(uint256 amount) external onlyOwner {
+    function distributeToStakers(uint256 amount) external onlyOwner nonReentrant {
+        require(!distributionsPaused, "Distributions paused");
         require(stakingRewardsAddress != address(0), "Staking not set");
         require(amount > 0, "Zero amount");
         usdc.safeTransfer(stakingRewardsAddress, amount);
@@ -243,15 +269,26 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
             delete swapFeeds[token];
             delete swapFeedMaxAges[token];
             delete swapSlippageBps[token];
+            delete swapPoolFees[token];
             emit SwapFeedConfigured(token, address(0), 0, 0);
+            emit SwapPoolFeeConfigured(token, 0);
             return;
         }
         require(slippageBps >= 10 && slippageBps <= 1000, "Bad slippage");
         require(maxAge >= 3600 && maxAge <= 172800, "Bad maxAge");
+        require(IERC20Metadata(token).decimals() <= 18 && AggregatorV3Interface(feed).decimals() <= 18, "Bad decimals");
         swapFeeds[token] = AggregatorV3Interface(feed);
         swapFeedMaxAges[token] = maxAge;
         swapSlippageBps[token] = slippageBps;
         emit SwapFeedConfigured(token, feed, slippageBps, maxAge);
+    }
+
+    /// @notice Authorize the single Uniswap V3 fee tier used for one commission token -> USDC route.
+    function setSwapPoolFee(address token, uint24 fee) external onlyOwner {
+        require(token != address(0) && token != address(usdc), "Invalid token");
+        require(fee == 100 || fee == 500 || fee == 3000 || fee == 10000, "Bad fee");
+        swapPoolFees[token] = fee;
+        emit SwapPoolFeeConfigured(token, fee);
     }
 
     function setBridgeConfig(bool _enabled, uint32 _dstEid, address _destination) external onlyOwner {
@@ -275,7 +312,7 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
 
     function setBridgeBounty(bool _enabled, uint256 _amount) external onlyOwner {
         if (_enabled) {
-            require(_amount > 0, "Bounty is zero");
+            require(_amount > 0 && _amount <= monthlyCap, "Invalid bounty");
             if (bridgeBountyCooldown == 0) revert BridgeBountyCooldownZero();
             if (bridgeBountyMinRatio == 0) revert BridgeBountyMinRatioZero();
         }
@@ -285,8 +322,10 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
     }
 
     function setBridgeBountyCooldown(uint64 _cooldown, uint16 _minRatio) external onlyOwner {
-        if (_cooldown == 0) revert BridgeBountyCooldownZero();
-        if (_minRatio == 0) revert BridgeBountyMinRatioZero();
+        require(_cooldown == 0 || (_cooldown >= 1 hours && _cooldown <= 30 days), "Bad cooldown");
+        require(_minRatio == 0 || (_minRatio >= 10 && _minRatio <= 10000), "Bad ratio");
+        if (bridgeBountyEnabled && bridgeBountyAmount > 0 && _cooldown == 0) revert BridgeBountyCooldownZero();
+        if (bridgeBountyEnabled && bridgeBountyAmount > 0 && _minRatio == 0) revert BridgeBountyMinRatioZero();
         bridgeBountyCooldown = _cooldown;
         bridgeBountyMinRatio = _minRatio;
         emit BridgeBountyCooldownConfigured(_cooldown, _minRatio);
@@ -297,11 +336,14 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
         returns (uint256 amountOut)
     {
         require(tokenIn != address(usdc), "Already USDC");
+        require(fee == swapPoolFees[tokenIn] && fee != 0, "Unapproved fee");
         require(amountIn > 0, "Zero amount");
         IERC20 token = IERC20(tokenIn);
-        require(token.balanceOf(address(this)) >= amountIn, "Insufficient balance");
+        uint256 balanceBefore = token.balanceOf(address(this));
+        uint256 usdcBefore = usdc.balanceOf(address(this));
+        require(balanceBefore >= amountIn, "Insufficient balance");
 
-        uint256 floor = _oracleMinUsdcOut(tokenIn, amountIn);
+        (uint256 floor, uint160 sqrtPriceLimitX96) = _oracleSwapBounds(tokenIn, amountIn);
         uint256 minOut = minAmountOut > floor ? minAmountOut : floor;
 
         token.safeApprove(address(swapRouter), 0);
@@ -315,30 +357,70 @@ contract SwapTreasury is Ownable, ReentrancyGuard {
             deadline: block.timestamp,
             amountIn: amountIn,
             amountOutMinimum: minOut,
-            sqrtPriceLimitX96: 0
+            sqrtPriceLimitX96: sqrtPriceLimitX96
         });
 
         amountOut = swapRouter.exactInputSingle(params);
+        require(balanceBefore - token.balanceOf(address(this)) == amountIn, "Partial fill");
+        require(usdc.balanceOf(address(this)) - usdcBefore == amountOut, "Output mismatch");
+        token.safeApprove(address(swapRouter), 0);
         emit SwappedToUSDC(tokenIn, fee, amountIn, amountOut);
     }
 
-    function _oracleMinUsdcOut(address tokenIn, uint256 amountIn) internal view returns (uint256) {
+    function _oracleSwapBounds(address tokenIn, uint256 amountIn)
+        internal
+        view
+        returns (uint256 minUsdcOut, uint160 sqrtPriceLimitX96)
+    {
         AggregatorV3Interface feed = swapFeeds[tokenIn];
-        require(address(feed) != address(0), "Missing feed");
+        AggregatorV3Interface usdcFeed = swapFeeds[address(usdc)];
+        require(address(feed) != address(0) && address(usdcFeed) != address(0), "Missing feed");
         (uint80 roundId, int256 answer,, uint256 updatedAt, uint80 answeredInRound) = feed.latestRoundData();
-        require(answer > 0, "Bad feed");
-        require(answeredInRound >= roundId, "Stale round");
-        require(block.timestamp - updatedAt <= swapFeedMaxAges[tokenIn], "Stale feed");
+        (uint80 usdcRoundId, int256 usdcAnswer,, uint256 usdcUpdatedAt, uint80 usdcAnsweredInRound) =
+            usdcFeed.latestRoundData();
+        require(
+            answer > 0 && updatedAt != 0 && answeredInRound >= roundId
+                && block.timestamp - updatedAt <= swapFeedMaxAges[tokenIn],
+            "Bad feed"
+        );
+        require(
+            usdcAnswer > 0 && usdcUpdatedAt != 0 && usdcAnsweredInRound >= usdcRoundId
+                && block.timestamp - usdcUpdatedAt <= swapFeedMaxAges[address(usdc)],
+            "Bad USDC feed"
+        );
 
         uint8 feedDecimals = feed.decimals();
         uint8 tokenDecimals = IERC20Metadata(tokenIn).decimals();
-        require(feedDecimals <= 18 && tokenDecimals <= 18, "Bad decimals");
+        uint8 usdcFeedDecimals = usdcFeed.decimals();
+        require(feedDecimals <= 18 && tokenDecimals <= 18 && usdcFeedDecimals <= 18, "Bad decimals");
 
-        uint256 usd8 = amountIn * uint256(answer) * USD_SCALE / (10 ** tokenDecimals) / (10 ** feedDecimals);
-        uint256 out = usd8 * (10 ** usdcDecimals) / USD_SCALE;
+        uint256 normalizedUsdcPrice = uint256(usdcAnswer);
+        if (usdcFeedDecimals < feedDecimals) normalizedUsdcPrice *= 10 ** (feedDecimals - usdcFeedDecimals);
+        else if (usdcFeedDecimals > feedDecimals) normalizedUsdcPrice /= 10 ** (usdcFeedDecimals - feedDecimals);
+        require(normalizedUsdcPrice > 0, "Bad USDC decimals");
+
+        uint256 usdValue = Math.mulDiv(amountIn, uint256(answer), 10 ** tokenDecimals);
+        uint256 out = Math.mulDiv(usdValue, 10 ** usdcDecimals, normalizedUsdcPrice);
         uint16 slippage = swapSlippageBps[tokenIn];
         require(slippage > 0, "Missing slippage");
-        return out * (10_000 - slippage) / 10_000;
+        minUsdcOut = out * (10_000 - slippage) / 10_000;
+
+        bool zeroForOne = tokenIn < address(usdc);
+        uint256 numerator =
+            zeroForOne ? uint256(answer) * (10 ** usdcDecimals) : normalizedUsdcPrice * (10 ** tokenDecimals);
+        uint256 denominator =
+            zeroForOne ? normalizedUsdcPrice * (10 ** tokenDecimals) : uint256(answer) * (10 ** usdcDecimals);
+        uint256 oracleSqrtPriceX96 = Math.sqrt(Math.mulDiv(numerator, uint256(1) << 192, denominator));
+        require(oracleSqrtPriceX96 > MIN_SQRT_RATIO && oracleSqrtPriceX96 < MAX_SQRT_RATIO, "Bad swap price");
+        uint256 factor = zeroForOne ? 20000 - slippage : 20000 + slippage;
+        uint256 limit = (oracleSqrtPriceX96 * factor) / 20000;
+        if (limit <= MIN_SQRT_RATIO) limit = MIN_SQRT_RATIO + 1;
+        if (limit >= MAX_SQRT_RATIO) limit = MAX_SQRT_RATIO - 1;
+        sqrtPriceLimitX96 = uint160(limit);
+    }
+
+    function _validMonthlyCap(uint256 cap) internal view returns (bool) {
+        return cap > 0 && cap <= 1_000_000 * (10 ** uint256(usdcDecimals));
     }
 
     function _bridgeUsdc(uint256 amount)
