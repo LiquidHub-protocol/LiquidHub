@@ -12,7 +12,7 @@ The keeper bot follows a simple loop:
 4. If `needsRebalance` is `true`, executes `rebalance()` (earns the keeper bounty)
 5. Waits for the configured interval and repeats
 
-All checks are independent: a cycle may record a snapshot, process a deposit, rebalance, any combination, or none. The snapshot step runs **before** the deposit/rebalance steps so they read a fresh Chainlink price.
+All checks are independent: a cycle may record a snapshot, process a deposit, rebalance, any combination, or none. A snapshot feeds and may update the stored dynamic range; it is not a cache-refresh prerequisite. Deposit processing and `rebalance()` each refresh and validate the price cache atomically before moving funds.
 
 ### Rebalance Flow
 
@@ -29,7 +29,7 @@ Everything happens atomically: if any step fails, the whole transaction reverts 
 
 ### Dynamic Range Calculation (100% on-chain)
 
-The range is computed **entirely on-chain** by the RangeManager — the keeper does not provide any range value. The contract keeps a ring buffer of price snapshots and, on each mint/rebalance, derives a symmetric range from the high/low amplitude over `volatMoyDay` days (after trimming the `volatTrimDay` most extreme days), scaled by a governance multiplier and rounded to the nearest `rangeStepBps` (0.5%). Tuning parameters (`maxSnapshotsPerDay`, `volatMoyDay`, `volatTrimDay`, `rangeStepBps`, `rangeMultiplicatorBps`) live in `dynRangeConfig()` and are set by the Safe multisig.
+The range is computed **entirely on-chain** by the RangeManager — the keeper does not provide any range value. When a due snapshot is recorded, the contract evaluates observations in the `volatMoyDay` window, trims the configured number of highest and lowest observations, scales the high/low amplitude by the governance multiplier, rounds it to `rangeStepBps`, and stores the bounded half-range. During cold start it retains the previous/base range. Mint and rebalance use the latest stored range. Tuning parameters live in `dynRangeConfig()` and are governed on-chain.
 
 Because the calculation is on-chain, **any keeper can reproduce it without the protocol's bot or database** — the keeper just feeds it price snapshots.
 
@@ -41,9 +41,9 @@ When `DYNAMIC_RANGE_ENABLED` is `false` (e.g. a stablecoin pool), the range stay
 
 #### Processing deposits (`processDepositPermissionless`)
 
-A user's `deposit()` is permissionless and queues the funds. Converting a queued deposit into LP liquidity is also permissionless: `processDepositPermissionless()` on the Vault processes **one** queued deposit per call, atomically — it refreshes the oracle, computes shares on the Chainlink oracle, executes the rebalancing swaps, and adds the liquidity. A successful call pays the **deposit bounty**.
+A user's `deposit()` is permissionless and queues the funds. Converting a queued deposit into LP liquidity is also permissionless: `processDepositPermissionless()` on the Vault processes **one** queued deposit per call, atomically — it refreshes the oracle, values the portfolio through Chainlink, executes the rebalancing swaps, adds liquidity, and mints shares from the actual post-action NAV increase. A successful eligible call can pay the **deposit bounty**.
 
-**Anti-MEV — keeper must supply oracle-floored `minAmountsOut`**: both `rebalance()` and `processDepositPermissionless()` reject any `minAmountsOut[i]` below an on-chain oracle floor. The reference keeper computes the floor from the Chainlink price (same formula the contract uses). Deposit processing reverts if the queue is empty, no position NFT exists for a community keeper (the one-time initial mint is the protocol bot's job), or the oracle cache is stale — so the keeper just calls it when a deposit is pending and treats a revert as "skip".
+**Anti-MEV — keeper must supply oracle-floored `minAmountsOut`**: both `rebalance()` and `processDepositPermissionless()` reject any `minAmountsOut[i]` below an on-chain oracle floor. The reference keeper computes the floor from the Chainlink price (same formula the contract uses). Deposit processing reverts if the queue is empty, no position NFT exists for a community keeper (the one-time initial mint is the protocol bot's job), or live oracle/TWAP validation fails; the deposit stays queued for a later safe retry.
 
 ### Permissionless
 
@@ -86,6 +86,7 @@ Edit `.env` with the following variables:
 | `TOKEN0_DECIMALS` | No | Token0 decimals (default: 18) |
 | `TOKEN1_DECIMALS` | No | Token1 decimals (default: 6) |
 | `CHECK_INTERVAL_MIN` | No | Check interval in minutes (default: 1; must be greater than 0) |
+| `KEEPER_PRICE_CACHE_MAX_AGE_SEC` | No | Local age used before refreshing and rebuilding a retry plan (default: 300; on-chain checks remain authoritative) |
 
 The swap-chunk ceiling is not a keeper setting: the keeper reads `initMultiSwapTvl()` directly from the deployed RangeManager before building each atomic plan.
 
@@ -115,6 +116,16 @@ npm start
 ```bash
 npm run check
 ```
+
+### 4. Run the regression tests
+
+```bash
+npm test
+```
+
+The versioned `test/` directory is part of the public keeper distribution. It validates RPC chain authentication
+and failover, nonce coordination, raw-transaction recovery, gas ceilings, retry behavior, pause handling and the
+absence of protocol-only Telegram, Tenderly or AWS secret integrations.
 
 ## Keeper Bounties
 
@@ -156,6 +167,8 @@ keeper-bot/
     utils/
       contracts.js     # Contract ABIs and factory
       rpc.js           # RPC provider pool with failover
+  test/
+    liveness.test.js   # Deterministic liveness/security regression suite
 ```
 
 ## License

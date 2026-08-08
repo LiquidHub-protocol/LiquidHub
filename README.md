@@ -19,7 +19,7 @@ Two pool types:
 | **RangeOperations** | Library for tick/range calculations and the on-chain dynamic-range formula |
 | **SecureBotModule** | Gnosis Safe module whitelisting specific function selectors for automated operations |
 | **Treasury** | Protocol fee collection, keeper / metrics / hedge bounties (+ Phase 2 bridge bounty), admin withdrawals with monthly cap |
-| **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: governed hedge target, permissionless over-hedge correction, debt-compatible atomic rebalance for under-hedge, proportional flash-loan settlement, health-factor monitoring |
+| **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: governed hedge target, permissionless over- and under-hedge correction when on-chain safety checks pass, atomic-rebalance fallback, proportional flash-loan settlement, health-factor monitoring |
 
 ## Directory Structure
 
@@ -27,11 +27,11 @@ Two pool types:
 pools/
 ├── UNI-ARB-WETH-USDC/          # Standard pool (WETH/USDC, Arbitrum)
 │   ├── contracts/               # Solidity contracts
-│   └── keeper-bot/              # Keeper bot (check & rebalance)
+│   └── keeper-bot/              # Keeper bot, including public regression tests
 │
 ├── UNI-ARB-WETH-USDC-DN/       # Delta Neutral pool (WETH/USDC, Arbitrum)
 │   ├── contracts/               # Solidity contracts + AaveHedgeManager
-│   └── keeper-bot/              # Keeper bot + hedge monitoring
+│   └── keeper-bot/              # Keeper bot + hedge monitoring + regression tests
 │
 docs/                            # Protocol documentation
 ```
@@ -40,11 +40,13 @@ docs/                            # Protocol documentation
 
 To run a keeper bot, see [docs/KEEPER-GUIDE.md](docs/KEEPER-GUIDE.md).
 
-For post-deployment Safe configuration, see [docs/SAFE-SETUP.md](docs/SAFE-SETUP.md).
+The official deployment addresses for all Liquid Hub contracts are published on the
+[Contracts page](https://liquidhub.app/docs#contracts-addresses). Always verify the selected network and copy
+addresses from that page before interacting with a deployment.
 
 ## Security
 
-All admin functions are controlled by a Gnosis Safe 2/3 multisig. The keeper bot can only execute whitelisted operations through the SecureBotModule. See [docs/SECURITY.md](docs/SECURITY.md) for details.
+In Phase 1, administrative functions are controlled by the configured Gnosis Safe multisig policy. The protocol bot is restricted to the selectors exposed by each pool's `SecureBotModule`; independent community keepers use only the contracts' guarded permissionless entry points. See [docs/SECURITY.md](docs/SECURITY.md) for details.
 
 ## Documentation
 
@@ -52,7 +54,6 @@ All admin functions are controlled by a Gnosis Safe 2/3 multisig. The keeper bot
 - [TREASURY.md](docs/TREASURY.md) — Treasury rules and monthly cap
 - [KEEPER-GUIDE.md](docs/KEEPER-GUIDE.md) — How to run a keeper
 - [SECURITY.md](docs/SECURITY.md) — Multisig powers and limitations
-- [SAFE-SETUP.md](docs/SAFE-SETUP.md) — Post-deployment Safe commands with ABIs
 
 ## License
 

@@ -2,6 +2,10 @@
 
 This folder exposes the dedicated frontend swap-fee treasury contract for public audit.
 
+Official deployment addresses for every network are published on the
+[Liquid Hub Contracts page](https://liquidhub.app/docs#contracts-addresses); never infer an address from this
+source directory.
+
 The frontend Velora integration sends partner fees to a chain-specific `SwapTreasury` address. This treasury is intentionally separate from LP pool treasuries, so swap revenue is not mixed with strategy revenue.
 It holds protocol commission revenue only: user deposit principal never passes through this contract.
 

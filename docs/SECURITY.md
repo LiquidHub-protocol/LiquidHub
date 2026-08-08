@@ -2,7 +2,8 @@
 
 ## Governance and emergency authority
 
-In Phase 1, the Gnosis Safe multisig is the governance authority and requires 2-of-3 signers. In Phase 2,
+In Phase 1, the Gnosis Safe multisig is the governance authority under the signer threshold configured directly
+in that Safe. In Phase 2,
 governance and ownership are transferred to the Governor-controlled Timelock. The Safe then remains only as
 the fast emergency guardian for the explicitly retained pause, recovery and rescue functions.
 
@@ -13,7 +14,8 @@ the fast emergency guardian for the explicitly retained pause, recovery and resc
 - **Phase 2 Timelock:** owns governance settings such as ranges, slippage, oracle addresses, Treasury routes,
   caps and keeper bounties.
 - **Phase 2 Safe:** can trigger only the emergency actions retained in each contract. It cannot change strategy
-  parameters or unpause governance-owned controls.
+  parameters. The bounded user-flow PauseController intentionally lets the emergency Safe both trigger and lift
+  those pauses; governance retains parameter and ownership control.
 - Treasury admin withdrawals are permanently disabled by the final Phase 2 lock (**irreversible**).
 
 ---
@@ -35,6 +37,22 @@ The `SecureBotModule` is a Gnosis Safe module that whitelists specific function 
   operations are not part of the public keeper/module allowlist.
 - Treasury bridging to stakers (Phase 2)
 
+**Core selector set in the published contracts:**
+
+| Selector | Function | Target / pools |
+|---|---|---|
+| `0x0be1c372` | `refreshPriceCache()` | RangeManager / standard + DN |
+| `0x6ecfe0f8` | `recordPriceSnapshot()` | RangeManager / standard + DN |
+| `0x76919a59` | `processDepositPermissionless(uint256[],uint256[],address,address)` | Vault / standard + DN |
+| `0x0040718e` | `endRebalance()` | Vault unlock / standard + DN |
+| `0x1e694f32` | `adjustHedge()` | AaveHedgeManager / DN only |
+| `0xa5599124` | `bridgeToStakers(uint256)` | Treasury / standard + DN, Phase 2 |
+| `0x56a12aca` | `distributeToStakers(uint256)` | Treasury / standard + DN, Phase 2 |
+
+The execution entrypoint also restricts which target contract each selector can reach. `rebalance()`
+(`0xed375437`) is intentionally absent: both pool variants expose it as a guarded permissionless RangeManager
+function, so community keepers call it directly rather than through the Safe module.
+
 **Blocked operations (cannot be called via the module):**
 
 - Transfer / approve tokens
@@ -42,11 +60,12 @@ The `SecureBotModule` is a Gnosis Safe module that whitelists specific function 
 - Withdraw from Treasury (outside the bridge-to-stakers path)
 - Any function not explicitly whitelisted
 
-> **Exhaustive, always-up-to-date list:** the complete per-pool list of whitelisted function selectors
-> (with their `bytes4` values) is published on the Contracts page:
-> **http://liquidhub.app/docs#contracts-addresses** → section *"Bot Module Security — Whitelisted Function Selectors"*.
+> **Live source of truth:** the deployed module's `isFunctionAllowed(bytes4)` result and verified bytecode are
+> authoritative. The complete per-pool list is also published on the Contracts page:
+> **https://liquidhub.app/docs#contracts-addresses** → section *"Bot Module Security — Whitelisted Function Selectors"*.
 > Each selector can be verified on Arbiscan via the module's read-only `isFunctionAllowed(bytes4)` function.
-> This document stays intentionally high-level so it never drifts out of sync with the deployed modules.
+> The table above matches the contracts in this repository; always verify it against the live address after a
+> redeployment.
 
 ---
 
@@ -89,8 +108,8 @@ no funds**, and is verified on Arbiscan. Because the contracts simply read the o
 
 ### Oracle-bounded swaps (anti-MEV / anti-sandwich)
 Rebalance and deposit swaps enforce an **on-chain `minAmountsOut` floor derived from the Chainlink price**
-(`"minOut<floor"`). A keeper-supplied minimum below the oracle floor reverts, so internal swaps cannot be
-sandwiched. The premium RPC additionally provides MEV-protected (private) transaction submission.
+(`"minOut<floor"`). A keeper-supplied minimum below the oracle floor reverts. Public keepers may use any RPC;
+their RPC choice cannot bypass the on-chain oracle, TWAP, exact-input and minimum-output checks.
 
 ### Fail-closed on price/fee dependencies
 - If the AAVE hedge valuation (`getHedgeData`) reverts while a hedge manager is set, portfolio valuation
@@ -147,7 +166,8 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 - **Hedge pause** (DN): `AaveHedgeManager.setPaused(true)` blocks new hedge openings (`supplyAndBorrow`) but
   deliberately leaves risk-reduction and position-maintenance paths available. In Phase 2 the Safe can pause,
   while only Timelock governance can unpause.
-- **ReentrancyGuard** on all state-changing entry points of the vault, RangeManager and hedge manager.
+- **ReentrancyGuard** on external fund-moving and sensitive maintenance paths of the Vault, RangeManager and
+  HedgeManager. Pure/view functions and simple governance setters do not require this guard.
 
 ---
 
@@ -180,8 +200,9 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 | Function | Access | Description |
 |----------|--------|-------------|
 | `deposit()` / `withdraw()` | Public | Any user can deposit or withdraw |
-| `startRebalance()` / `endRebalance()` | `onlyBot` | Safe, module, or RangeManager |
-| `collectCommissions()` | `onlyBot` | Collect LP fees for Treasury |
+| `startRebalance()` | `onlyBot` | Operational lock used by authorized callers |
+| `endRebalance()` | Owner, module, RangeManager or emergency Safe | Clears the operational lock; moves no funds |
+| `syncFeesForDeposits()` | Public, guarded | Crystallizes pending LP fees before queued-deposit share accounting when required |
 | `updateTreasuryAddress()` | `onlyOwner` (Safe Phase 1 / Timelock Phase 2) | Update the Treasury address |
 
 ---
@@ -190,10 +211,12 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 
 The protocol is designed so that user funds are protected even if the keeper wallet or bot infrastructure is compromised:
 
-- **User funds are held in the vault contract**, never in the bot wallet or any externally owned account.
+- **User funds remain across the protocol contracts**: queued balances in the Vault, active liquidity in the
+  RangeManager/DEX position, and DN collateral/debt in the HedgeManager/AAVE integration. They are never held by
+  the bot wallet or another externally owned account.
 - **The keeper cannot withdraw user funds** — it can only call public rebalance functions.
-- **LP position NFTs are owned by the vault contract**, not by any individual.
+- **LP position NFTs are owned by the pool's RangeManager contract**, not by any individual or keeper.
 - **Withdrawals go directly to the user's wallet** — there is no intermediary step where funds can be redirected.
 - **No admin can redirect user withdrawals** — the withdrawal function sends tokens to `msg.sender`.
-- **Governance changes** require 2-of-3 Safe approval in Phase 1 and Governor/Timelock execution in Phase 2;
+- **Governance changes** require the configured Safe approval threshold in Phase 1 and Governor/Timelock execution in Phase 2;
   the Safe then retains only the documented emergency guardian powers.

@@ -431,11 +431,11 @@ function readJavaScriptTree(dir) {
   }).join('\n');
 }
 
-test('community keeper source has no protocol Telegram or AWS secret transport', () => {
+test('community keeper source has no protocol Telegram, Tenderly or AWS secret transport', () => {
   const source = readJavaScriptTree(path.join(__dirname, '..', 'src'));
   assert.doesNotMatch(
     source,
-    /TELEGRAM_|api\.telegram\.org|sendTelegram|aws-sdk|SecretsManager|secrets-manager|AWS_SECRET/i
+    /TELEGRAM_|api\.telegram\.org|sendTelegram|TENDERLY_|tenderly\.co|aws-sdk|SecretsManager|secrets-manager|AWS_SECRET/i
   );
 });
 

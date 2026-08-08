@@ -15,13 +15,14 @@ Anyone can run a keeper bot to perform the protocol's permissionless actions for
 
 Each cycle the keeper:
 
-1. Calls `getBotInstructions()` on the `RangeManager`; if `needsRebalance` is `true`, executes `rebalance()`.
-2. Reads `getPendingDepositsCount()`; if `> 0`, a position NFT exists, and the vault is not locked, calls `processDepositPermissionless()` to process one queued deposit (atomic; reverts if the queue is empty, no NFT exists for a community keeper, or the oracle cache is stale).
-3. Calls `isSnapshotDue()`; if `true`, calls `recordPriceSnapshot()` (the contract reverts if a snapshot is not yet due).
-4. **(DN only)** Tries `adjustHedge()`; it executes only if the hedge drift exceeds the on-chain threshold, otherwise it reverts (no-op).
-5. After any successful action, the bounty is paid from the Treasury (if enabled).
+1. Reads `getBotInstructions()` and the pool's operational state.
+2. Calls `isSnapshotDue()`; if `true`, calls `recordPriceSnapshot()` (the contract reverts if a snapshot is not yet due).
+3. Reads `getPendingDepositsCount()`; if `> 0`, a position NFT exists, inflows are available and no rebalance is already due, calls `processDepositPermissionless()` to process one queued deposit atomically.
+4. Refreshes the instructions and, if `needsRebalance` is `true`, executes the single atomic `rebalance()` transaction.
+5. **(DN only)** Simulates and, when accepted by the contract, executes `adjustHedge()`; the DN reference keeper prioritizes this risk-maintenance check before the other actions.
+6. After any successful eligible action, the bounty is paid from the Treasury if enabled and funded.
 
-**Important — oracle freshness**: the keeper records a price snapshot **before** rebalancing/processing deposits (it earns the metrics bounty). Note: `rebalance()` **does refresh the price cache itself** (refresh-and-validate guard at the top), so rebalance freshness no longer depends on this snapshot — keeping the order simply lets one cycle both snapshot and rebalance on a fresh price. `processDepositPermissionless()` also refreshes the oracle atomically on-chain and bounds swap outputs by the oracle (anti-MEV). The keeper must compute `minAmountsOut` from the Chainlink oracle floor for **both** deposits and rebalances (the contract enforces the floor on both paths — never pass 0).
+**Important — snapshots and action prices are separate**: `recordPriceSnapshot()` feeds the dynamic-range history and may update the stored range. It is not used as a standalone cache refresh for a later action. `rebalance()` and `processDepositPermissionless()` refresh and validate their own price cache atomically before moving funds. The keeper computes `minAmountsOut` from the Chainlink oracle floor for both deposits and rebalances; the contracts enforce that floor, so a zero or weaker minimum is rejected.
 
 **Important**: the range is computed **100% on-chain** by the `RangeManager` (high/low amplitude over N days, trimmed, scaled by a governance multiplier, rounded to a step). The keeper does **not** configure or calculate ranges — it only feeds price snapshots and executes rebalances. The hedge target and the deposit share count are likewise computed on-chain (on the Chainlink oracle).
 
@@ -55,18 +56,20 @@ This prints the current pool state, whether a rebalance is needed, and the curre
 
 ## Environment Variables
 
-> **Contract addresses** — the official deployed addresses (RangeManager, Vault, Treasury, AaveHedgeManager) are listed on the protocol's Contracts page: **http://liquidhub.app/docs#contracts-addresses**. Always copy them from there; never guess or hardcode an address.
+> **Contract addresses** — the official deployed addresses (RangeManager, Vault, Treasury, AaveHedgeManager) are listed on the protocol's Contracts page: **https://liquidhub.app/docs#contracts-addresses**. Always copy them from there; never guess or hardcode an address.
 
 ### Required
 
 | Variable | Description |
 |----------|-------------|
+| `CHAINID` | Expected chain ID; every configured RPC is authenticated against it before use |
 | `RPC_URL` | Arbitrum RPC endpoint |
 | `RANGEMANAGER_ADDRESS` | RangeManager contract address (from the Contracts page) |
 | `VAULT_ADDRESS` | MultiUserVault contract address (from the Contracts page) |
 | `TOKEN0_ADDRESS` | Token0 address (e.g., WETH) |
 | `TOKEN1_ADDRESS` | Token1 address (e.g., USDC) |
 | `KEEPER_PRIVATE_KEY` | Private key of the keeper wallet |
+| `KEEPER_MAX_GAS_PRICE_GWEI` | Local ceiling for initial and same-nonce replacement transactions |
 
 ### Optional
 
@@ -74,9 +77,13 @@ This prints the current pool state, whether a rebalance is needed, and the curre
 |----------|-------------|---------|
 | `RPC_BACKUP_1` | Backup RPC endpoint 1 | — |
 | `RPC_BACKUP_2` | Backup RPC endpoint 2 | — |
+| `PAUSE_CONTROLLER_ADDRESS` | Used only to gate deposit processing; if absent/unreadable, deposits are skipped while maintenance continues | — |
 | `TREASURY_ADDRESS` | Treasury address — lets the bot read the USDC balance and warn when a bounty would be skipped (falls back to `vault.treasuryAddress()`) | — |
+| `KEEPER_STATE_DIR` | Shared signer lock/journal directory for processes using the same chain and key | `~/.liquidhub-keeper-state` |
 | `CHECK_INTERVAL_MIN` | Minutes between checks; must be greater than 0 | 1 |
-| `INIT_MULTI_SWAP_TVL` | Max USD per swap chunk | 10000 |
+| `KEEPER_PRICE_CACHE_MAX_AGE_SEC` | Local age used to decide whether an action retry should first refresh and rebuild its plan; it is not an on-chain safety limit | 300 |
+
+The swap-chunk ceiling is not configured by a community keeper. Before building a plan, the keeper reads `initMultiSwapTvl()` from the deployed `RangeManager`; the contract then enforces the same ceiling on-chain.
 
 ### RPC Trust Model
 
@@ -91,9 +98,11 @@ The reference keepers populate and sign each transaction once, then fail over se
 | Variable | Description |
 |----------|-------------|
 | `AAVE_HEDGE_MANAGER_ADDRESS` | AaveHedgeManager contract address |
-| `AAVE_HEALTH_WARN` | Health factor warn threshold (e.g., 1.40 when reserve target is 1.40) |
-| `AAVE_HEALTH_DELEVERAGE` | Health factor critical/deleverage threshold (e.g., 1.25) |
-| `AAVE_HEALTH_EMERGENCY` | Health factor emergency threshold (e.g., 1.15) |
+| `AAVE_HEALTH_WARN` | Local log/status warning threshold |
+| `AAVE_HEALTH_DELEVERAGE` | Local log/status critical threshold |
+| `AAVE_HEALTH_EMERGENCY` | Local log/status emergency threshold |
+
+These three values only label keeper logs. They do not size transactions, trigger privileged deleveraging or replace the on-chain health-factor, drift, cooldown, oracle and TWAP checks enforced by `AaveHedgeManager`.
 
 ---
 
@@ -142,14 +151,14 @@ The keeper **cannot**:
 - Perform any admin operations
 - Change contract configuration
 
-User funds are held in the vault contract and LP positions are owned by the vault. The keeper wallet only needs ETH for gas.
+User assets remain in the protocol contracts: pending funds in the Vault, active liquidity and its NFT in the RangeManager/DEX position, and DN collateral/debt in the HedgeManager/AAVE integration. They never enter the keeper wallet, which only needs native gas funds.
 
 ---
 
 ## Gas Costs
 
 - A typical rebalance costs **0.001–0.01 ETH** on Arbitrum.
-- Multi-swap rebalances (large TVL) will cost more due to multiple swap transactions.
+- Multi-swap rebalances (large TVL) cost more because one atomic transaction performs several internal swap calls.
 - Ensure your keeper wallet has sufficient ETH to cover gas.
 
 ---
@@ -160,3 +169,9 @@ User funds are held in the vault contract and LP positions are owned by the vaul
 - **Rebalance triggered**: Logs show the rebalance steps being executed.
 - **Errors**: Check logs for error messages. Common issues include insufficient gas, RPC failures, or slippage exceeding tolerance.
 - Use backup RPCs (`RPC_BACKUP_1`, `RPC_BACKUP_2`) for reliability.
+
+---
+
+## Regression Tests
+
+Each public `keeper-bot/test` directory is intentionally versioned. After `npm install`, run `npm test` to verify RPC chain authentication and failover, signed-transaction persistence, nonce coordination, gas ceilings, action retries, pause handling, and the absence of protocol-only Telegram, Tenderly or AWS secret integrations. These tests are part of the auditable keeper distribution and should be kept in forks and releases.

@@ -46,6 +46,11 @@ All standard keeper variables apply (see the standard pool README), including th
 | `AAVE_HEALTH_DELEVERAGE` | Health factor critical/deleverage threshold | `1.25` |
 | `AAVE_HEALTH_EMERGENCY` | Health factor emergency threshold | `1.15` |
 
+The `AAVE_HEALTH_*` values only label local console status. They do not trigger transactions or define protocol
+safety. `AaveHedgeManager` reads its sizing, health-factor, drift, cooldown, oracle and TWAP constraints on-chain.
+The optional `KEEPER_PRICE_CACHE_MAX_AGE_SEC` (default `300`) only controls when the keeper refreshes and rebuilds
+an action retry plan; it is not an on-chain acceptance threshold.
+
 ### RPC Trust Model
 
 Community keepers are permissionless and may use any RPC provider they choose. Liquid Hub does not require public keepers to use premium or MEV-protected RPCs. This is intentional: keeper safety is enforced on-chain by oracle/TWAP checks, oracle-floored `minAmountsOut`, cooldowns, caps, and DN hedge post-checks.
@@ -76,6 +81,15 @@ npm start
 # Check-only mode -- reads state once and exits
 npm run check
 ```
+
+Run the versioned public regression suite after installing dependencies:
+
+```bash
+npm test
+```
+
+The `test/` directory validates the standard liveness/security properties plus DN hedge simulation, fallback and
+retry classification. It intentionally contains no Telegram, Tenderly or AWS integration.
 
 ## License
 

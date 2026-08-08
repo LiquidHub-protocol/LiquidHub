@@ -2,9 +2,12 @@
 
 ## Overview
 
-The on-chain Treasury contract collects protocol fees and manages fund distribution. It serves as the central revenue hub for the Liquid Hub protocol, accumulating fees from LP commissions and frontend swap commissions.
+The on-chain pool Treasury contract collects LP-strategy protocol fees and manages their distribution. User principal never becomes Treasury revenue.
 
-One Treasury contract is deployed per network for the LP pools.
+One pool Treasury is deployed per **DEX protocol and blockchain** and may be shared by all compatible Liquid Hub pools in that scope. Frontend Velora partner fees use a separate **SwapTreasury per blockchain**; they are not mixed with LP-strategy revenue.
+
+Official deployment addresses for pool Treasuries, SwapTreasuries and all other Liquid Hub contracts are
+published on the [Contracts page](https://liquidhub.app/docs#contracts-addresses).
 
 ---
 
@@ -19,7 +22,7 @@ The protocol is currently in **Phase 1 of its decentralization roadmap**. What t
 | Keeper / deposit / metrics / hedge bounties | **Enabled** — configured by the Safe | Permissionless triggers, configuration controlled by the Timelock |
 | Bridge to stakers | Mechanism deployed, **bounty disabled** (no staking contract yet) | `bridgeToStakers()` live, fees routed to the governed destination |
 
-We believe clarity on what is and isn't decentralized matters more than marketing claims. Every function described below already exists on-chain and is verified on the block explorer — the table above states what is *enabled* today versus what is planned.
+The table states what is enabled in Phase 1 versus planned for Phase 2. For any deployment, verify the live address and bytecode through the official Contracts page rather than assuming a source file is already deployed.
 
 ---
 
@@ -27,9 +30,10 @@ We believe clarity on what is and isn't decentralized matters more than marketin
 
 | Source | Tokens | Mechanism |
 |--------|--------|-----------|
-| LP commissions | token0 + token1 (e.g. WETH + USDC) | Collected during each rebalance, sent from vault to Treasury |
-| Frontend swap commissions | Any ERC-20 | Via DEX aggregator partner fee (`PARTNER_FEE_BPS`, e.g. 0.03%) |
+| LP commissions | token0 + token1 (e.g. WETH + USDC) | Crystallized before value-sensitive share operations and during position maintenance; the protocol share is sent to the pool Treasury |
 | Bounty fund | USDC | Pre-funded by the protocol to pay keeper / deposit / metrics / hedge bounties (see below) |
+
+Frontend swap commissions are documented separately in [`swap/treasury/README.md`](../swap/treasury/README.md).
 
 ---
 
@@ -48,10 +52,10 @@ We believe clarity on what is and isn't decentralized matters more than marketin
 
 ### swapToUSDC()
 
-Converts a configured ERC-20 token held by the Treasury to USDC via the DEX router. This function is **owner-only** (Safe in Phase 1, Timelock governance in Phase 2).
+Converts a configured ERC-20 pool-revenue token held by the Treasury to USDC via the router for that Treasury's DEX protocol and blockchain. This function is **owner-only** (Safe in Phase 1, Timelock governance in Phase 2).
 - Parameters: `tokenIn`, `fee`, `amountIn`, `minAmountOut`.
 - The deployment/onboarding batch records the approved fee tier for each token from the pool `FEE`. The supplied `fee` must match that on-chain value, so the caller cannot select a different route tier.
-- Fee tiers: 100 (0.01%), 500 (0.05%), 3000 (0.3%), 10000 (1%).
+- The current Uniswap V3 implementation supports fee tiers 100 (0.01%), 500 (0.05%), 3000 (0.3%) and 10000 (1%). A Treasury for another protocol uses that protocol's audited route implementation rather than pretending to be Uniswap-compatible.
 - USDC remains in the Treasury after the swap.
 - Useful for consolidating revenue from multiple token types into USDC.
 
@@ -85,7 +89,7 @@ The payment uses a best-effort safety pattern: if a bounty cannot be paid (disab
 
 This guarantees:
 - **No revert** of the action if the bounty cannot be paid
-- **Predictable experience** for community keepers (bounty is best-effort, action is guaranteed)
+- **Predictable payment semantics** for community keepers (the bounty is best-effort; the underlying action may still revert on its own safety or market checks)
 - **Governance safety** — enabling or disabling a bounty cannot lock the underlying permissionless action
 
 ---
