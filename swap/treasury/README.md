@@ -8,12 +8,17 @@ It holds protocol commission revenue only: user deposit principal never passes t
 Main responsibilities:
 
 - hold frontend swap fees received through Velora `partnerAddress`
-- convert configured non-USDC fee tokens to the chain USDC through the owner-only, oracle-bounded `swapToUSDC()` path and its governance-approved fee tier
+- convert configured non-USDC fee tokens to the chain USDC through owner-only, oracle-bounded Velora Augustus calldata
 - bridge USDC permissionlessly to the governed Phase 2 destination through Stargate
 - pay the existing permissionless Bridge Bounty when on-chain cooldown and minimum-ratio conditions are met
 
 Conversion and bridging are intentionally separate: a public keeper cannot choose the sale timing, token amount,
-route fee or slippage for Treasury-held non-USDC revenue. Safe governance in Phase 1, then Timelock governance in
-Phase 2, performs the conversion; keepers can only bridge the available USDC to the destination fixed on-chain.
+route or slippage for Treasury-held non-USDC revenue. Safe governance in Phase 1, then Timelock governance in
+Phase 2, supplies fresh Velora calldata; the contract pins the Augustus target and independently enforces exact
+input spending, its oracle minimum and receipt of canonical USDC by the Treasury. Keepers can only bridge the
+available USDC to the destination fixed on-chain.
+
+The private Safe tooling that prepares these governance transactions explicitly requests a zero partner fee, so
+consolidating already-earned protocol revenue does not charge Liquid Hub's frontend commission a second time.
 
 The public bridge keeper remains in `../bridge/bridge-keeper`. It is the shared keeper for pool and swap treasuries.
