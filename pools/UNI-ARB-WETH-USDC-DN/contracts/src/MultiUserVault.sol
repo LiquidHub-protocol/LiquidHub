@@ -1121,22 +1121,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         return _pendingCount();
     }
 
-    function estimateWithdrawAmounts(address user)
-        external
-        view
-        returns (uint256 amount0, uint256 amount1, uint256 fees0, uint256 fees1)
-    {
-        UserInfo memory info = userInfo[user];
-        if (info.shares == 0 || totalShares == 0) return (0, 0, 0, 0);
-        (uint256 totalToken0, uint256 totalToken1) = rangeManager.getCurrentBalances();
-        // Auto-compound: part proportionnelle du LP (inclut fees compoundees)
-        amount0 = (totalToken0 * info.shares) / totalShares;
-        amount1 = (totalToken1 * info.shares) / totalShares;
-        // Fees nettes comptabilisees: creditees + pending lazy. Les fees NFT non collectees
-        // restent exclues jusqu'a leur cristallisation par collectFeesForVault().
-        (fees0, fees1) = _currentUserFees(user);
-    }
-
     /**
      * @notice Retourne les informations utilisateur avec fees comptables
      * @dev totalFeesEarnedToken0/1 (deja credites) + pendingFees (modele accFeePerShare : shares*acc - debt, pas encore credites)
