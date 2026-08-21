@@ -1,0 +1,17 @@
+{
+  "name": "liquidhub-vault-registry-reference-adapter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Provider-neutral Liquid Hub vault discovery and position valuation reference",
+  "main": "reference-adapter.js",
+  "scripts": {
+    "test": "node --test reference-adapter.test.js ../../deployments.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ethers": "6.17.0"
+  },
+  "license": "SEE LICENSE IN ../../../LICENSE"
+}

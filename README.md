@@ -20,6 +20,7 @@ Two pool types:
 | **SecureBotModule** | Gnosis Safe module whitelisting specific function selectors for automated operations |
 | **Treasury** | Protocol fee collection, keeper / metrics / hedge bounties (+ Phase 2 bridge bounty), admin withdrawals with monthly cap |
 | **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: governed hedge target, permissionless over- and under-hedge correction when on-chain safety checks pass, atomic-rebalance fallback, proportional flash-loan settlement, health-factor monitoring |
+| **LiquidHubVaultRegistry** | Chain-local, read-only vault discovery directory for wallet and portfolio integrations |
 
 ## Directory Structure
 
@@ -33,6 +34,10 @@ pools/
 │   ├── contracts/               # Solidity contracts + AaveHedgeManager
 │   └── keeper-bot/              # Keeper bot + hedge monitoring + regression tests
 │
+registry/                         # Network registries and generic wallet adapter
+├── contracts/                    # LiquidHubVaultRegistry source
+└── adapters/                     # Provider-neutral reader and integration guide
+
 docs/                            # Protocol documentation
 ```
 
@@ -54,6 +59,8 @@ In Phase 1, administrative functions are controlled by the configured Gnosis Saf
 - [TREASURY.md](docs/TREASURY.md) — Treasury rules and monthly cap
 - [KEEPER-GUIDE.md](docs/KEEPER-GUIDE.md) — How to run a keeper
 - [SECURITY.md](docs/SECURITY.md) — Multisig powers and limitations
+- [Vault Registry](registry/README.md) — Per-network vault discovery contract and deployment directory
+- [Wallet Integration Guide](registry/adapters/README.md) — Generic position reader and provider integration contract
 
 ## License
 

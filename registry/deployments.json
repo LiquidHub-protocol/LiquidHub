@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "registries": [
+    {
+      "network": "Arbitrum",
+      "chainId": 42161,
+      "registryAddress": null,
+      "explorerUrl": "https://arbiscan.io",
+      "registryVersion": 1,
+      "status": "pending"
+    },
+    {
+      "network": "Base",
+      "chainId": 8453,
+      "registryAddress": null,
+      "explorerUrl": "https://basescan.org",
+      "registryVersion": 1,
+      "status": "pending"
+    },
+    {
+      "network": "Optimism",
+      "chainId": 10,
+      "registryAddress": null,
+      "explorerUrl": "https://optimistic.etherscan.io",
+      "registryVersion": 1,
+      "status": "pending"
+    },
+    {
+      "network": "Polygon",
+      "chainId": 137,
+      "registryAddress": null,
+      "explorerUrl": "https://polygonscan.com",
+      "registryVersion": 1,
+      "status": "pending"
+    },
+    {
+      "network": "BNB Smart Chain",
+      "chainId": 56,
+      "registryAddress": null,
+      "explorerUrl": "https://bscscan.com",
+      "registryVersion": 1,
+      "status": "pending"
+    },
+    {
+      "network": "Unichain",
+      "chainId": 130,
+      "registryAddress": null,
+      "explorerUrl": "https://uniscan.xyz",
+      "registryVersion": 1,
+      "status": "pending"
+    }
+  ]
+}
