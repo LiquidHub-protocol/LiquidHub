@@ -34,7 +34,7 @@ All contracts from the standard pool are included, plus the hedge manager:
 
 ## Build & verification
 
-- **Compiler**: Solidity 0.8.19 — **Framework**: Foundry — **Settings**: `via_ir = true`, `optimizer_runs = 1` (the DN RangeManager carries the most logic and is close to the EIP-170 size limit, so the optimizer is tuned for size over runtime — fine for low-frequency calls on an L2).
+- **Compiler**: Solidity 0.8.36 — **Framework**: Foundry — **Settings**: `via_ir = true`, `optimizer_runs = 1`, `evm_version = "paris"` (the linked DN libraries and RangeManager remain close to the EIP-170 size limit, so the optimizer is tuned for deployment size over runtime -- appropriate for these low-frequency L2 operations).
 - Each deployed contract is **verified on Arbiscan**: open the address from the Contracts page and check the "Contract" tab to confirm the on-chain bytecode matches this source.
 
 ## Dependencies

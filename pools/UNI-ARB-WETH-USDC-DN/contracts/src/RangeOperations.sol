@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity 0.8.36;
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -30,6 +30,17 @@ library RangeOperations {
     error LiquidityCheck();
     error E70();
     error E_HEDGE_PAUSED();
+    error TwapUnavailable();
+    error InvalidTicks();
+    error SwapChunkAboveCap();
+    error MinOutBelowOracleFloor();
+    error PriceOutsideRange();
+    error SqrtRatioAIsZero();
+    error Uint128Overflow();
+    error SwapTotalAboveLimit();
+    error ZeroDenominator();
+    error E45();
+    error E46();
 
     int24 private constant MIN_TICK = -887272;
     int24 private constant MAX_TICK = 887272;
@@ -221,7 +232,7 @@ library RangeOperations {
             if (tickDelta < 0 && tickDelta % int56(uint56(300)) != 0) twapTick--;
         } catch {
             // Bootstrap uniquement. Des la deuxieme observation, un echec observe() est fail-closed.
-            require(cardinality == 1, "TWAP unavailable");
+            if (cardinality != 1) revert TwapUnavailable();
             twapTick = spotTick;
         }
     }
@@ -290,7 +301,7 @@ library RangeOperations {
         }
 
         // Verification finale : s'assurer que le currentTick est bien dans le range
-        require(tickLower < currentTick && currentTick < tickUpper, "Current tick not in range");
+        if (!(tickLower < currentTick && currentTick < tickUpper)) revert InvalidTicks();
 
         _validateTicks(tickLower, tickUpper, currentTick, tickSpacing);
     }
@@ -385,9 +396,11 @@ library RangeOperations {
         if (initMultiSwapTvl > 0) {
             uint256 priceIn = tokenInIsToken0 ? uint256(pc.price0) : uint256(pc.price1);
             uint256 decIn = tokenInIsToken0 ? cfg.token0Decimals : cfg.token1Decimals;
-            require((amountIn * priceIn) / (10 ** decIn) <= initMultiSwapTvl * 1e8, "chunk>cap");
+            if ((amountIn * priceIn) / (10 ** decIn) > initMultiSwapTvl * 1e8) revert SwapChunkAboveCap();
         }
-        require(minAmountOut >= _oracleMinOut(tokenInIsToken0, amountIn, pc, cfg, cfg.maxSlippageBps), "minOut<floor");
+        if (minAmountOut < oracleMinOut(tokenInIsToken0, amountIn, pc, cfg, cfg.maxSlippageBps)) {
+            revert MinOutBelowOracleFloor();
+        }
     }
 
     /// @notice Détails d'une position (déporté du RangeManager pour le bytecode — audit V1). View pure-logique.
@@ -597,9 +610,9 @@ library RangeOperations {
         ISwapRouter swapRouter,
         uint160 sqrtPriceLimitX96
     ) external returns (uint256 amountOut) {
-        require(amountIn > 0, "E45");
+        if (amountIn == 0) revert E45();
         uint256 balanceBefore = IERC20(tokenIn).balanceOf(contractAddress);
-        require(balanceBefore >= amountIn, "E46");
+        if (balanceBefore < amountIn) revert E46();
 
         amountOut = swapRouter.exactInputSingle(
             ISwapRouter.ExactInputSingleParams({
@@ -627,9 +640,9 @@ library RangeOperations {
         uint24 maxSlippageBps,
         address contractAddress
     ) external {
-        require(liquidityToRemove > 0, "E45");
+        if (liquidityToRemove == 0) revert E45();
         (,,,,,,, uint128 currentLiquidity,,,,) = positionManager.positions(tokenId);
-        require(liquidityToRemove <= currentLiquidity, "E46");
+        if (liquidityToRemove > currentLiquidity) revert E46();
 
         (uint256 amount0Min, uint256 amount1Min) =
             _burnMinAmounts(tokenId, liquidityToRemove, positionManager, pool, maxSlippageBps);
@@ -682,7 +695,7 @@ library RangeOperations {
         uint160 sqrtPriceUpper = getSqrtRatioAtTick(tickUpper);
 
         // Protection overflows
-        require(sqrtPriceX96 > sqrtPriceLower && sqrtPriceX96 < sqrtPriceUpper, "Price out of range");
+        if (!(sqrtPriceX96 > sqrtPriceLower && sqrtPriceX96 < sqrtPriceUpper)) revert PriceOutsideRange();
 
         // Pour une liquidite L donnee, Uniswap V3 utilise:
         // amount0 = L * (1/sqrtPrice - 1/sqrtPriceUpper)
@@ -860,7 +873,7 @@ library RangeOperations {
     // Remplace TickMath.getSqrtRatioAtTick
     function getSqrtRatioAtTick(int24 tick) internal pure returns (uint160 sqrtPriceX96) {
         uint256 absTick = tick < 0 ? uint256(-int256(tick)) : uint256(int256(tick));
-        require(absTick <= 887272, "T");
+        if (absTick > 887272) revert InvalidTicks();
 
         uint256 ratio = absTick & 0x1 != 0 ? 0xfffcb933bd6fad37aa2d162d1a594001 : 0x100000000000000000000000000000000;
         if (absTick & 0x2 != 0) ratio = (ratio * 0xfff97272373d413259a46990580e213a) >> 128;
@@ -895,7 +908,7 @@ library RangeOperations {
     {
         if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
 
-        require(sqrtRatioAX96 > 0, "sqrtRatioA cannot be 0");
+        if (sqrtRatioAX96 == 0) revert SqrtRatioAIsZero();
 
         uint256 numerator = uint256(liquidity) << 96; // L * 2^96
         uint256 part1 = numerator / sqrtRatioAX96;
@@ -1041,14 +1054,13 @@ library RangeOperations {
     }
 
     function _validateTicks(int24 tickLower, int24 tickUpper, int24 currentTick, int24 tickSpacing) private pure {
-        require(tickLower < tickUpper, "RT1");
-        require(
-            _isAlignedToTickSpacing(tickLower, tickSpacing) && _isAlignedToTickSpacing(tickUpper, tickSpacing),
-            "RT2"
-        );
-        require(tickLower >= MIN_TICK && tickUpper <= MAX_TICK, "RT3");
-        require(tickUpper - tickLower >= int24(int256(tickSpacing) * int256(10)), "RT4");
-        require(tickLower >= currentTick - 50000 && tickUpper <= currentTick + 50000, "RT5");
+        if (tickLower >= tickUpper) revert InvalidTicks();
+        if (!(_isAlignedToTickSpacing(tickLower, tickSpacing) && _isAlignedToTickSpacing(tickUpper, tickSpacing))) {
+            revert InvalidTicks();
+        }
+        if (tickLower < MIN_TICK || tickUpper > MAX_TICK) revert InvalidTicks();
+        if (tickUpper - tickLower < int24(int256(tickSpacing) * int256(10))) revert InvalidTicks();
+        if (tickLower < currentTick - 50000 || tickUpper > currentTick + 50000) revert InvalidTicks();
     }
 
     /**
@@ -1105,7 +1117,7 @@ library RangeOperations {
     }
 
     function _safeUint128(uint256 value) private pure returns (uint128) {
-        require(value <= type(uint128).max, "Overflow uint128");
+        if (value > type(uint128).max) revert Uint128Overflow();
         return uint128(value);
     }
 
@@ -1270,18 +1282,7 @@ library RangeOperations {
         PriceCache memory pc,
         RangeConfig memory cfg,
         uint24 slippageBps
-    ) external pure returns (uint256 minOut) {
-        return _oracleMinOut(tokenInIsToken0, amountIn, pc, cfg, slippageBps);
-    }
-
-    /// @dev Helper interne reutilisable par d'autres fonctions de la library.
-    function _oracleMinOut(
-        bool tokenInIsToken0,
-        uint256 amountIn,
-        PriceCache memory pc,
-        RangeConfig memory cfg,
-        uint24 slippageBps
-    ) internal pure returns (uint256 minOut) {
+    ) public pure returns (uint256 minOut) {
         if (amountIn == 0 || !pc.valid || pc.price0 == 0 || pc.price1 == 0) return 0;
         uint256 priceIn = tokenInIsToken0 ? uint256(pc.price0) : uint256(pc.price1);
         uint256 priceOut = tokenInIsToken0 ? uint256(pc.price1) : uint256(pc.price0);
@@ -1294,7 +1295,7 @@ library RangeOperations {
 
     /// @notice Valide qu'un tableau minAmountsOut respecte le plancher oracle (anti-sandwich).
     /// @dev Deportee depuis RangeManager.rebalance() pour rester sous EIP-170. Reverte avec
-    ///      "minOut<floor" si un chunk n'est pas assez restrictif. Sans cette garde, un appelant
+    ///      MinOutBelowOracleFloor si un chunk n'est pas assez restrictif. Sans cette garde, un appelant
     ///      permissionless pouvait passer 0 et se faire sandwicher en MEV (V4 audit). N'execute
     ///      pas les swaps : c'est au caller d'appeler swapRouter (le delegatecall library
     ///      briserait le contexte msg.sender/balance).
@@ -1325,14 +1326,14 @@ library RangeOperations {
             if (amt == 0) continue;
             uint256 chunkUsd = (amt * priceIn) / (10 ** decIn);
             if (initMultiSwapTvl > 0) {
-                require(chunkUsd <= cap, "chunk>cap");
+                if (chunkUsd > cap) revert SwapChunkAboveCap();
             }
             if (maxTotalSwapUsd > 0) {
                 totalSwapUsd += chunkUsd;
-                require(totalSwapUsd <= maxTotalSwapUsd, "swap>tvl");
+                if (totalSwapUsd > maxTotalSwapUsd) revert SwapTotalAboveLimit();
             }
-            uint256 floor = _oracleMinOut(tokenInIsToken0, amt, pc, config, config.maxSlippageBps);
-            require(minAmountsOut[i] >= floor, "minOut<floor");
+            uint256 floor = oracleMinOut(tokenInIsToken0, amt, pc, config, config.maxSlippageBps);
+            if (minAmountsOut[i] < floor) revert MinOutBelowOracleFloor();
         }
     }
 
@@ -1512,7 +1513,7 @@ library RangeOperations {
         // H·r·(1−L) en bps = hr * (10000 − ltvBps) / 10000
         uint256 hrOneMinusL = Math.mulDiv(hr, 10000 - uint256(p.ltvBps), 10000); // bps
         uint256 denBps = uint256(p.ltvBps) + hrOneMinusL; // bps, > 0
-        require(denBps > 0, "den=0");
+        if (denBps == 0) revert ZeroDenominator();
 
         // collateral = numerator / (denBps/10000) = numerator * 10000 / denBps
         collateralUsd = Math.mulDiv(numerator, 10000, denBps);

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity 0.8.36;
 
 /// @title IAaveV3Pool - Minimal interface for AAVE V3 Pool on Arbitrum
 /// @dev Only the functions needed by AaveHedgeManager

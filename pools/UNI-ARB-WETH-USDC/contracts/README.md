@@ -24,7 +24,7 @@ Standard directional Uniswap V3 liquidity management for the WETH/USDC pair on A
 
 ## Build & verification
 
-- **Compiler**: Solidity 0.8.19 — **Framework**: Foundry — **Settings**: `via_ir = true`, `optimizer_runs = 1`
+- **Compiler**: Solidity 0.8.36 — **Framework**: Foundry — **Settings**: `via_ir = true`, `optimizer_runs = 1`, `evm_version = "paris"`
 - Each deployed contract is **verified on Arbiscan**: open the address from the Contracts page and check the "Contract" tab to confirm the on-chain bytecode matches this source.
 
 ## Dependencies

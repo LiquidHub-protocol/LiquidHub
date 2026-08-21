@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity 0.8.36;
 
 /// @notice Bounded circuit breaker. It never holds or moves funds.
 /// @dev Phase 1: Safe is both governance and pause guardian.

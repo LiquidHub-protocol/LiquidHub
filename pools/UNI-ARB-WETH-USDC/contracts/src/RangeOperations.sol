@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity 0.8.36;
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -37,6 +37,17 @@ library RangeOperations {
     using SafeERC20 for IERC20;
 
     error PartialFill();
+    error InvalidTicks();
+    error NoFundsToAdd();
+    error MinOutBelowOracleFloor();
+    error NoTokens();
+    error E45();
+    error E46();
+    error PriceOutsideRange();
+    error SqrtRatioAIsZero();
+    error InvalidSlippage();
+    error Uint128Overflow();
+    error SwapChunkAboveCap();
 
     int24 private constant MIN_TICK = -887272;
     int24 private constant MAX_TICK = 887272;
@@ -270,7 +281,7 @@ library RangeOperations {
         }
 
         // Verification finale : s'assurer que le currentTick est bien dans le range
-        require(tickLower < currentTick && currentTick < tickUpper, "Current tick not in range");
+        if (!(tickLower < currentTick && currentTick < tickUpper)) revert InvalidTicks();
 
         _validateTicks(tickLower, tickUpper, currentTick, tickSpacing);
     }
@@ -339,7 +350,7 @@ library RangeOperations {
         // Approuver et ajouter la liquidité (PAS DE SWAP - fait avant via Velora)
         (uint256 newBalance0, uint256 newBalance1) =
             _approveAndGetBalances(token0, token1, positionManager, contractAddress);
-        require(newBalance0 > 0 || newBalance1 > 0, "No funds to add");
+        if (newBalance0 == 0 && newBalance1 == 0) revert NoFundsToAdd();
 
         return _increaseLiquidity(tokenId, newBalance0, newBalance1, positionManager, sqrtPriceX96, maxSlippageBps);
     }
@@ -386,7 +397,9 @@ library RangeOperations {
         PriceCache memory pc,
         RangeConfig memory cfg
     ) external pure {
-        require(minAmountOut >= _oracleMinOut(tokenInIsToken0, amountIn, pc, cfg, cfg.maxSlippageBps), "minOut<floor");
+        if (minAmountOut < _oracleMinOut(tokenInIsToken0, amountIn, pc, cfg, cfg.maxSlippageBps)) {
+            revert MinOutBelowOracleFloor();
+        }
     }
 
     /// @notice Détails d'une position (déporté du RangeManager pour le bytecode — audit V1). View pure-logique.
@@ -483,7 +496,7 @@ library RangeOperations {
     ) external returns (uint256 tokenId, uint128 liquidity) {
         uint256 balance0 = IERC20(token0).balanceOf(contractAddress);
         uint256 balance1 = IERC20(token1).balanceOf(contractAddress);
-        require(balance0 > 0 || balance1 > 0, "No tokens");
+        if (balance0 == 0 && balance1 == 0) revert NoTokens();
 
         // Reset allowances a zero d'abord
         IERC20(token0).safeApprove(address(positionManager), 0);
@@ -655,9 +668,9 @@ library RangeOperations {
         ISwapRouter swapRouter,
         uint160 sqrtPriceLimitX96
     ) external returns (uint256 amountOut) {
-        require(amountIn > 0, "E45");
+        if (amountIn == 0) revert E45();
         uint256 balanceBefore = IERC20(tokenIn).balanceOf(contractAddress);
-        require(balanceBefore >= amountIn, "E46");
+        if (balanceBefore < amountIn) revert E46();
 
         amountOut = swapRouter.exactInputSingle(
             ISwapRouter.ExactInputSingleParams({
@@ -685,9 +698,9 @@ library RangeOperations {
         uint24 maxSlippageBps,
         address contractAddress
     ) external {
-        require(liquidityToRemove > 0, "E45");
+        if (liquidityToRemove == 0) revert E45();
         (,,,,,,, uint128 currentLiquidity,,,,) = positionManager.positions(tokenId);
-        require(liquidityToRemove <= currentLiquidity, "E46");
+        if (liquidityToRemove > currentLiquidity) revert E46();
 
         (uint256 amount0Min, uint256 amount1Min) =
             _burnMinAmounts(tokenId, liquidityToRemove, positionManager, pool, maxSlippageBps);
@@ -737,7 +750,7 @@ library RangeOperations {
         uint160 sqrtPriceUpper = getSqrtRatioAtTick(tickUpper);
 
         // Protection overflows
-        require(sqrtPriceX96 > sqrtPriceLower && sqrtPriceX96 < sqrtPriceUpper, "Price out of range");
+        if (!(sqrtPriceX96 > sqrtPriceLower && sqrtPriceX96 < sqrtPriceUpper)) revert PriceOutsideRange();
 
         // Pour une liquidite L donnee, Uniswap V3 utilise:
         // amount0 = L * (1/sqrtPrice - 1/sqrtPriceUpper)
@@ -846,7 +859,7 @@ library RangeOperations {
     // Remplace TickMath.getSqrtRatioAtTick
     function getSqrtRatioAtTick(int24 tick) internal pure returns (uint160 sqrtPriceX96) {
         uint256 absTick = tick < 0 ? uint256(-int256(tick)) : uint256(int256(tick));
-        require(absTick <= 887272, "T");
+        if (absTick > 887272) revert InvalidTicks();
 
         uint256 ratio = absTick & 0x1 != 0 ? 0xfffcb933bd6fad37aa2d162d1a594001 : 0x100000000000000000000000000000000;
         if (absTick & 0x2 != 0) ratio = (ratio * 0xfff97272373d413259a46990580e213a) >> 128;
@@ -881,7 +894,7 @@ library RangeOperations {
     {
         if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
 
-        require(sqrtRatioAX96 > 0, "sqrtRatioA cannot be 0");
+        if (sqrtRatioAX96 == 0) revert SqrtRatioAIsZero();
 
         return Math.mulDiv(uint256(liquidity) << 96, sqrtRatioBX96 - sqrtRatioAX96, sqrtRatioBX96) / sqrtRatioAX96;
     }
@@ -987,7 +1000,7 @@ library RangeOperations {
 
     function _minWithSlippage(uint256 amount, uint24 slippageBps) private pure returns (uint256) {
         if (amount == 0) return 0;
-        require(slippageBps < 10000, "bad slippage");
+        if (slippageBps >= 10000) revert InvalidSlippage();
         uint256 slip = uint256(slippageBps);
         uint256 minAmount = Math.mulDiv(amount, 10000 - slip, 10000);
         return minAmount == 0 ? 1 : minAmount;
@@ -1090,14 +1103,13 @@ library RangeOperations {
     }
 
     function _validateTicks(int24 tickLower, int24 tickUpper, int24 currentTick, int24 tickSpacing) private pure {
-        require(tickLower < tickUpper, "RT1");
-        require(
-            _isAlignedToTickSpacing(tickLower, tickSpacing) && _isAlignedToTickSpacing(tickUpper, tickSpacing),
-            "RT2"
-        );
-        require(tickLower >= MIN_TICK && tickUpper <= MAX_TICK, "RT3");
-        require(tickUpper - tickLower >= int24(int256(tickSpacing) * int256(10)), "RT4");
-        require(tickLower >= currentTick - 50000 && tickUpper <= currentTick + 50000, "RT5");
+        if (tickLower >= tickUpper) revert InvalidTicks();
+        if (!(_isAlignedToTickSpacing(tickLower, tickSpacing) && _isAlignedToTickSpacing(tickUpper, tickSpacing))) {
+            revert InvalidTicks();
+        }
+        if (tickLower < MIN_TICK || tickUpper > MAX_TICK) revert InvalidTicks();
+        if (tickUpper - tickLower < int24(int256(tickSpacing) * int256(10))) revert InvalidTicks();
+        if (tickLower < currentTick - 50000 || tickUpper > currentTick + 50000) revert InvalidTicks();
     }
 
     /**
@@ -1154,7 +1166,7 @@ library RangeOperations {
     }
 
     function _safeUint128(uint256 value) private pure returns (uint128) {
-        require(value <= type(uint128).max, "Overflow uint128");
+        if (value > type(uint128).max) revert Uint128Overflow();
         return uint128(value);
     }
 
@@ -1331,7 +1343,7 @@ library RangeOperations {
 
     /// @notice Valide qu'un tableau minAmountsOut respecte le plancher oracle (anti-sandwich).
     /// @dev Deportee depuis RangeManager.rebalance() pour rester sous EIP-170 et reutilisable
-    ///      par processDepositPermissionless. Reverte avec "minOut<floor" si un chunk n'est pas
+    ///      par processDepositPermissionless. Reverte avec MinOutBelowOracleFloor si un chunk n'est pas
     ///      assez restrictif. Sans cette garde, un appelant permissionless pouvait passer 0 et
     ///      se faire sandwicher en MEV (V4 audit). N'execute pas les swaps : c'est au caller
     ///      d'appeler swapRouter (le delegatecall library briserait le contexte msg.sender/balance).
@@ -1357,11 +1369,11 @@ library RangeOperations {
             if (amt == 0) continue;
             uint256 swapUsd = (amt * priceIn) / (10 ** decIn);
             if (initMultiSwapTvl > 0) {
-                require(swapUsd <= cap, "chunk>cap");
+                if (swapUsd > cap) revert SwapChunkAboveCap();
             }
             totalSwapUsd += swapUsd;
             uint256 floor = _oracleMinOut(tokenInIsToken0, amt, pc, config, config.maxSlippageBps);
-            require(minAmountsOut[i] >= floor, "minOut<floor");
+            if (minAmountsOut[i] < floor) revert MinOutBelowOracleFloor();
         }
     }
 

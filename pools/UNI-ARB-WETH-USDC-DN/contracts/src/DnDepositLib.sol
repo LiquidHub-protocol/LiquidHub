@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity 0.8.36;
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -154,6 +154,10 @@ library DnDepositLib {
     error InsufficientCollateral();
     error PreAdjustRequired();
     error InvalidSwapPlan();
+    error BadOracle();
+    error LpPriceDeviation();
+    error LpTwapDeviation();
+    error SqrtRatioAIsZero();
 
     /// @notice Exact debt-token amount to repay through the existing flash-loan path when HF is below target.
     /// @dev Solves the repay-first equation while accounting for the collateral needed to buy back the flash
@@ -442,43 +446,45 @@ library DnDepositLib {
     ) external view {
         if (swapAmountsIn.length != minAmountsOut.length) revert InvalidSwapPlan();
         IRmDep rm = IRmDep(rangeManager);
-        address token0 = rm.token0();
-        address token1 = rm.token1();
-        bool tokenInIsToken0 = tokenIn == token0;
         (bool expectedZeroForOne, uint256 expectedAmountIn) =
             _depositSwapParams(rangeManager, depositAmount0, depositAmount1);
-        uint256 n = swapAmountsIn.length;
-        uint256 totalSwapIn;
-        uint16 toleranceBps;
-        if (n > 0) {
-            if (!((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0))) {
-                revert InvalidSwapPlan();
-            }
-            (uint128 price0, uint128 price1,,, uint64 ts, bool valid) = rm.priceCache();
-            if (!valid || price0 == 0 || price1 == 0) revert InvalidSwapPlan();
-            (, uint8 dec0, uint8 dec1, uint16 tol, uint24 slip,,,,,) = rm.config();
-            toleranceBps = tol;
-            RangeOperations.PriceCache memory pc = RangeOperations.PriceCache(price0, price1, 0, 0, ts, valid);
-            RangeOperations.RangeConfig memory cfg =
-                RangeOperations.RangeConfig(0, dec0, dec1, tol, slip, 0, true, 0, 0, 1);
-            uint256 chunkCapUsd = rm.initMultiSwapTvl() * 1e8;
-            uint256 priceInUsd = tokenInIsToken0 ? uint256(price0) : uint256(price1);
-            uint256 decIn = tokenInIsToken0 ? dec0 : dec1;
-            uint256 totalSwapUsd;
-            for (uint256 i; i < n; ++i) {
-                uint256 amt = swapAmountsIn[i];
-                totalSwapIn += amt;
-                uint256 chunkUsd = (amt * priceInUsd) / (10 ** decIn);
-                if (chunkCapUsd > 0 && chunkUsd > chunkCapUsd) revert InvalidSwapPlan();
-                totalSwapUsd += chunkUsd;
-                if (maxTotalSwapUsd > 0 && totalSwapUsd > maxTotalSwapUsd) revert InvalidSwapPlan();
-                uint256 floor = RangeOperations.oracleMinOut(tokenInIsToken0, amt, pc, cfg, slip);
-                if (minAmountsOut[i] < floor) revert InvalidSwapPlan();
-            }
-        } else {
-            (,,, toleranceBps,,,,,,) = rm.config();
-        }
+        (uint256 totalSwapIn, uint16 toleranceBps, bool tokenInIsToken0) =
+            _validateDepositSwapChunks(rm, swapAmountsIn, minAmountsOut, tokenIn, tokenOut, maxTotalSwapUsd);
         _requireSwapPlan(expectedAmountIn, expectedZeroForOne, tokenInIsToken0, totalSwapIn, toleranceBps);
+    }
+
+    function _validateDepositSwapChunks(
+        IRmDep rm,
+        uint256[] calldata swapAmountsIn,
+        uint256[] calldata minAmountsOut,
+        address tokenIn,
+        address tokenOut,
+        uint256 maxTotalSwapUsd
+    ) private view returns (uint256 totalSwapIn, uint16 toleranceBps, bool tokenInIsToken0) {
+        address token0 = rm.token0();
+        address token1 = rm.token1();
+        tokenInIsToken0 = tokenIn == token0;
+        uint256 n = swapAmountsIn.length;
+        if (n == 0) {
+            (,,, toleranceBps,,,,,,) = rm.config();
+            return (0, toleranceBps, tokenInIsToken0);
+        }
+        if (!((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0))) {
+            revert InvalidSwapPlan();
+        }
+
+        (uint128 price0, uint128 price1,,, uint64 ts, bool valid) = rm.priceCache();
+        if (!valid || price0 == 0 || price1 == 0) revert InvalidSwapPlan();
+        (, uint8 dec0, uint8 dec1, uint16 tol, uint24 slip,,,,,) = rm.config();
+        toleranceBps = tol;
+        RangeOperations.PriceCache memory pc = RangeOperations.PriceCache(price0, price1, 0, 0, ts, valid);
+        RangeOperations.RangeConfig memory cfg = RangeOperations.RangeConfig(0, dec0, dec1, tol, slip, 0, true, 0, 0, 1);
+        RangeOperations.validateMinOutsAgainstOracle(
+            tokenInIsToken0, swapAmountsIn, minAmountsOut, pc, cfg, rm.initMultiSwapTvl(), maxTotalSwapUsd
+        );
+        for (uint256 i; i < n; ++i) {
+            totalSwapIn += swapAmountsIn[i];
+        }
     }
 
     function aaveHfSafeSwapBudget(
@@ -882,17 +888,17 @@ library DnDepositLib {
         uint256 poolPrice = Math.mulDiv(poolRaw, 10 ** volatileDecimals, 10 ** stableDecimals);
 
         (uint128 price0, uint128 price1,,,, bool valid) = IRmDep(rangeManager).priceCache();
-        require(valid && price0 > 0 && price1 > 0, "Bad oracle");
+        if (!(valid && price0 > 0 && price1 > 0)) revert BadOracle();
         uint256 oraclePrice = Math.mulDiv(uint256(price0), 1e18, uint256(price1));
 
         uint256 diff = poolPrice > oraclePrice ? poolPrice - oraclePrice : oraclePrice - poolPrice;
-        require((diff * 10000) / oraclePrice <= maxHedgeDeviationBps, "LP price deviation");
+        if ((diff * 10000) / oraclePrice > maxHedgeDeviationBps) revert LpPriceDeviation();
 
         (bool twapEnabled,,, uint16 twapBps,,,) = IRmDep(rangeManager).protectionConfig();
         if (twapEnabled) {
             int24 twapTick = RangeOperations.trustedTwapTick(lpPool);
             int24 tickDiff = currentTick > twapTick ? currentTick - twapTick : twapTick - currentTick;
-            require(uint24(tickDiff) <= uint24(twapBps), "LP TWAP");
+            if (uint24(tickDiff) > uint24(twapBps)) revert LpTwapDeviation();
         }
     }
 
@@ -922,10 +928,10 @@ library DnDepositLib {
         bool zeroForOne
     ) external view returns (uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) {
         (uint128 price0, uint128 price1, uint160 sqrtP,,, bool valid) = IRmDep(rangeManager).priceCache();
-        require(valid && price0 > 0 && price1 > 0 && sqrtP > 0, "Bad oracle");
+        if (!(valid && price0 > 0 && price1 > 0 && sqrtP > 0)) revert BadOracle();
         uint256 theoretical = Math.mulDiv(amount0In, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0));
         amountOutMinimum = Math.mulDiv(theoretical, 10000 - uint256(slippageBps), 10000);
-        require(amountOutMinimum > 0, "Bad oracle");
+        if (amountOutMinimum == 0) revert BadOracle();
         sqrtPriceLimitX96 = uint160(
             (uint256(sqrtP) * (zeroForOne ? 20000 - uint256(slippageBps) : 20000 + uint256(slippageBps))) / 20000
         );
@@ -944,11 +950,13 @@ library DnDepositLib {
         // This exact-output repayment path may bypass only the spot/TWAP validity bit produced by a refresh
         // in THIS transaction. Invalid/stale feeds return zero values and cannot pass; the Chainlink max-in
         // and full-fill post-check still bound every settlement and HF repair.
-        require((valid || timestamp == uint64(block.timestamp)) && price0 > 0 && price1 > 0 && sqrtP > 0, "Bad oracle");
+        if (!((valid || timestamp == uint64(block.timestamp)) && price0 > 0 && price1 > 0 && sqrtP > 0)) {
+            revert BadOracle();
+        }
         uint256 theoretical =
             Math.mulDiv(amount0Out, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0), Math.Rounding.Up);
         amountInMaximum = Math.mulDiv(theoretical, 10000 + uint256(slippageBps), 10000, Math.Rounding.Up);
-        require(amountInMaximum > 0, "Bad oracle");
+        if (amountInMaximum == 0) revert BadOracle();
         sqrtPriceLimitX96 = uint160(
             (uint256(sqrtP) * (zeroForOne ? 20000 - uint256(slippageBps) : 20000 + uint256(slippageBps))) / 20000
         );
@@ -972,7 +980,7 @@ library DnDepositLib {
         returns (uint256 amount0)
     {
         if (sqrtRatioAX96 > sqrtRatioBX96) (sqrtRatioAX96, sqrtRatioBX96) = (sqrtRatioBX96, sqrtRatioAX96);
-        require(sqrtRatioAX96 > 0, "sqrtA=0");
+        if (sqrtRatioAX96 == 0) revert SqrtRatioAIsZero();
         uint256 numerator = uint256(liquidity) << 96;
         return (numerator / uint256(sqrtRatioAX96)) - (numerator / uint256(sqrtRatioBX96));
     }

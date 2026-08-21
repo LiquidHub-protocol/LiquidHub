@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity 0.8.36;
 
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
 import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
@@ -45,6 +45,27 @@ interface IMultiUserVault {
 contract RangeManager is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using RangeOperations for *;
+
+    error E01();
+    error E03();
+    error E04();
+    error E06();
+    error E07();
+    error E13();
+    error E15();
+    error E16();
+    error E17();
+    error E18();
+    error E19();
+    error E20();
+    error E21();
+    error E38();
+    error E40();
+    error E44();
+    error E45();
+    error E46();
+    error E94();
+    error E99();
 
     uint256 private constant MAX_UINT128 = type(uint128).max;
     uint256 private constant MIN_REBALANCE_INTERVAL = 300;
@@ -131,7 +152,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * mais les reglages de gouvernance passent par onlyVaultOwner.
      */
     modifier onlyAuthorized() {
-        require(msg.sender == owner() || authorizedExecutors[msg.sender], "E99");
+        if (!(msg.sender == owner() || authorizedExecutors[msg.sender])) revert E99();
         _;
     }
 
@@ -140,7 +161,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * Utilise pour les fonctions de gestion des autorisations
      */
     modifier onlyVaultOwner() {
-        require(msg.sender == owner(), "E01");
+        if (msg.sender != owner()) revert E01();
         _;
     }
 
@@ -148,28 +169,29 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // Failure counters are informational only: state changes made before a revert are rolled back by the EVM.
         // Liveness must rely on the bot/module watchdog, oracle/deviation checks and Safe intervention.
         if (protectionConfig.mevProtectionEnabled) {
-            require(block.timestamp - config.lastRebalanceTime >= MIN_REBALANCE_INTERVAL, "E03");
+            if (block.timestamp - config.lastRebalanceTime < MIN_REBALANCE_INTERVAL) revert E03();
         }
-        require(config.oraclesConfigured, "E04");
+        if (!config.oraclesConfigured) revert E04();
         _;
     }
 
     modifier maxPositionsCheck() {
-        require(positionCount < config.maxPositions, "E06");
+        if (positionCount >= config.maxPositions) revert E06();
         _;
     }
 
     modifier onlyVault() {
-        require(msg.sender == vault, "E07");
+        if (msg.sender != vault) revert E07();
         _;
     }
 
     modifier onlyVaultOrAuthorized() {
-        require(
-            msg.sender == address(this) || msg.sender == vault || msg.sender == owner()
-                || authorizedExecutors[msg.sender],
-            "E94"
-        );
+        if (
+            !(
+                msg.sender == address(this) || msg.sender == vault || msg.sender == owner()
+                    || authorizedExecutors[msg.sender]
+            )
+        ) revert E94();
         _;
     }
 
@@ -262,7 +284,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * @param _safe L'adresse de la Safe
      */
     function setSafeAddress(address _safe) external onlyVaultOwner {
-        require(_safe != address(0), "E13");
+        if (_safe == address(0)) revert E13();
         safeAddress = _safe;
         emit SafeAddressSet(_safe);
     }
@@ -276,8 +298,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
      *      Les autorisations operationnelles passent par le Vault owner (Safe en Phase 1, Timelock en Phase 2).
      */
     function setAuthorizedExecutor(address _executor, bool _authorized) external {
-        require(_executor != address(0), "E15");
-        require(msg.sender == owner(), "E16");
+        if (_executor == address(0)) revert E15();
+        if (msg.sender != owner()) revert E16();
         authorizedExecutors[_executor] = _authorized;
         emit ExecutorAuthorized(_executor, _authorized);
     }
@@ -294,9 +316,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     function configureRanges(uint16 _rangeUpPercent, uint16 _rangeDownPercent) external onlyVaultOwner {
-        require(_rangeUpPercent >= 10 && _rangeUpPercent <= 5000, "E17");
-        require(_rangeDownPercent >= 10 && _rangeDownPercent <= 5000, "E18");
-        require(uint256(_rangeUpPercent) + _rangeDownPercent >= _minTotalRangeBps(), "E40");
+        if (_rangeUpPercent < 10 || _rangeUpPercent > 5000) revert E17();
+        if (_rangeDownPercent < 10 || _rangeDownPercent > 5000) revert E18();
+        if (uint256(_rangeUpPercent) + _rangeDownPercent < _minTotalRangeBps()) revert E40();
 
         config.rangeUpPercent = _rangeUpPercent;
         config.rangeDownPercent = _rangeDownPercent;
@@ -315,14 +337,15 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint16 _rangeMinBps,
         uint16 _rangeMaxBps
     ) external onlyVaultOwner {
-        require(
-            _maxSnapshotsPerDay >= 1 && _maxSnapshotsPerDay <= 24 && _volatMoyDay >= 1 && _volatMoyDay <= 20
-                && uint16(_volatTrimDay) * 2 + 2 <= uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay)
-                && _rangeStepBps >= 10 && _rangeStepBps <= 1000 && _rangeMultiplicatorBps >= 5000
-                && _rangeMultiplicatorBps <= 30000 && _rangeMinBps >= 10 && _rangeMinBps <= _rangeMaxBps
-                && _rangeMaxBps <= 5000 && uint256(_rangeMinBps) * 2 >= _minTotalRangeBps(),
-            "E40"
-        );
+        if (
+            !(
+                _maxSnapshotsPerDay >= 1 && _maxSnapshotsPerDay <= 24 && _volatMoyDay >= 1 && _volatMoyDay <= 20
+                    && uint16(_volatTrimDay) * 2 + 2 <= uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay)
+                    && _rangeStepBps >= 10 && _rangeStepBps <= 1000 && _rangeMultiplicatorBps >= 5000
+                    && _rangeMultiplicatorBps <= 30000 && _rangeMinBps >= 10 && _rangeMinBps <= _rangeMaxBps
+                    && _rangeMaxBps <= 5000 && uint256(_rangeMinBps) * 2 >= _minTotalRangeBps()
+            )
+        ) revert E40();
         _ringCap = uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay);
         dynRangeConfig.dynamicRangeEnabled = _enabled;
         dynRangeConfig.maxSnapshotsPerDay = _maxSnapshotsPerDay;
@@ -352,7 +375,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     function setRangeMultiplicator(uint16 _rangeMultiplicatorBps) external onlyVaultOwner {
-        require(_rangeMultiplicatorBps >= 5000 && _rangeMultiplicatorBps <= 30000, "E44");
+        if (_rangeMultiplicatorBps < 5000 || _rangeMultiplicatorBps > 30000) revert E44();
         dynRangeConfig.rangeMultiplicatorBps = _rangeMultiplicatorBps;
     }
 
@@ -363,13 +386,13 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /// @notice Enregistre le ratio oracle token0/token1 normalise en 8 decimales et verse le metrics bounty.
     function recordPriceSnapshot() external nonReentrant {
-        require(dynRangeConfig.dynamicRangeEnabled, "E45");
-        require(RangeOperations.isSnapshotDue(dynRangeConfig, uint64(block.timestamp)), "E46");
+        if (!dynRangeConfig.dynamicRangeEnabled) revert E45();
+        if (!RangeOperations.isSnapshotDue(dynRangeConfig, uint64(block.timestamp))) revert E46();
 
         _updatePriceCache();
-        require(priceCache.valid && priceCache.price0 > 0 && priceCache.price1 > 0, "E38");
+        if (!(priceCache.valid && priceCache.price0 > 0 && priceCache.price1 > 0)) revert E38();
         uint256 pairPriceRaw = (uint256(priceCache.price0) * 1e8) / uint256(priceCache.price1);
-        require(pairPriceRaw > 0 && pairPriceRaw <= type(uint128).max, "E38");
+        if (pairPriceRaw == 0 || pairPriceRaw > type(uint128).max) revert E38();
         uint128 pairPrice = uint128(pairPriceRaw);
 
         _ringHead = RangeOperations.writeRing(
@@ -396,12 +419,12 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     function configureSlippage(uint24 _maxSlippageBps) external onlyVaultOwner {
-        require(_maxSlippageBps >= 50 && _maxSlippageBps <= 500, "E19");
+        if (_maxSlippageBps < 50 || _maxSlippageBps > 500) revert E19();
         config.maxSlippageBps = _maxSlippageBps;
     }
 
     function configureTolerance(uint16 _toleranceBps) external onlyVaultOwner {
-        require(_toleranceBps <= 1000, "E20");
+        if (_toleranceBps > 1000) revert E20();
 
         uint16 oldTolerance = config.toleranceBps;
         config.toleranceBps = _toleranceBps;
@@ -417,8 +440,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
     ) external onlyVaultOwner {
         // Historical field names kept for ABI/storage compatibility:
         // sandwichDetectionEnabled = spot/TWAP guard enabled, sandwichThresholdBps = max TWAP tick drift.
-        require(_maxTwapDeviationBps <= 1000, "E21");
-        require(!_twapGuardEnabled || _maxTwapDeviationBps > 0, "E21");
+        if (_maxTwapDeviationBps > 1000) revert E21();
+        if (_twapGuardEnabled && _maxTwapDeviationBps == 0) revert E21();
 
         protectionConfig.sandwichDetectionEnabled = _twapGuardEnabled;
         protectionConfig.mevProtectionEnabled = _mevProtection;
@@ -430,8 +453,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
     /// @dev Gouvernance via Vault owner (Safe phase 1, Timelock phase 2). Le garde pool/oracle ne peut pas être
     ///      désactivé : la NAV oracle du BotModule utilise le sqrt spot borné comme seed. Heartbeats 1h-48h.
     function setOracleParams(uint16 _maxOracleDeviationBps, uint32 _maxAge0, uint32 _maxAge1) external onlyVaultOwner {
-        require(_maxOracleDeviationBps > 0 && _maxOracleDeviationBps <= 1000, "E21"); // 0 < déviation <=10%
-        require(_maxAge0 >= 3600 && _maxAge0 <= 172800 && _maxAge1 >= 3600 && _maxAge1 <= 172800, "E20"); // 1h-48h
+        if (_maxOracleDeviationBps == 0 || _maxOracleDeviationBps > 1000) revert E21();
+        if (_maxAge0 < 3600 || _maxAge0 > 172800 || _maxAge1 < 3600 || _maxAge1 > 172800) revert E20();
         protectionConfig.maxOracleDeviationBps = _maxOracleDeviationBps;
         protectionConfig.maxAge0 = _maxAge0;
         protectionConfig.maxAge1 = _maxAge1;
@@ -1043,7 +1066,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         if (n > 0) {
             require((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0), "E43");
             // Validation (chunk cap + plancher oracle anti-sandwich V4) deportee en library
-            // pour rester sous EIP-170. Reverte sur chunk>cap ou minOut<floor. Sans ce plancher,
+            // pour rester sous EIP-170. Reverte sur SwapChunkAboveCap ou MinOutBelowOracleFloor. Sans ce plancher,
             // un appelant permissionless pouvait passer minAmountsOut[i] = 0 et se faire sandwicher.
             uint256 totalSwapUsd = RangeOperations.validateMinOutsAgainstOracle(
                 tokenIn == token0, swapAmountsIn, minAmountsOut, priceCache, config, initMultiSwapTvl

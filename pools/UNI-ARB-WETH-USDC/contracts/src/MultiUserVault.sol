@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity 0.8.36;
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -773,14 +773,13 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         // Mise à jour fees avant calculs (regle sur l'ancien solde de shares, fige la dette).
         _updateUserFees(msg.sender);
-        _handleUnclaimedFeesOnWithdraw(user, shareAmount);
+        _handleUnclaimedFeesOnWithdraw();
 
         // Calculer montants pour le retrait (commission = 0, deja au Treasury)
-        (uint256 commission0, uint256 commission1, uint256 principal0, uint256 principal1) =
-            _calculateWithdrawAmounts(shareAmount, totalSharesBefore);
+        (uint256 principal0, uint256 principal1) = _calculateWithdrawAmounts(shareAmount, totalSharesBefore);
 
         // ===== EFFECTS =====
-        _finalizeWithdrawal(user, shareAmount, commission0, commission1, principal0, principal1);
+        _finalizeWithdrawal(user, shareAmount);
 
         // ===== INTERACTIONS =====
         (uint256 toSend0, uint256 toSend1) =
@@ -1141,7 +1140,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice Collecte les fees non reclamees avant un retrait
      * @dev Commission deduite dans le RangeManager → Treasury. Fees nettes restent sur le RM.
      */
-    function _handleUnclaimedFeesOnWithdraw(UserInfo storage, /* user */ uint256 /* shareAmount */ ) private {
+    function _handleUnclaimedFeesOnWithdraw() private {
         uint256[] memory positions = rangeManager.getOwnerPositions();
         if (positions.length == 0) return;
         rangeManager.collectFeesForVault();
@@ -1154,11 +1153,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     function _calculateWithdrawAmounts(uint256 shareAmount, uint256 totalSharesBefore)
         private
         view
-        returns (uint256 commission0, uint256 commission1, uint256 principal0, uint256 principal1)
+        returns (uint256 principal0, uint256 principal1)
     {
         (uint256 totalToken0, uint256 totalToken1) = rangeManager.getCurrentBalances();
-        commission0 = 0;
-        commission1 = 0;
         principal0 = (totalToken0 * shareAmount) / totalSharesBefore;
         principal1 = (totalToken1 * shareAmount) / totalSharesBefore;
     }
@@ -1198,9 +1195,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     /**
      * @notice Finalise le retrait en mettant à jour l'état
      */
-    function _finalizeWithdrawal(UserInfo storage user, uint256 shareAmount, uint256, uint256, uint256, uint256)
-        private
-    {
+    function _finalizeWithdrawal(UserInfo storage user, uint256 shareAmount) private {
         // audit V1 (M3-B-fix) : modele accFeePerShare -> plus de time-weighted global a maintenir.
         _updateUserStateAfterWithdrawal(user, shareAmount);
         totalShares -= shareAmount;

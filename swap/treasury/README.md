@@ -2,6 +2,9 @@
 
 This folder exposes the dedicated frontend swap-fee treasury contract for public audit.
 
+The published source is compiled for deployment with Solidity 0.8.36, the Paris
+EVM target, `via_ir = true` and 200 optimizer runs.
+
 Official deployment addresses for every network are published on the
 [Liquid Hub Contracts page](https://liquidhub.app/docs#contracts-addresses); never infer an address from this
 source directory.
