@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
 
 import "openzeppelin-contracts/contracts/access/Ownable2Step.sol";

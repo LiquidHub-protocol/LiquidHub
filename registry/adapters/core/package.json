@@ -13,5 +13,5 @@
   "dependencies": {
     "ethers": "6.17.0"
   },
-  "license": "SEE LICENSE IN ../../../LICENSE"
+  "license": "BUSL-1.1"
 }
