@@ -1,6 +1,6 @@
 # UNI-ARB-WETH-USDC Contracts (Standard Pool)
 
-> **Public audit source — do not deploy it as a community keeper.** Keeper bots connect to the protocol's official
+> **Public audit source.** Community keeper bots connect to the protocol's official
 > **Arbitrum** deployment (chainId `42161`), whose current addresses are listed on the Contracts page:
 > **https://liquidhub.app/docs#contracts-addresses**.
 >
@@ -32,3 +32,10 @@ Standard directional Uniswap V3 liquidity management for the WETH/USDC pair on A
 - [OpenZeppelin Contracts](https://github.com/OpenZeppelin/openzeppelin-contracts)
 - [Uniswap V3 Core](https://github.com/Uniswap/v3-core)
 - [Uniswap V3 Periphery](https://github.com/Uniswap/v3-periphery)
+
+## License
+
+Files carrying `SPDX-License-Identifier: BUSL-1.1` are source-available under the repository
+[Business Source License](../../../LICENSE). Production software may freely interact with the official deployments,
+but the protected contracts may not be copied or redeployed in production before **2028-08-21**. They become
+`GPL-2.0-or-later` on that date. Separately marked interfaces, scripts and tests retain their stated licenses.

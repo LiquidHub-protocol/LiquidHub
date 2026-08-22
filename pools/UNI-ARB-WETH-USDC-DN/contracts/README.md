@@ -1,6 +1,6 @@
 # UNI-ARB-WETH-USDC-DN Contracts (Delta Neutral Pool)
 
-> **Public audit source — do not deploy it as a community keeper.** Keeper bots connect to the protocol's official
+> **Public audit source.** Community keeper bots connect to the protocol's official
 > **Arbitrum** deployment (chainId `42161`), whose current addresses are listed on the Contracts page:
 > **https://liquidhub.app/docs#contracts-addresses**.
 >
@@ -47,3 +47,11 @@ All contracts from the standard pool are included, plus the hedge manager:
 ## Key Difference from Standard Pool
 
 The standard pool's `MultiUserVault` handles deposits and withdrawals directly against the Uniswap V3 position. In the delta neutral variant, the vault coordinates with `AaveHedgeManager` to atomically unwind both the LP position and the AAVE hedge during withdrawals. This ensures users receive their fair share of both LP assets and hedge collateral in a single transaction, using flash loans and Uniswap V3 swaps when necessary to cover any WETH shortfall.
+
+## License
+
+Files carrying `SPDX-License-Identifier: BUSL-1.1` are source-available under the repository
+[Business Source License](../../../LICENSE). Production software may freely interact with the official deployments,
+but the protected contracts may not be copied or redeployed in production before **2028-08-21**. They become
+`GPL-2.0-or-later` on that date. The Aave interface and separately marked scripts and tests retain their stated MIT
+license.

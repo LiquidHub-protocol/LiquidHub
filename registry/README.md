@@ -125,4 +125,7 @@ versions instead of decoding them as version 1.
 
 ## License
 
-This source is distributed under the repository's [Business Source License 1.1](../LICENSE).
+The registry and its adapters are distributed under the repository [MIT License](../LICENSE-MIT). They may be used,
+modified, redistributed and deployed in production without permission from Liquid Hub. This permissive license is
+intentional: wallets and indexers must be able to integrate every official network registry without a licensing
+dependency on the protected strategy contracts.

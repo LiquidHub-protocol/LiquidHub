@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');

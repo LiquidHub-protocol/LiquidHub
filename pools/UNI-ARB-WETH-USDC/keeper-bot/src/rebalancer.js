@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 const USD_SCALE = 100_000_000n;
 
 function ceilDiv(value, divisor) {

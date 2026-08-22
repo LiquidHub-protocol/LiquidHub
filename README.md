@@ -6,8 +6,9 @@ Decentralized liquidity management protocol.
 
 Liquid Hub automates range management: **dynamic ranges computed 100% on-chain**, permissionless rebalancing, multi-user vaults with fair share accounting, and protocol fee collection via an on-chain Treasury. It runs on concentrated-liquidity DEXs; the architecture is DEX-agnostic, and each deployed pool documents the specific DEX it targets in its own folder.
 
-Two pool types:
-- **Standard** — Directional LP exposure on a concentrated-liquidity DEX
+3 pool types:
+- **Exposed** — Directional LP exposure on a concentrated-liquidity DEX
+- **Stable** — Stable LP exposure on a concentrated-liquidity DEX
 - **Delta Neutral (DN)** — LP exposure hedged via AAVE V3 (supply USDC collateral, borrow WETH), with a permissionless on-chain hedge rebalance (`adjustHedge()`)
 
 ## Architecture
@@ -26,13 +27,15 @@ Two pool types:
 
 ```
 pools/
-├── UNI-ARB-WETH-USDC/          # Standard pool (WETH/USDC, Arbitrum)
+├── UNI-ARB-WETH-USDC/          # Exposed pool (WETH/USDC, Arbitrum)
 │   ├── contracts/               # Solidity contracts
 │   └── keeper-bot/              # Keeper bot, including public regression tests
 │
 ├── UNI-ARB-WETH-USDC-DN/       # Delta Neutral pool (WETH/USDC, Arbitrum)
 │   ├── contracts/               # Solidity contracts + AaveHedgeManager
 │   └── keeper-bot/              # Keeper bot + hedge monitoring + regression tests
+│
+├── ... OTHER POOLS
 │
 registry/                         # Network registries and generic wallet adapter
 ├── contracts/                    # LiquidHubVaultRegistry source
@@ -55,7 +58,7 @@ In Phase 1, administrative functions are controlled by the configured Gnosis Saf
 
 ## Documentation
 
-- [PROTOCOL.md](docs/PROTOCOL.md) — How the protocol works (standard + DN)
+- [PROTOCOL.md](docs/PROTOCOL.md) — How the protocol works (exposed + DN)
 - [TREASURY.md](docs/TREASURY.md) — Treasury rules and monthly cap
 - [KEEPER-GUIDE.md](docs/KEEPER-GUIDE.md) — How to run a keeper
 - [SECURITY.md](docs/SECURITY.md) — Multisig powers and limitations
@@ -64,4 +67,14 @@ In Phase 1, administrative functions are controlled by the configured Gnosis Saf
 
 ## License
 
-[Business Source License 1.1](LICENSE)
+Liquid Hub uses a split license so public integrations remain permissionless while the core contract implementation
+is protected against production clones for two years:
+
+- **Core strategy contracts and SwapTreasury**: [BUSL-1.1](LICENSE) until **2028-08-21**, then
+  `GPL-2.0-or-later`. Production software may freely interact with the official deployments, but copies and
+  derivatives of the protected contracts may not be deployed in production before the change date.
+- **Community keepers, bridge keeper, vault registry, wallet/indexer adapters, interfaces, scripts and tests**:
+  [MIT](LICENSE-MIT), including unrestricted production use.
+
+See [LICENSING.md](LICENSING.md) for the precise file-level policy. Neither license grants rights to the Liquid Hub
+name or branding.

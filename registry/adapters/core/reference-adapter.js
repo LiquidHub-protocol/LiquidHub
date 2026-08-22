@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 'use strict';
 
 const { ethers } = require('ethers');

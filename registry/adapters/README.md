@@ -126,3 +126,8 @@ actually requires, such as:
 
 The registry and adapter make Liquid Hub positions discoverable and computable. Display, protocol attribution and
 inclusion in a wallet's total USD balance begin only after that provider accepts and deploys the integration.
+
+## License
+
+The registry adapters are released under the repository [MIT License](../../LICENSE-MIT) and may be integrated,
+modified and operated in production without permission from Liquid Hub.

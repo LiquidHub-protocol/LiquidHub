@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 'use strict';
 
 const assert = require('node:assert/strict');

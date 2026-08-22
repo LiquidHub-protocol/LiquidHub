@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 const USD_SCALE = 100_000_000n;
 const DN_MAX_DEPOSIT_SWAP_CHUNKS = 10n;
 

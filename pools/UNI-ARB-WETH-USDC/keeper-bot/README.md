@@ -173,4 +173,6 @@ keeper-bot/
 
 ## License
 
-BUSL-1.1
+[MIT](../../../LICENSE-MIT). This reference keeper may be used, modified, redistributed and operated in production
+without permission from Liquid Hub. It connects only to guarded, permissionless functions exposed by the official
+contracts.

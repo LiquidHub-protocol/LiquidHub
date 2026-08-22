@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 const { ethers } = require('ethers');
 const crypto = require('node:crypto');
 const fs = require('node:fs');

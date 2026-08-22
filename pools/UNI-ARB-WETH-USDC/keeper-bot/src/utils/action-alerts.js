@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 const fs = require('fs/promises');
 const path = require('path');
 

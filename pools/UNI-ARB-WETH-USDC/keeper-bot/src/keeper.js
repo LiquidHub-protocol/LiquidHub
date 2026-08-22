@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 
 const { ethers } = require('ethers');

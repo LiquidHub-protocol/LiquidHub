@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 const { ethers } = require('ethers');
 
 // RangeManager ABI (only functions needed by keeper)

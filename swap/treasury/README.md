@@ -29,3 +29,10 @@ The private Safe tooling that prepares these governance transactions explicitly 
 consolidating already-earned protocol revenue does not charge Liquid Hub's frontend commission a second time.
 
 The public bridge keeper remains in `../bridge/bridge-keeper`. It is the shared keeper for pool and swap treasuries.
+
+## License
+
+`SwapTreasury.sol` is source-available under the repository [Business Source License](../../LICENSE). Production
+software may freely interact with an official deployment, but copies and derivatives may not be deployed in
+production before **2028-08-21**. The contract becomes `GPL-2.0-or-later` on that date. The bridge keeper is separately
+licensed under MIT.
