@@ -1,30 +1,38 @@
 # Liquid Hub - Delta Neutral Keeper Bot
 
-Keeper bot for the Liquid Hub Delta Neutral (DN) pool **UNI-ARB-WETH-USDC-DN**. This bot extends the standard keeper bot with AAVE V3 hedge monitoring and recalibration.
+Reference keeper for a Liquid Hub Delta Neutral pool. It reads the pool's immutable-profile
+`RangeStrategyEngine` and extends the Exposed keeper flow with Aave V3 hedge maintenance and safety repair.
 
 ## Overview
 
-The DN keeper bot performs the same rebalancing, deposit-processing and on-chain dynamic-range cycle as the standard pool (see the standard pool README for `rebalance()`, `processDepositPermissionless()` and `recordPriceSnapshot()` — all permissionless, all bountied, the range computed 100% on-chain). On top of that, the DN bot can adjust the AAVE V3 hedge permissionlessly.
+The DN keeper uses the same canonical checkpoint, deposit-processing and atomic rebalance paths as the Exposed
+keeper. The `RangeStrategyEngine` also evaluates Aave capacity, borrowing cost, delta drift and stressed health
+factor before authorizing a range. The keeper supplies none of those values.
 
 At each polling cycle the bot:
 
-1. Reads the current RangeManager instructions, PauseController state and AAVE collateral/debt/health factor
-2. Simulates `adjustHedge()` first; if the contract accepts it, executes the hedge maintenance (hedge bounty), with the atomic rebalance as the bounded critical fallback
-3. Records a price snapshot when `isSnapshotDue()` (metrics bounty)
-4. Refreshes the instructions and processes one queued deposit when inflows are available and no rebalance is already due (deposit bounty)
-5. Executes the atomic `rebalance()` when the refreshed on-chain instructions require it (keeper bounty)
+1. Reads `previewDecision()`, `checkpointDue()`, PauseController state and Aave health information.
+2. Executes `HF_REPAIR` immediately when authorized; this safety path is never delayed for the protocol bot.
+3. Calls `checkpointMarketState()` when a canonical epoch is due, then rereads the decision.
+4. Executes `HEDGE_ONLY` through `adjustHedge()` or `RANGE_AND_HEDGE` through atomic `rebalance()` as authorized.
+5. Processes one queued deposit when inflows are available, a position exists and no maintenance action takes priority.
 
 All steps are independent. Note: processing a deposit **opens the AAVE hedge atomically** in the same transaction (`processDepositPermissionless` → `DnDepositLib.openDepositHedge` + a strict post-check) — the keeper does not touch AAVE directly, and the transaction reverts if the resulting hedge drifts beyond tolerance.
 
 ### Hedge adjustment (`adjustHedge`, 100% on-chain)
 
-`adjustHedge()` is **permissionless** and pilots on the **net effective short** (`effectiveShort = debt − idle token0`) versus the on-chain target. It corrects both directions without keeper-provided sizing: flash-repay for over-hedge, or atomic borrow + oracle/TWAP-bounded token0 sale + token1 collateral supply for under-hedge. The call reverts unless drift, cooldown, oracle/TWAP and AAVE health-factor checks all pass. Large idle token0 balances cannot inflate a borrow and instead require the atomic rebalance fallback. The same rules apply to community keepers and the protocol bot.
+`adjustHedge()` is **permissionless** and pilots on the **net effective short** (`effectiveShort = debt − idle token0`) versus the on-chain target. It corrects both directions without keeper-provided sizing. Ordinary drift requires same-direction confirmation over the tactical horizon, a minimum portfolio exposure and the four-hour on-chain cooldown; fading signals clear below the hysteresis boundary, and an eligible correction may be grouped with an imminent range action. Critical drift bypasses confirmation, grouping and cooldown. An urgent repair is enabled only below `HF_REPAIR_TRIGGER_BPS`, also bypasses those ordinary controls for safety and restores toward `HF_REPAIR_TARGET_BPS`. It earns a bounty only when at least `HF_REPAIR_BOUNTY_MIN_USD` of AAVE debt was actually repaid; smaller repairs still execute without a bounty.
 
-**USDC reserve management** is integrated into the same call: when the health factor is above the governance target (`RESERVE_HF_TARGET_BPS`), `adjustHedge()` releases the surplus AAVE collateral and keeps it as USDC **on the HedgeManager itself** (never sent off-contract), so the reserve used for future adjustments is replenished on-chain without any separate keeper action.
+**USDC reserve management** is integrated into the same call: when the health factor is above the governance target (`HF_REPAIR_TARGET_BPS`), `adjustHedge()` releases the surplus AAVE collateral and keeps it as USDC **on the HedgeManager itself** (never sent off-contract), so the reserve used for future adjustments is replenished on-chain without any separate keeper action.
 
-Each cycle the keeper simulates `adjustHedge()` before sending. The contract itself reads and enforces `hedgeAdjustCooldown`, `lastHedgeAdjustAt`, drift, oracle/TWAP and health-factor conditions atomically; a cooldown or insufficient drift revert is classified as a normal skip and no transaction is broadcast. An under-hedge is corrected directly only when the borrow, oracle/TWAP-bounded sale, collateral supply and final AAVE health factor all pass atomically; otherwise the transaction reverts and the atomic LP rebalance remains the bounded fallback. Every successful correction direction can pay the **hedge bounty**. The hedge parameters (`HEDGE_ADJUST_RANGE_DIVISOR`, `hedgeTargetBps`, `hedgeAdjustCooldown`, `swapSlippageBps`, reserve/HF parameters) are configured by the Safe via `setAdjustHedgeConfig` / `setCriticalHedgeRangeDivisor` / `setHedgeAdjustCooldown` and are the single source of truth — the protocol bot reads the same on-chain values.
+Each cycle the keeper simulates `adjustHedge()` before sending. The contract enforces sizing and all safety checks atomically. After a confirmed transaction, the keeper rereads the live HF: remaining below 1.40 raises an immediate local critical incident, reinforced below 1.25 for Safe intervention. Community keeper alerts remain local-only; protocol Telegram credentials are never distributed.
 
-`rebalance()`, `recordPriceSnapshot()` and `adjustHedge()` are all permissionless — any address can call them when the contract agrees. No whitelisting or keeper role required.
+`checkpointMarketState()`, `rebalance()` and `adjustHedge()` are permissionless. Any address can call them when the
+contracts agree; no keeper allowlist or role is required.
+
+Community keepers may checkpoint from the epoch boundary. Identities configured as protocol-bot callers are
+rejected on-chain during the first 60 seconds for canonical checkpoints and normal eligible rebalances, then act
+only as fallback. Critical `HF_REPAIR` remains immediately permissionless and is never delayed by that window.
 
 ## Setup
 
@@ -37,19 +45,17 @@ chmod 600 .env
 
 ## Environment Variables
 
-All standard keeper variables apply (see the standard pool README), including the optional `TREASURY_ADDRESS` (lets the bot read the Treasury USDC balance and warn when a bounty would be skipped). The DN bot adds:
+All Exposed keeper variables apply, with `STRATEGY_PROFILE=DELTA_NEUTRAL`, including the optional
+`TREASURY_ADDRESS`. The DN keeper adds:
 
 | Variable | Description | Default |
 |---|---|---|
 | `AAVE_HEDGE_MANAGER_ADDRESS` | AaveHedgeManager contract address | -- |
-| `AAVE_HEALTH_WARN` | Health factor warning threshold, usually near `RESERVE_HF_TARGET_BPS` | `1.40` |
+| `AAVE_HEALTH_WARN` | Health factor warning threshold, usually near `HF_REPAIR_TARGET_BPS` | `1.50` |
 | `AAVE_HEALTH_DELEVERAGE` | Health factor critical/deleverage threshold | `1.25` |
 | `AAVE_HEALTH_EMERGENCY` | Health factor emergency threshold | `1.15` |
-
-The `AAVE_HEALTH_*` values only label local console status. They do not trigger transactions or define protocol
-safety. `AaveHedgeManager` reads its sizing, health-factor, drift, cooldown, oracle and TWAP constraints on-chain.
-The optional `KEEPER_PRICE_CACHE_MAX_AGE_SEC` (default `300`) only controls when the keeper refreshes and rebuilds
-an action retry plan; it is not an on-chain acceptance threshold.
+| `HF_REPAIR_TARGET_BPS` | On-chain HF restoration target | `15000` |
+| `HF_REPAIR_TRIGGER_BPS` | On-chain urgent repair trigger | `14000` |
 
 ### RPC Trust Model
 
@@ -57,7 +63,7 @@ Community keepers are permissionless and may use any RPC provider they choose. L
 
 A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Configure backup RPCs for reliability.
 
-`CHECK_INTERVAL_MIN` defaults to `1` and must be greater than zero. Signed transactions are persisted before RPC failover. A pending or underpriced payload may be replaced at the same nonce with a 12.5% fee bump, bounded by the required `KEEPER_MAX_GAS_PRICE_GWEI`; nonce consumption requires RPC agreement. Pool and bridge processes derive one shared lock and journal from `chainId + signer address`; using the same local test key for standard, DN and bridge keepers is supported without nonce collisions when they share `KEEPER_STATE_DIR`. Public keepers with their own keys remain independent. `KEEPER_PENDING_TX_FILE` is accepted only as a deprecated one-time migration source; new journals always use the canonical filename. This community code never reads protocol Telegram or AWS Secrets Manager credentials. If the PauseController is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Snapshots, hedge maintenance and rebalances remain active.
+`CHECK_INTERVAL_MIN` defaults to `1` and must be greater than zero. Signed transactions are persisted before RPC failover. A pending or underpriced payload may be replaced at the same nonce with a 12.5% fee bump, bounded by the required `KEEPER_MAX_GAS_PRICE_GWEI`; nonce consumption requires RPC agreement. Pool and bridge processes derive one shared lock and journal from `chainId + signer address`; using the same local test key for Exposed, DN and bridge keepers is supported without nonce collisions when they share `KEEPER_STATE_DIR`. Public keepers with their own keys remain independent. `KEEPER_PENDING_TX_FILE` is accepted only as a deprecated one-time migration source; new journals always use the canonical filename. This community code never reads protocol Telegram or AWS Secrets Manager credentials. If the PauseController is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Strategy checkpoints, hedge maintenance and eligible rebalances remain active.
 
 ## Keeper Bounties
 
@@ -67,7 +73,7 @@ Paid in **USDC** by the Treasury to whoever sends the transaction. The DN pool h
 |--------|--------|------------------------|
 | `rebalance()` | Keeper bounty | `keeperBountyEnabled` / `keeperBountyAmount()` |
 | `processDepositPermissionless()` | Deposit bounty | `depositBountyEnabled` / `depositBountyAmount()` |
-| `recordPriceSnapshot()` | Metrics bounty | `metricsBountyEnabled` / `metricsBountyAmount()` |
+| `checkpointMarketState()` | Strategy checkpoint bounty | `strategyCheckpointBountyEnabled` / `strategyCheckpointBountyAmount()` |
 | `adjustHedge()` | Hedge bounty | `hedgeBountyEnabled` / `hedgeBountyAmount()` |
 
 A bounty is only paid if the Treasury holds enough USDC; otherwise the action still succeeds on-chain but no bounty is paid. The bot logs a warning and shows the Treasury balance on startup. Verify it on-chain (Contracts page) before relying on bounty income.
@@ -82,17 +88,7 @@ npm start
 npm run check
 ```
 
-Run the versioned public regression suite after installing dependencies:
-
-```bash
-npm test
-```
-
-The `test/` directory validates the standard liveness/security properties plus DN hedge simulation, fallback and
-retry classification. It intentionally contains no Telegram, Tenderly or AWS integration.
-
 ## License
 
-[MIT](../../../LICENSE-MIT). This reference keeper may be used, modified, redistributed and operated in production
-without permission from Liquid Hub. It connects only to guarded, permissionless functions exposed by the official
-contracts.
+MIT. This reference keeper may be used, modified, redistributed and operated in production without permission from
+Liquid Hub.

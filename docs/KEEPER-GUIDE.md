@@ -1,177 +1,168 @@
 # Keeper Guide
 
-## What is a Keeper?
+## What is a keeper?
 
-Anyone can run a keeper bot to perform the protocol's permissionless actions for Liquid Hub pools. In return, keepers receive a bounty in USDC (if enabled and the Treasury is funded). There are four keeper actions:
+Anyone can run a Liquid Hub community keeper. A keeper submits only permissionless transactions that the deployed
+contracts independently validate. No allowlist, protocol account or private signal is required.
 
-- **Rebalance** an out-of-range LP position (`rebalance()`) — keeper bounty
-- **Process a queued user deposit** (`processDepositPermissionless()`) that converts a pending deposit into LP liquidity — deposit bounty
-- **Record a price snapshot** (`recordPriceSnapshot()`) that feeds the on-chain range calculation — metrics bounty
-- **(Delta-Neutral only) Adjust the AAVE hedge** (`adjustHedge()`) — hedge bounty
+The supported pool actions are:
 
----
+- execute an eligible range decision with `rebalance()`;
+- process one queued post-mint deposit with `processDepositPermissionless()`;
+- advance one due canonical strategy epoch with `checkpointMarketState()`;
+- on Delta Neutral pools, execute an eligible hedge action with `adjustHedge()`.
 
-## How It Works
+A successful eligible action may receive a bounded USDC bounty from the pool Treasury. Bounty payment is
+best-effort and never gives the caller access to user funds.
 
-Each cycle the keeper:
+## Canonical decision loop
 
-1. Reads `getBotInstructions()` and the pool's operational state.
-2. Calls `isSnapshotDue()`; if `true`, calls `recordPriceSnapshot()` (the contract reverts if a snapshot is not yet due).
-3. Reads `getPendingDepositsCount()`; if `> 0`, a position NFT exists, inflows are available and no rebalance is already due, calls `processDepositPermissionless()` to process one queued deposit atomically.
-4. Refreshes the instructions and, if `needsRebalance` is `true`, executes the single atomic `rebalance()` transaction.
-5. **(DN only)** Simulates and, when accepted by the contract, executes `adjustHedge()`; the DN reference keeper prioritizes this risk-maintenance check before the other actions.
-6. After any successful eligible action, the bounty is paid from the Treasury if enabled and funded.
+Each reference keeper follows the same sequence:
 
-**Important — snapshots and action prices are separate**: `recordPriceSnapshot()` feeds the dynamic-range history and may update the stored range. It is not used as a standalone cache refresh for a later action. `rebalance()` and `processDepositPermissionless()` refresh and validate their own price cache atomically before moving funds. The keeper computes `minAmountsOut` from the Chainlink oracle floor for both deposits and rebalances; the contracts enforce that floor, so a zero or weaker minimum is rejected.
+1. Authenticate every configured RPC against `CHAINID` and validate the configured contract topology.
+2. Read `previewDecision()` and `checkpointDue()` from the pool's `RangeStrategyEngine`.
+3. If an epoch is due, call `checkpointMarketState()` without supplying a price, forecast, score or target range.
+4. Read the fresh enum action, reason code, epoch, validity and `decisionHash`.
+5. If a post-mint deposit is queued and no incompatible maintenance action is pending, call
+   `processDepositPermissionless()` for the head deposit.
+6. For `RANGE_REBALANCE` or `RANGE_AND_HEDGE`, build the oracle-bounded swap plan and call
+   `rebalance(decisionHash, ...)`.
+7. On Delta Neutral pools, call `adjustHedge()` for `HEDGE_ONLY` or `HF_REPAIR`.
+8. Explicitly abstain for every action that does not apply to that pool and repeat after the configured interval.
 
-**Important**: the range is computed **100% on-chain** by the `RangeManager` (high/low amplitude over N days, trimmed, scaled by a governance multiplier, rounded to a step). The keeper does **not** configure or calculate ranges — it only feeds price snapshots and executes rebalances. The hedge target and the deposit share count are likewise computed on-chain (on the Chainlink oracle).
+The one-time initial position mint remains reserved to the protocol bot. Strategy checkpoints, later deposits,
+eligible rebalances and supported hedge actions are permissionless.
 
----
+## Adaptive range intelligence
+
+One immutable-profile `RangeStrategyEngine` is attached to each Liquid Hub pool. It combines:
+
+- an **Analytical controller** that builds a bounded range anchor from canonical on-chain observations;
+- a **Multi-scenario optimizer** that compares a fixed set of admissible ranges after transition costs and risk;
+- **Bounded online adaptation** that updates fixed estimator families at canonical epochs without caller discretion.
+
+The engine returns `NO_ACTION`, `CHECKPOINT_ONLY`, `RANGE_REBALANCE`, `HEDGE_ONLY`, `RANGE_AND_HEDGE` or
+`HF_REPAIR`, together with an exact target, reason code and `decisionHash`. A simple range exit does not authorize a
+rebalance. The engine also evaluates economic edge, uncertainty, cooldown and how deep or persistent the exit is.
+On Delta Neutral pools, ordinary drift must remain in the same direction over the tactical confirmation horizon,
+clear the minimum portfolio-exposure filter and respect the four-hour on-chain cooldown. A lower hysteresis boundary
+clears fading signals, and an eligible ordinary correction may be grouped with a range action already expected inside
+the strategic horizon. Critical drift bypasses confirmation, grouping and cooldown and takes priority even near a range edge.
+The engine may use a range change for hedge recovery only after direct adjustment remains infeasible for the
+configured persistence period and the candidate range reduces the measured drift. Keepers cannot bypass this order.
+Every new range, including a hedge-recovery candidate, must also preserve the governed skew budget around the live
+execution tick. A candidate whose total width hides a near-edge price is not executable.
+
+The keeper never computes or proposes target ticks. `RangeManager.rebalance()` revalidates the current decision,
+live price and all execution guards before touching funds. A stale, superseded or mismatched decision reverts.
+
+## Canonical checkpoints
+
+`checkpointMarketState()` is callable only when `checkpointDue()` is true. Epoch boundaries and observation
+horizons are fixed on-chain. The caller supplies no market value. A successful checkpoint can receive the strategy
+checkpoint bounty at most once for that epoch, subject to the Treasury daily cap and available USDC.
+
+Checkpoints and execution prices serve different purposes. The checkpoint advances strategy state. A deposit,
+rebalance or hedge transaction independently refreshes and validates the prices required for its own asset-moving
+operation.
+
+## Deposits and rebalances
+
+`processDepositPermissionless()` processes one FIFO deposit atomically. It requires an existing NFT for a community
+keeper, refreshes the price cache, values shares against the configured oracle, executes bounded swaps, and adds
+liquidity. It reverts if the queue is empty, inflows are paused or any execution guard fails.
+
+`rebalance()` locks Vault accounting, burns the current NFT, executes the complete bounded swap plan, mints the
+exact engine-approved tick range, records execution and unlocks the Vault in one transaction. For a Delta Neutral
+`RANGE_AND_HEDGE` decision, the AAVE hedge is synchronized and post-checked atomically. Any failed step reverts the
+entire transaction and bounty.
+
+Both paths reject `minAmountsOut` below the on-chain oracle floor. Swap chunks are capped by
+`RangeManager.initMultiSwapTvl()`; this cap is read on-chain and is not a keeper setting.
 
 ## Setup
 
-1. **Choose a pool** — Standard or Delta Neutral (DN). Each pool has its own `RangeManager` and `MultiUserVault` addresses.
-2. **Copy `.env.example` to `.env`** and fill in the required values (see below).
-3. **Fund a wallet** with ETH on Arbitrum for gas.
-4. **Set `KEEPER_PRIVATE_KEY`** in your `.env` file.
-5. **Install and run**:
-   ```bash
-   npm install
-   npm start
-   ```
+1. Choose the Exposed/Stable or Delta Neutral keeper folder for the deployed pool.
+2. Install dependencies in `keeper-bot` with `npm install`.
+3. Copy the pool-level `.env.example` to `keeper-bot/.env` and set file mode `600`.
+4. Copy official addresses from `https://liquidhub.app/docs#contracts-addresses`.
+5. Fund the keeper address with the network's native gas token.
+6. Run `npm run check` for a read-only cycle or `npm start` for active operation.
 
----
+Never guess an address or reuse an address from another network.
 
-## Check-Only Mode
+## Required environment
 
-To check pool status without executing any transactions:
+| Variable | Purpose |
+|---|---|
+| `CHAINID` | Expected chain ID; every RPC is authenticated against it |
+| `RPC_URL` | Primary keeper RPC |
+| `RANGEMANAGER_ADDRESS` | Pool RangeManager |
+| `RANGE_STRATEGY_ENGINE_ADDRESS` | Pool RangeStrategyEngine |
+| `VAULT_ADDRESS` | Pool MultiUserVault |
+| `STRATEGY_PROFILE` | Expected immutable profile: `EXPOSED`, `DELTA_NEUTRAL` or `STABLE` |
+| `TOKEN0_ADDRESS`, `TOKEN1_ADDRESS` | Pool tokens |
+| `KEEPER_PRIVATE_KEY` | Keeper signer, except in check-only mode |
+| `KEEPER_MAX_GAS_PRICE_GWEI` | Local signing and replacement ceiling |
 
-```bash
-npm run check
-```
+Common optional variables include `RPC_BACKUP_1`, `RPC_BACKUP_2`, `PAUSE_CONTROLLER_ADDRESS`,
+`TREASURY_ADDRESS`, `CHECK_INTERVAL_MIN`, `KEEPER_PRICE_CACHE_MAX_AGE_SEC` and `KEEPER_STATE_DIR`. Delta Neutral
+keepers also require `AAVE_HEDGE_MANAGER_ADDRESS`; local `AAVE_HEALTH_*` values only label logs and do not replace
+on-chain thresholds.
 
-This prints the current pool state, whether a rebalance is needed, and the current position details.
+## RPC and signer model
 
----
+Community keepers may choose their own RPC providers. Safety does not trust an RPC response alone: the contracts
+enforce oracle/TWAP checks, minimum outputs, cooldowns, caps, exact decisions and Delta Neutral post-checks. A poor
+RPC can reduce a keeper's liveness or bounty capture rate but cannot grant extra permissions.
 
-## Environment Variables
+The reference keepers populate and sign once, persist the raw transaction, then rebroadcast that exact payload
+sequentially through configured RPCs. Same-nonce replacement uses a bounded fee increase. Processes sharing one
+chain and signer must share `KEEPER_STATE_DIR`; do not delete signer state while a transaction is unresolved.
 
-> **Contract addresses** — the official deployed addresses (RangeManager, Vault, Treasury, AaveHedgeManager) are listed on the protocol's Contracts page: **https://liquidhub.app/docs#contracts-addresses**. Always copy them from there; never guess or hardcode an address.
+If PauseController state is missing or unreadable, only queued deposits are skipped fail-closed. Strategy
+checkpoints, eligible rebalances and DN safety maintenance remain available.
 
-### Required
-
-| Variable | Description |
-|----------|-------------|
-| `CHAINID` | Expected chain ID; every configured RPC is authenticated against it before use |
-| `RPC_URL` | Arbitrum RPC endpoint |
-| `RANGEMANAGER_ADDRESS` | RangeManager contract address (from the Contracts page) |
-| `VAULT_ADDRESS` | MultiUserVault contract address (from the Contracts page) |
-| `TOKEN0_ADDRESS` | Token0 address (e.g., WETH) |
-| `TOKEN1_ADDRESS` | Token1 address (e.g., USDC) |
-| `KEEPER_PRIVATE_KEY` | Private key of the keeper wallet |
-| `KEEPER_MAX_GAS_PRICE_GWEI` | Local ceiling for initial and same-nonce replacement transactions |
-
-### Optional
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RPC_BACKUP_1` | Backup RPC endpoint 1 | — |
-| `RPC_BACKUP_2` | Backup RPC endpoint 2 | — |
-| `PAUSE_CONTROLLER_ADDRESS` | Used only to gate deposit processing; if absent/unreadable, deposits are skipped while maintenance continues | — |
-| `TREASURY_ADDRESS` | Treasury address — lets the bot read the USDC balance and warn when a bounty would be skipped (falls back to `vault.treasuryAddress()`) | — |
-| `KEEPER_STATE_DIR` | Shared signer lock/journal directory for processes using the same chain and key | `~/.liquidhub-keeper-state` |
-| `CHECK_INTERVAL_MIN` | Minutes between checks; must be greater than 0 | 1 |
-| `KEEPER_PRICE_CACHE_MAX_AGE_SEC` | Local age used to decide whether an action retry should first refresh and rebuild its plan; it is not an on-chain safety limit | 300 |
-
-The swap-chunk ceiling is not configured by a community keeper. Before building a plan, the keeper reads `initMultiSwapTvl()` from the deployed `RangeManager`; the contract then enforces the same ceiling on-chain.
-
-### RPC Trust Model
-
-Community keepers are permissionless and may use any RPC provider they choose. Liquid Hub does not require public keepers to use premium or MEV-protected RPCs. This is intentional: keeper safety is enforced on-chain by oracle/TWAP checks, oracle-floored `minAmountsOut`, cooldowns, caps, and DN post-checks.
-
-A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Use `RPC_BACKUP_1` and `RPC_BACKUP_2` for reliability.
-
-The reference keepers populate and sign each transaction once, then fail over sequentially by rebroadcasting only that exact raw transaction across the configured RPC endpoints. They never switch to an implicit public or premium tier. If PauseController state cannot be read, queued deposits are skipped fail-closed while snapshots, rebalances and DN hedge maintenance continue normally.
-
-### Delta Neutral (DN) Additional Variables
-
-| Variable | Description |
-|----------|-------------|
-| `AAVE_HEDGE_MANAGER_ADDRESS` | AaveHedgeManager contract address |
-| `AAVE_HEALTH_WARN` | Local log/status warning threshold |
-| `AAVE_HEALTH_DELEVERAGE` | Local log/status critical threshold |
-| `AAVE_HEALTH_EMERGENCY` | Local log/status emergency threshold |
-
-These three values only label keeper logs. They do not size transactions, trigger privileged deleveraging or replace the on-chain health-factor, drift, cooldown, oracle and TWAP checks enforced by `AaveHedgeManager`.
-
----
-
-## Keeper Bounties
-
-Community keepers earn bounties in USDC, paid directly from the Treasury contract to whoever sends the transaction (`msg.sender`):
+## Bounties and priority
 
 | Action | Bounty |
-|--------|--------|
+|---|---|
 | `rebalance()` | Keeper bounty |
 | `processDepositPermissionless()` | Deposit bounty |
-| `recordPriceSnapshot()` | Metrics bounty |
+| `checkpointMarketState()` | Strategy checkpoint bounty |
 | `adjustHedge()` (DN) | Hedge bounty |
 
-> **Amounts** are published on the protocol's Decentralization page (https://liquidhub.app/docs#decentralization) and are set on-chain by the multisig. Read the live value on the Treasury contract (`keeperBountyAmount()`, `depositBountyAmount()`, …) before relying on it — never assume a fixed figure.
+Bounties are paid to `msg.sender` only after successful state transitions. Disabled or underfunded bounties are a
+silent no-op and never revert useful work. Read current flags, amounts, caps and Treasury USDC balance on-chain.
 
-- Paid automatically at the end of the action — no manual claim.
-- The internal protocol bot waits **1 minute** before doing the action itself, leaving the priority window open for community keepers.
-- Anti-drain: `recordPriceSnapshot()` reverts unless a snapshot is due; `adjustHedge()` reverts unless the hedge drift exceeds the on-chain threshold **and** the on-chain cooldown (`hedgeAdjustCooldown`) has elapsed since the last adjustment.
-- **Silent no-op**: if a bounty is disabled or the Treasury has insufficient USDC, the action still completes successfully (the payment is wrapped in a try/catch by the contract) — only the bounty is skipped. Set `TREASURY_ADDRESS` so the bot warns you when the Treasury is underfunded; verify the balance on-chain before relying on bounty income.
+For normal actions, the protocol bot waits one minute so community keepers have first execution opportunity.
+Critical `HF_REPAIR` is immediately permissionless and is never delayed by hedge confirmation, grouping or cooldown. A checkpoint bounty is limited to one
+due epoch and a daily cap. Normal hedge adjustment respects drift and cooldown rules; urgent repair has separate
+health-factor and minimum-repair conditions.
 
-### Bounty payment guarantees
+## Security boundary
 
-```
-- The bounty is paid by the Treasury, not the user
-- The bounty payment cannot revert the underlying rebalance
-- The bounty is paid to msg.sender (whoever called the function)
-- All payments emit events (KeeperBountyPaid) for audit
-```
+A keeper cannot:
 
----
+- access, transfer or withdraw user funds to itself;
+- supply arbitrary ticks, prices, forecasts, scores, debt targets or expert weights;
+- bypass the decision epoch, oracle, TWAP, cooldown, slippage, cap, HF or post-check guards;
+- call Safe-only governance or emergency functions through the permissionless path.
 
-## Security
+User assets remain in the Vault, RangeManager/DEX position and, for DN, HedgeManager/AAVE integration. The keeper
+wallet holds only its own gas funds and any bounty it legitimately receives.
 
-The keeper can only call **public functions** on the contracts:
+## Monitoring and tests
 
-- `rebalance()` — Execute an atomic rebalance when the position is out of range
-- `processDepositPermissionless()` — Process one queued deposit when contract conditions allow it
-- `recordPriceSnapshot()` — Feed the on-chain dynamic range calculation when a snapshot is due
-- `adjustHedge()` — Delta-Neutral pools only, adjust the AAVE hedge when drift exceeds the on-chain threshold
+Logs expose the enum action and reason code. `NO_ACTION / OUT_OF_RANGE_EVALUATING` is a valid economic abstention;
+it must not be relabeled as an execution failure. Unknown reason codes must be displayed safely rather than mapped
+to an existing meaning.
 
-The keeper **cannot**:
+Each `keeper-bot/test` directory is versioned. Run `npm test` after `npm install` to verify chain authentication,
+failover, persisted signed transactions, nonce coordination, gas ceilings, action mapping, retries, pause handling
+and the absence of protocol-only Telegram, Tenderly or AWS integrations.
 
-- Access or withdraw user funds
-- Modify range parameters
-- Perform any admin operations
-- Change contract configuration
+## License
 
-User assets remain in the protocol contracts: pending funds in the Vault, active liquidity and its NFT in the RangeManager/DEX position, and DN collateral/debt in the HedgeManager/AAVE integration. They never enter the keeper wallet, which only needs native gas funds.
-
----
-
-## Gas Costs
-
-- A typical rebalance costs **0.001–0.01 ETH** on Arbitrum.
-- Multi-swap rebalances (large TVL) cost more because one atomic transaction performs several internal swap calls.
-- Ensure your keeper wallet has sufficient ETH to cover gas.
-
----
-
-## Monitoring
-
-- **Healthy**: Logs show `"No action needed"` — the position is in range.
-- **Rebalance triggered**: Logs show the rebalance steps being executed.
-- **Errors**: Check logs for error messages. Common issues include insufficient gas, RPC failures, or slippage exceeding tolerance.
-- Use backup RPCs (`RPC_BACKUP_1`, `RPC_BACKUP_2`) for reliability.
-
----
-
-## Regression Tests
-
-Each public `keeper-bot/test` directory is intentionally versioned. After `npm install`, run `npm test` to verify RPC chain authentication and failover, signed-transaction persistence, nonce coordination, gas ceilings, action retries, pause handling, and the absence of protocol-only Telegram, Tenderly or AWS secret integrations. These tests are part of the auditable keeper distribution and should be kept in forks and releases.
+The reference keepers are MIT licensed and may be used, modified, redistributed and operated in production without
+permission from Liquid Hub.

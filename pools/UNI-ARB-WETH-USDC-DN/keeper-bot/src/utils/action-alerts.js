@@ -70,6 +70,21 @@ class PersistentActionAlerts {
     await this._persist();
   }
 
+  async critical(action, details) {
+    const previous = this.state.actions[action];
+    if (previous?.alerted) return false;
+    const message = String(details || 'critical condition').slice(0, 1000);
+    const sent = await this.sender(`[${this.poolName}] CRITICAL ${action}.\n${message}`);
+    this.state.actions[action] = {
+      consecutiveFailures: 1,
+      alerted: Boolean(sent),
+      lastError: message,
+      updatedAt: new Date().toISOString(),
+    };
+    await this._persist();
+    return Boolean(sent);
+  }
+
   async _persist() {
     const tmp = `${this.stateFile}.tmp`;
     await fs.writeFile(tmp, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });

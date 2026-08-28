@@ -26,7 +26,8 @@ interface IRmDeposit {
     function config()
         external
         view
-        returns (uint24 fee, uint8 d0, uint8 d1, uint16 t, uint24 s, uint64 l, bool o, uint16 u, uint16 dn, uint32 m);
+        returns (uint24 fee, uint8 d0, uint8 d1, uint16 t, uint24 s, uint64 l, bool o, uint32 m);
+    function calculateTargetTicks() external view returns (int24 tickLower, int24 tickUpper);
 }
 
 /**
@@ -62,8 +63,6 @@ library RangeOperations {
         uint24 maxSlippageBps;
         uint64 lastRebalanceTime;
         bool oraclesConfigured;
-        uint16 rangeUpPercent;
-        uint16 rangeDownPercent;
         uint32 maxPositions;
     }
 
@@ -113,25 +112,15 @@ library RangeOperations {
         int24 tickUpper;
     }
 
-    // ===== DYNAMIC RANGE (calcul on-chain) =====
-
-    /// @notice Snapshot horodate du ratio oracle token0/token1, normalise en 8 decimales.
-    struct PriceSnapshot {
-        uint128 price; // ratio token0/token1 en 8 decimales
-        uint64 timestamp; // unix timestamp du snapshot
-    }
-
-    /// @notice Parametres de gouvernance du calcul dynamique des ranges (stockes on-chain)
-    struct DynamicRangeConfig {
-        bool dynamicRangeEnabled; // false => ranges fixes via configureRanges (ex: stablecoin)
-        uint8 maxSnapshotsPerDay; // nombre de snapshots/jour (timing regulier = 86400/maxSnapshotsPerDay)
-        uint8 volatMoyDay; // fenetre de calcul high/low en jours (<= 20)
-        uint8 volatTrimDay; // nombre d'extremes hauts ET bas retires (trim des pics)
-        uint16 rangeStepBps; // unite strategique appliquee ensuite comme distance de ticks (~50 = 0,5%)
-        uint16 rangeMultiplicatorBps; // facteur d'amplitude, 10000 = x1,0 ; 12500 = x1,25 ; 8000 = x0,8
-        uint16 rangeMinBps; // borne basse par cote en distance de ticks approx. (100 ~= +1,005%/-0,995%)
-        uint16 rangeMaxBps; // borne haute par cote en distance de ticks approx. (1000 ~= +10,52%/-9,52%)
-        uint64 lastSnapshotAt; // timestamp du dernier snapshot (timing regulier)
+    struct StrategyScenarioInput {
+        int24 lower;
+        int24 upper;
+        int24 liveTick;
+        int24 trendTicks;
+        uint24 volatilityTicks;
+        uint16 forecastFeeRateBps;
+        uint16 analyticalWidthTicks;
+        uint16 tailRiskBps;
     }
 
     // ===== FONCTIONS PRINCIPALES =====
@@ -215,75 +204,6 @@ library RangeOperations {
             (,,, uint16 cardinality,,,) = pool.slot0();
             return cardinality != 1;
         }
-    }
-
-    /**
-     * @notice Calcule les ticks cibles pour une nouvelle position
-     * @dev Supporte les ranges asymetriques via rangeUpPercent et rangeDownPercent
-     *      Le ratio optimal de tokens est calcule automatiquement par calculateOptimalRatio()
-     */
-    function calculateTargetTicks(PriceCache memory priceCache, RangeConfig memory config, IUniswapV3Pool pool)
-        external
-        view
-        returns (int24 tickLower, int24 tickUpper)
-    {
-        return _calculateTargetTicksInternal(priceCache, config, pool);
-    }
-
-    /**
-     * @notice Version interne de calculateTargetTicks (pour appel depuis autres fonctions de la library)
-     * @dev Supporte les ranges asymetriques: ticksUp et ticksDown peuvent etre differents
-     *      Cela permet d'optimiser la generation de fees selon les conditions de marche
-     */
-    function _calculateTargetTicksInternal(PriceCache memory priceCache, RangeConfig memory config, IUniswapV3Pool pool)
-        internal
-        view
-        returns (int24 tickLower, int24 tickUpper)
-    {
-        int24 currentTick = priceCache.poolTick;
-        int24 tickSpacing = pool.tickSpacing();
-
-        // Calculer le nombre de ticks pour chaque cote (ASYMETRIQUE)
-        // Les valeurs BPS sont appliquees comme distances de ticks: approximation volontaire.
-        // 100 ticks = +1,005% vers le haut et -0,995% vers le bas avant alignement tickSpacing.
-        int24 ticksUp = int24(uint24(config.rangeUpPercent));
-        int24 ticksDown = int24(uint24(config.rangeDownPercent));
-
-        // Arrondir chaque cote au tickSpacing
-        int24 spacingsUp = ticksUp / tickSpacing;
-        if (spacingsUp < 1) spacingsUp = 1; // Minimum 1 tickSpacing
-        int24 spacingsDown = ticksDown / tickSpacing;
-        if (spacingsDown < 1) spacingsDown = 1; // Minimum 1 tickSpacing
-
-        int24 alignedTicksUp = spacingsUp * tickSpacing;
-        int24 alignedTicksDown = spacingsDown * tickSpacing;
-
-        // Calculer les ticks theoriques ASYMETRIQUES autour du currentTick
-        int24 theoreticalLower = currentTick - alignedTicksDown;
-        int24 theoreticalUpper = currentTick + alignedTicksUp;
-
-        // Aligner tickLower vers le bas (floor)
-        tickLower = _floorToTickSpacing(theoreticalLower, tickSpacing);
-
-        // Aligner tickUpper vers le haut (ceil)
-        tickUpper = _ceilToTickSpacing(theoreticalUpper, tickSpacing);
-
-        // Verifier que le currentTick est dans le range
-        // Si non, ajuster le range pour le contenir
-        if (currentTick <= tickLower) {
-            // currentTick trop proche du bas, decaler le range vers le bas
-            tickLower = _floorToTickSpacing(currentTick - 1, tickSpacing);
-            tickUpper = tickLower + alignedTicksUp + alignedTicksDown;
-        } else if (currentTick >= tickUpper) {
-            // currentTick trop proche du haut, decaler le range vers le haut
-            tickUpper = _ceilToTickSpacing(currentTick + 1, tickSpacing);
-            tickLower = tickUpper - alignedTicksUp - alignedTicksDown;
-        }
-
-        // Verification finale : s'assurer que le currentTick est bien dans le range
-        if (!(tickLower < currentTick && currentTick < tickUpper)) revert InvalidTicks();
-
-        _validateTicks(tickLower, tickUpper, currentTick, tickSpacing);
     }
 
     /**
@@ -414,38 +334,6 @@ library RangeOperations {
         (,,,,, tickLower, tickUpper, liquidity,,,,) = positionManager.positions(tokenId);
         currentTick = priceCache.poolTick;
         inRange = (currentTick > tickLower && currentTick < tickUpper);
-    }
-
-    function getBotInstructions(
-        uint32 positionCount,
-        uint32 maxPositions,
-        uint256[] memory positions,
-        INonfungiblePositionManager positionManager,
-        PriceCache memory priceCache
-    )
-        external
-        view
-        returns (bool hasPosition, uint256 tokenId, bool needsRebalance, string memory action, string memory reason)
-    {
-        hasPosition = positions.length > 0;
-
-        if (!hasPosition) {
-            if (positionCount >= maxPositions) {
-                return (false, 0, false, "MAX_POSITIONS_REACHED", "Limit positions");
-            }
-            return (false, 0, true, "MINT_INITIAL", "No position exists");
-        }
-
-        // Verifier chaque position
-        for (uint256 i = 0; i < positions.length; i++) {
-            if (_isPositionOutOfRange(positions[i], positionManager, priceCache)) {
-                return (true, positions[i], true, "REBALANCE", "Position out of Range");
-            }
-        }
-
-        tokenId = positions.length > 0 ? positions[0] : 0;
-        action = "WAIT";
-        reason = "All positions in Range";
     }
 
     /**
@@ -820,7 +708,7 @@ library RangeOperations {
         IRmDeposit rm = IRmDeposit(rangeManager);
         (uint128 price0, uint128 price1, uint160 sp, int24 tk,, bool valid) = rm.priceCache();
         if (!valid) return (false, 0);
-        (, uint8 dec0, uint8 dec1,,,,, uint16 rangeUpPercent, uint16 rangeDownPercent,) = rm.config();
+        (, uint8 dec0, uint8 dec1,,,,,) = rm.config();
 
         uint256 v0 = (depositAmount0 * uint256(price0)) / (10 ** dec0);
         uint256 v1 = (depositAmount1 * uint256(price1)) / (10 ** dec1);
@@ -833,10 +721,7 @@ library RangeOperations {
             (,,,,, int24 tickLower, int24 tickUpper,,,,,) = rm.positionManager().positions(positions[0]);
             ratioBps = calculateOptimalRatio(tickLower, tickUpper, tk, sp);
         } else {
-            IUniswapV3Pool lpPool = rm.pool();
-            int24 spacing = lpPool.tickSpacing();
-            int24 lower = _floorToTickSpacing(tk - int24(uint24(rangeDownPercent)), spacing);
-            int24 upper = _ceilToTickSpacing(tk + int24(uint24(rangeUpPercent)), spacing);
+            (int24 lower, int24 upper) = rm.calculateTargetTicks();
             ratioBps = calculateOptimalRatio(lower, upper, tk, sp);
         }
         uint256 targetV0 = (tot * ratioBps) / 10000;
@@ -910,37 +795,6 @@ library RangeOperations {
     }
 
     // ===== FONCTIONS PRIVEES =====
-
-    /**
-     * @notice Helper interne pour vérifier si position hors range
-     */
-    function _isPositionOutOfRange(
-        uint256 tokenId,
-        INonfungiblePositionManager positionManager,
-        PriceCache memory priceCache
-    ) private view returns (bool) {
-        if (!priceCache.valid) return false;
-
-        try positionManager.positions(tokenId) returns (
-            uint96,
-            address,
-            address,
-            address,
-            uint24,
-            int24 tickLower,
-            int24 tickUpper,
-            uint128,
-            uint256,
-            uint256,
-            uint128,
-            uint128
-        ) {
-            int24 currentTick = priceCache.poolTick;
-            return currentTick <= tickLower || currentTick >= tickUpper;
-        } catch {
-            return false;
-        }
-    }
 
     /**
      * @notice Helper pour approuver et récupérer les nouvelles balances
@@ -1176,7 +1030,8 @@ library RangeOperations {
      * @param balance1 Balance actuelle de token1
      * @param priceCache Cache des prix actuels
      * @param config Configuration du range
-     * @param pool Pool Uniswap V3
+     * @param tickLower Lower tick validated by RangeStrategyEngine
+     * @param tickUpper Upper tick validated by RangeStrategyEngine
      * @return params Parametres de swap optimaux
      */
     function calculateOptimalSwapParams(
@@ -1184,8 +1039,9 @@ library RangeOperations {
         uint256 balance1,
         PriceCache memory priceCache,
         RangeConfig memory config,
-        IUniswapV3Pool pool
-    ) external view returns (OptimalSwapParams memory params) {
+        int24 tickLower,
+        int24 tickUpper
+    ) external pure returns (OptimalSwapParams memory params) {
         params.currentBalance0 = balance0;
         params.currentBalance1 = balance1;
 
@@ -1194,9 +1050,9 @@ library RangeOperations {
             return params;
         }
 
-        // IMPORTANT: Utiliser EXACTEMENT la meme logique que calculateTargetTicks
-        // pour que le ratio calcule corresponde au range qui sera effectivement utilise
-        (params.tickLower, params.tickUpper) = _calculateTargetTicksInternal(priceCache, config, pool);
+        _validateTicks(tickLower, tickUpper, priceCache.poolTick, 1);
+        params.tickLower = tickLower;
+        params.tickUpper = tickUpper;
 
         // Calculer le ratio optimal
         params.targetRatio0Bps =
@@ -1269,52 +1125,6 @@ library RangeOperations {
         }
     }
 
-    // ===== DYNAMIC RANGE — CALCUL ON-CHAIN =====
-
-    /**
-     * @notice Indique si un nouveau snapshot de prix est du (timing regulier).
-     * @dev Intervalle = 86400 / maxSnapshotsPerDay (ex: 2/jour => 12h, 4/jour => 6h).
-     *      Au tout premier appel (lastSnapshotAt == 0) le snapshot est immediatement du.
-     */
-    function isSnapshotDue(DynamicRangeConfig memory drc, uint64 nowTs) external pure returns (bool) {
-        if (drc.maxSnapshotsPerDay == 0) return false;
-        if (drc.lastSnapshotAt == 0) return true;
-        uint64 interval = uint64(86400) / uint64(drc.maxSnapshotsPerDay);
-        return nowTs >= drc.lastSnapshotAt + interval;
-    }
-
-    /**
-     * @notice Calcule le demi-range symetrique (en bps) a partir du ring buffer de prix.
-     * @dev Formule: sur les snapshots des `volatMoyDay` derniers jours, on retire les
-     *      `volatTrimDay` prix les plus hauts ET les plus bas (trim des pics aberrants),
-     *      puis high = max restant, low = min restant. Amplitude haute = (high-cur)/cur,
-     *      amplitude basse = (cur-low)/cur. Amplitude totale = haut+bas, multipliee par
-     *      rangeMultiplicatorBps/10000, arrondie au palier rangeStepBps (vers le haut),
-     *      puis divisee par 2 pour le demi-range symetrique.
-     * @param snapshots Copie memoire du ring buffer (lue par le caller).
-     * @param currentPrice Prix Chainlink courant (price0, 8 decimales).
-     * @param drc Parametres de gouvernance.
-     * @param nowTs Timestamp courant (pour filtrer la fenetre).
-     * @return halfRangeBps Demi-range symetrique en bps (rangeUp == rangeDown).
-     * @return enoughData False si pas assez de snapshots dans la fenetre (cold start).
-     */
-    /// @notice Écrit un snapshot dans le ring buffer circulaire (push tant que < cap, sinon overwrite à head).
-    /// @dev Déporté du RangeManager (gain bytecode) : la library opère directement sur le storage array passé
-    ///      par référence et renvoie le nouvel index de tête. cap==0 traité comme 1. Miroir exact de la pool DN.
-    /// @return newHead Index circulaire d'écriture suivant.
-    function writeRing(PriceSnapshot[] storage ring, uint16 head, uint16 cap, PriceSnapshot memory snap)
-        external
-        returns (uint16 newHead)
-    {
-        if (cap == 0) cap = 1;
-        if (ring.length < cap) {
-            ring.push(snap);
-        } else {
-            ring[head] = snap;
-        }
-        return uint16((uint256(head) + 1) % cap);
-    }
-
     /// @notice Plancher de sortie d'un swap au prix oracle Chainlink, moins le slippage.
     /// @dev Anti-MEV pour les swaps permissionless (depots) : le minAmountOut fourni par un keeper
     ///      doit etre >= ce plancher. Conversion value-neutral via les prix oracle 8 decimales et les
@@ -1377,121 +1187,226 @@ library RangeOperations {
         }
     }
 
-    /// @dev Logique interne du calcul du demi-range (reutilisee par evaluateDynamicRange).
-    function _computeDynamicRangeBps(
-        PriceSnapshot[] memory snapshots,
-        uint128 currentPrice,
-        DynamicRangeConfig memory drc,
-        uint64 nowTs
-    ) internal pure returns (uint16 halfRangeBps, bool enoughData) {
-        if (currentPrice == 0 || drc.volatMoyDay == 0) return (0, false);
-
-        // 1. Filtrer les snapshots dans la fenetre [nowTs - volatMoyDay*1d, nowTs]
-        uint64 windowStart = nowTs > uint64(drc.volatMoyDay) * 86400 ? nowTs - uint64(drc.volatMoyDay) * 86400 : 0;
-        uint256 n = snapshots.length;
-        uint128[] memory win = new uint128[](n);
-        uint256 count;
-        for (uint256 i = 0; i < n; i++) {
-            if (snapshots[i].timestamp >= windowStart && snapshots[i].price > 0) {
-                win[count] = snapshots[i].price;
-                count++;
-            }
+    /// @notice Stateless fixed-scenario score used by RangeStrategyEngine.
+    /// @dev This remains in the already-linked library so the stateful engine stays below EIP-170.
+    function evaluateStrategyScenarios(StrategyScenarioInput calldata input)
+        external
+        pure
+        returns (int32 scoreBps, int32 expectedFeesBps, int32 riskPenaltyBps)
+    {
+        uint256 concentration = (uint256(input.analyticalWidthTicks) * 10000)
+            / _maxStrategy(uint256(uint24(input.upper - input.lower)) / 2, 1);
+        concentration = _clampStrategy(concentration, 5000, 20000);
+        uint256 baseFee = uint256(input.forecastFeeRateBps) * concentration / 10000;
+        uint256 volatility = _maxStrategy(input.volatilityTicks, 10);
+        int256 trend = input.trendTicks;
+        int256[7] memory moves = [
+            trend,
+            trend + int256(volatility),
+            trend - int256(volatility),
+            trend + int256(volatility * 2),
+            trend - int256(volatility * 2),
+            int256(0),
+            int256(0)
+        ];
+        uint16[7] memory weights = [uint16(2500), 1500, 1500, 1000, 1000, 1250, 1250];
+        int256 weightedScore;
+        uint256 totalFees;
+        uint256 totalRisk;
+        for (uint256 i; i < 7; ++i) {
+            int24 endTick = _boundedStrategyTick(int256(input.liveTick) + moves[i]);
+            int24 pathTick = i == 5
+                ? _boundedStrategyTick(int256(input.liveTick) + int256(volatility))
+                : i == 6 ? _boundedStrategyTick(int256(input.liveTick) - int256(volatility)) : endTick;
+            bool active =
+                endTick > input.lower && endTick < input.upper && pathTick > input.lower && pathTick < input.upper;
+            uint256 fees = active ? baseFee : 0;
+            uint256 lvr = _strategyLvrBps(input.lower, input.upper, input.liveTick, endTick);
+            uint256 exitPenalty = active ? 0 : 50 + _outsideStrategyDistance(endTick, input.lower, input.upper) / 10;
+            uint256 tailPenalty = (i == 3 || i == 4) ? (lvr * input.tailRiskBps) / 10000 : 0;
+            uint256 risk = lvr + exitPenalty + tailPenalty;
+            weightedScore += (int256(fees) - int256(risk)) * int256(uint256(weights[i]));
+            totalFees += fees * weights[i];
+            totalRisk += risk * weights[i];
         }
-
-        // 2. Cold start: apres le trim haut+bas, deux valeurs doivent rester pour mesurer high-low.
-        uint256 needed = uint256(drc.volatTrimDay) * 2 + 2;
-        if (count < needed || count == 0) return (0, false);
-
-        // 3. Trim: retirer les `volatTrimDay` plus hauts ET plus bas par selection par passes.
-        //    On marque les valeurs retirees en les mettant a 0 (prix toujours > 0 sinon).
-        uint256 trim = drc.volatTrimDay;
-        for (uint256 p = 0; p < trim; p++) {
-            // retirer le max courant
-            uint256 maxIdx = type(uint256).max;
-            uint128 maxVal = 0;
-            for (uint256 i = 0; i < count; i++) {
-                if (win[i] > maxVal) {
-                    maxVal = win[i];
-                    maxIdx = i;
-                }
-            }
-            if (maxIdx != type(uint256).max) win[maxIdx] = 0;
-            // retirer le min courant (parmi les valeurs encore > 0)
-            uint256 minIdx = type(uint256).max;
-            uint128 minVal = type(uint128).max;
-            for (uint256 i = 0; i < count; i++) {
-                if (win[i] > 0 && win[i] < minVal) {
-                    minVal = win[i];
-                    minIdx = i;
-                }
-            }
-            if (minIdx != type(uint256).max) win[minIdx] = 0;
-        }
-
-        // 4. high/low sur les valeurs restantes (> 0)
-        uint128 high = 0;
-        uint128 low = type(uint128).max;
-        for (uint256 i = 0; i < count; i++) {
-            if (win[i] == 0) continue;
-            if (win[i] > high) high = win[i];
-            if (win[i] < low) low = win[i];
-        }
-        if (high == 0 || low == type(uint128).max) return (0, false);
-
-        // 5. Amplitude PURE de la fenetre = (high - low) / prix courant, en bps.
-        //    On mesure la dispersion reelle des prix observes (volatilite), independamment de la
-        //    position instantanee du prix. L'ancien calcul (ampUp+ampDown clampes au prix courant)
-        //    sous-estimait la volatilite quand le prix sortait de [low,high] (un cote etait clampe a 0),
-        //    ce qui produisait un range biaise au moment meme ou le marche bougeait le plus.
-        uint256 totalBps = (uint256(high - low) * 10000) / currentPrice;
-        if (totalBps == 0) return (0, false);
-
-        // 6. Appliquer le multiplicateur d'amplitude (rangeMultiplicatorBps/10000)
-        uint256 mult = drc.rangeMultiplicatorBps == 0 ? 10000 : uint256(drc.rangeMultiplicatorBps);
-        totalBps = (totalBps * mult) / 10000;
-
-        // 7. Arrondir l'amplitude totale au palier rangeStepBps (vers le haut).
-        //    Le palier effectif par cote vaut donc rangeStepBps / 2.
-        uint256 step = drc.rangeStepBps == 0 ? 50 : uint256(drc.rangeStepBps);
-        uint256 roundedTotal = ((totalBps + step - 1) / step) * step;
-
-        // 8. Demi-range symetrique
-        uint256 half = roundedTotal / 2;
-        if (half == 0) return (0, false);
-        if (half > type(uint16).max) half = type(uint16).max;
-        return (uint16(half), true);
+        scoreBps = _safeInt32(weightedScore / 10000);
+        expectedFeesBps = _safeInt32(int256(totalFees / 10000));
+        riskPenaltyBps = _safeInt32(int256(totalRisk / 10000));
     }
 
-    /**
-     * @notice Calcule le nouveau demi-range ET decide s'il faut l'appliquer.
-     * @dev Encapsule le calcul + la decision pour alleger le RangeManager (bytecode).
-     *      Retourne shouldApply=false si: dynamique desactive, cold start, ou range trop petit (<10 bps).
-     *      PAS d'hysteresis : appele lors du snapshot on-chain qui met a jour la config de range.
-     *      Le mint/rebalance suivant lit cette config deja figee, ce qui garde le plan de swap coherent.
-     * @return newHalfBps Demi-range a appliquer (borne 10..5000), valide seulement si shouldApply.
-     * @return shouldApply True s'il faut reecrire config.rangeUp/DownPercent.
-     */
-    function evaluateDynamicRange(
-        PriceSnapshot[] memory snapshots,
-        uint128 currentPrice,
-        DynamicRangeConfig memory drc,
-        uint64 nowTs
-    ) external pure returns (uint16 newHalfBps, bool shouldApply) {
-        if (!drc.dynamicRangeEnabled || currentPrice == 0) return (0, false);
+    function strategyAmountsAtTick(int24 lower, int24 upper, int24 tick, uint128 liquidity)
+        external
+        pure
+        returns (uint256 amount0, uint256 amount1)
+    {
+        return _strategyAmountsAtTick(lower, upper, tick, liquidity);
+    }
 
-        (uint16 halfBps, bool ok) = _computeDynamicRangeBps(snapshots, currentPrice, drc, nowTs);
-        if (!ok) return (0, false);
+    function updateTrendExpertWeights(uint16[4] calldata weights, int24[4] calldata predictions, int24 realized)
+        external
+        pure
+        returns (uint16[4] memory updated)
+    {
+        uint256 scale = _maxStrategy(_absStrategy(int256(realized)), 25);
+        uint256[4] memory next;
+        uint256 sum;
+        for (uint256 i; i < 4; ++i) {
+            uint256 loss = _minStrategy((_absStrategy(int256(predictions[i]) - realized) * 10000) / scale, 10000);
+            uint256 factor = 10000 - loss / 10;
+            uint256 value = (uint256(weights[i]) * factor) / 10000;
+            value = (value * 9950 + uint256(2500) * 50) / 10000;
+            if (value < 500) value = 500;
+            next[i] = value;
+            sum += value;
+        }
+        uint256 assigned;
+        for (uint256 i; i < 3; ++i) {
+            updated[i] = uint16((next[i] * 10000) / sum);
+            assigned += updated[i];
+        }
+        updated[3] = uint16(10000 - assigned);
+    }
 
-        uint16 minBps = drc.rangeMinBps == 0 ? 10 : drc.rangeMinBps;
-        uint16 maxBps = drc.rangeMaxBps == 0 ? 5000 : drc.rangeMaxBps;
-        if (minBps < 10 || minBps > maxBps || maxBps > 5000) return (0, false);
+    function updateUnsignedExpertWeights(
+        uint16[3] calldata weights,
+        uint24[3] calldata predictions,
+        uint24 realized,
+        uint24 scaleFloor
+    ) external pure returns (uint16[3] memory updated) {
+        uint256 scale = _maxStrategy(realized, scaleFloor);
+        uint256[3] memory next;
+        uint256 sum;
+        for (uint256 i; i < 3; ++i) {
+            uint256 loss = _minStrategy((_absDiffStrategy(predictions[i], realized) * 10000) / scale, 10000);
+            uint256 factor = 10000 - loss / 10;
+            uint256 value = (uint256(weights[i]) * factor) / 10000;
+            value = (value * 9950 + uint256(3333) * 50) / 10000;
+            if (value < 500) value = 500;
+            next[i] = value;
+            sum += value;
+        }
+        updated[0] = uint16((next[0] * 10000) / sum);
+        updated[1] = uint16((next[1] * 10000) / sum);
+        updated[2] = uint16(10000 - uint256(updated[0]) - updated[1]);
+    }
 
-        // PAS d'hysteresis : le snapshot on-chain applique directement le nouveau range calcule.
-        // Le rebalance/mint suivant utilise ensuite cette config de range deja figee, ce qui evite
-        // une divergence entre le plan de swap lu par le bot/keeper et le range effectivement minte.
-        // (Le palier rangeStepBps reste applique en amont dans _computeDynamicRangeBps.)
-        if (halfBps < minBps) halfBps = minBps;
-        if (halfBps > maxBps) halfBps = maxBps;
-        return (halfBps, true);
+    function combineStrategyForecasts(
+        int24[4] calldata trendPredictions,
+        uint24[3] calldata volatilityPredictions,
+        uint24[3] calldata feePredictions,
+        uint16[4] calldata trendWeights,
+        uint16[3] calldata volatilityWeights,
+        uint16[3] calldata feeWeights,
+        uint16 learningInfluenceBps
+    ) external pure returns (int24 trend, uint24 volatility, uint16 fees, uint16 uncertainty) {
+        int256 trendTotal;
+        uint256 volatilityTotal;
+        uint256 feeTotal;
+        uint16[3] memory uniform = [uint16(3334), 3333, 3333];
+        for (uint256 i; i < 4; ++i) {
+            uint256 weight = (
+                uint256(trendWeights[i]) * learningInfluenceBps + uint256(2500) * (10000 - learningInfluenceBps)
+            ) / 10000;
+            trendTotal += int256(trendPredictions[i]) * int256(weight);
+        }
+        for (uint256 i; i < 3; ++i) {
+            uint256 volatilityWeight = (
+                uint256(volatilityWeights[i]) * learningInfluenceBps
+                    + uint256(uniform[i]) * (10000 - learningInfluenceBps)
+            ) / 10000;
+            uint256 feeWeight = (
+                uint256(feeWeights[i]) * learningInfluenceBps + uint256(uniform[i]) * (10000 - learningInfluenceBps)
+            ) / 10000;
+            volatilityTotal += uint256(volatilityPredictions[i]) * volatilityWeight;
+            feeTotal += uint256(feePredictions[i]) * feeWeight;
+        }
+        trend = _safeInt24(trendTotal / 10000);
+        volatility = uint24(_minStrategy(volatilityTotal / 10000, 20000));
+        fees = uint16(_minStrategy(feeTotal / 10000, 2000));
+
+        uint256 spread;
+        for (uint256 i; i < 4; ++i) {
+            spread += _absStrategy(int256(trendPredictions[i]) - trend) / 4;
+        }
+        for (uint256 i; i < 3; ++i) {
+            spread += _absDiffStrategy(volatilityPredictions[i], volatility) / 3;
+            spread += _absDiffStrategy(feePredictions[i], fees) / 3;
+        }
+        uncertainty = uint16(_minStrategy(spread, 5000));
+    }
+
+    function _strategyLvrBps(int24 lower, int24 upper, int24 startTick, int24 endTick) private pure returns (uint256) {
+        (uint256 initial0, uint256 initial1) = _strategyAmountsAtTick(lower, upper, startTick, 1e12);
+        (uint256 final0, uint256 final1) = _strategyAmountsAtTick(lower, upper, endTick, 1e12);
+        uint256 holdValue = initial1 + _strategyQuote0To1(endTick, initial0);
+        uint256 lpValue = final1 + _strategyQuote0To1(endTick, final0);
+        if (holdValue == 0 || holdValue <= lpValue) return 0;
+        return _minStrategy(((holdValue - lpValue) * 10000) / holdValue, 5000);
+    }
+
+    function _strategyAmountsAtTick(int24 lower, int24 upper, int24 tick, uint128 liquidity)
+        private
+        pure
+        returns (uint256 amount0, uint256 amount1)
+    {
+        uint160 sqrtP = getSqrtRatioAtTick(tick);
+        uint160 sqrtA = getSqrtRatioAtTick(lower);
+        uint160 sqrtB = getSqrtRatioAtTick(upper);
+        if (sqrtP <= sqrtA) return (getAmount0ForLiquidity(sqrtA, sqrtB, liquidity), 0);
+        if (sqrtP >= sqrtB) return (0, getAmount1ForLiquidity(sqrtA, sqrtB, liquidity));
+        return (getAmount0ForLiquidity(sqrtP, sqrtB, liquidity), getAmount1ForLiquidity(sqrtA, sqrtP, liquidity));
+    }
+
+    function _strategyQuote0To1(int24 tick, uint256 amount0) private pure returns (uint256) {
+        if (amount0 == 0) return 0;
+        uint160 sqrtRatioX96 = getSqrtRatioAtTick(tick);
+        uint256 ratioX128 = Math.mulDiv(sqrtRatioX96, sqrtRatioX96, 1 << 64);
+        return Math.mulDiv(ratioX128, amount0, 1 << 128);
+    }
+
+    function _outsideStrategyDistance(int24 tick, int24 lower, int24 upper) private pure returns (uint256) {
+        if (tick <= lower) return uint256(uint24(lower - tick));
+        if (tick >= upper) return uint256(uint24(tick - upper));
+        return 0;
+    }
+
+    function _boundedStrategyTick(int256 tick) private pure returns (int24) {
+        if (tick <= MIN_TICK + 1) return MIN_TICK + 1;
+        if (tick >= MAX_TICK - 1) return MAX_TICK - 1;
+        return int24(tick);
+    }
+
+    function _safeInt32(int256 value) private pure returns (int32) {
+        if (value > type(int32).max) return type(int32).max;
+        if (value < type(int32).min) return type(int32).min;
+        return int32(value);
+    }
+
+    function _safeInt24(int256 value) private pure returns (int24) {
+        if (value > type(int24).max) return type(int24).max;
+        if (value < type(int24).min) return type(int24).min;
+        return int24(value);
+    }
+
+    function _absStrategy(int256 value) private pure returns (uint256) {
+        return uint256(value < 0 ? -value : value);
+    }
+
+    function _absDiffStrategy(uint256 a, uint256 b) private pure returns (uint256) {
+        return a > b ? a - b : b - a;
+    }
+
+    function _minStrategy(uint256 a, uint256 b) private pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function _maxStrategy(uint256 a, uint256 b) private pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    function _clampStrategy(uint256 value, uint256 minimum, uint256 maximum) private pure returns (uint256) {
+        if (value < minimum) return minimum;
+        if (value > maximum) return maximum;
+        return value;
     }
 }

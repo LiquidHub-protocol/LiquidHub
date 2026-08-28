@@ -16,16 +16,7 @@ interface IRangeManagerExtended {
     function setAuthorizedExecutor(address _executor, bool _authorized) external;
     function safeAddress() external view returns (address);
     function authorizedExecutors(address) external view returns (bool);
-    function setDynamicRangeConfig(
-        bool _enabled,
-        uint8 _maxSnapshotsPerDay,
-        uint8 _volatMoyDay,
-        uint8 _volatTrimDay,
-        uint16 _rangeStepBps,
-        uint16 _rangeMultiplicatorBps,
-        uint16 _rangeMinBps,
-        uint16 _rangeMaxBps
-    ) external;
+    function strategyEngine() external view returns (address);
 }
 
 interface IAaveHedgeSettlement {
@@ -53,7 +44,6 @@ interface IAaveHedgeSettlement {
     // (montants EXACTS, destination figée RM). onlySafeOrVault côté HedgeManager.
     function supplyAndBorrow(uint256 collateralAmountUsdc, uint256 borrowAmountWeth) external;
     function sweepWethAmount(uint256 amount, address to) external;
-    function withdrawCollateral(uint256 amountUsdc, address to) external;
     function hedgeTargetBps() external view returns (uint16);
     function reserveHfTargetBps() external view returns (uint16);
     function liqThresholdBps() external view returns (uint16);
@@ -392,32 +382,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit ExecutorAuthorizedOnRangeManager(executor, authorized);
     }
 
-    /// @notice Relaie setDynamicRangeConfig au RangeManager (dont ce Vault est l'owner).
-    /// @dev Permet de configurer le range dynamique au deploiement : le RangeManager appartient
-    ///      au Vault des sa construction, donc le deployeur ne peut pas l'appeler directement
-    ///      (onlyAuthorized => E99). Le deployeur (owner du Vault a ce stade) passe par ici.
-    function setDynamicRangeConfigOnRangeManager(
-        bool _enabled,
-        uint8 _maxSnapshotsPerDay,
-        uint8 _volatMoyDay,
-        uint8 _volatTrimDay,
-        uint16 _rangeStepBps,
-        uint16 _rangeMultiplicatorBps,
-        uint16 _rangeMinBps,
-        uint16 _rangeMaxBps
-    ) external onlyOwner {
-        IRangeManagerExtended(address(rangeManager)).setDynamicRangeConfig(
-            _enabled,
-            _maxSnapshotsPerDay,
-            _volatMoyDay,
-            _volatTrimDay,
-            _rangeStepBps,
-            _rangeMultiplicatorBps,
-            _rangeMinBps,
-            _rangeMaxBps
-        );
-    }
-
     /// @notice Phase 2 governance relay for RangeManager settings.
     /// @dev RangeManager is owned by this Vault. Once the Vault owner is a timelock and Safe ops are disabled
     ///      on RangeManager, governance can still execute RangeManager setters through this relay.
@@ -431,20 +395,36 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function _isAllowedRangeManagerGovernanceSelector(bytes4 selector) private pure returns (bool) {
-        return selector == bytes4(keccak256("configureRanges(uint16,uint16)"))
-            || selector == bytes4(keccak256("setDynamicRangeConfig(bool,uint8,uint8,uint8,uint16,uint16,uint16,uint16)"))
-            || selector == bytes4(keccak256("setDynamicRangeEnabled(bool)"))
-            || selector == bytes4(keccak256("setRangeMultiplicator(uint16)"))
+        return selector == bytes4(keccak256("setStrategyEngine(address,address)"))
             || selector == bytes4(keccak256("configureSlippage(uint24)"))
             || selector == bytes4(keccak256("configureTolerance(uint16)"))
             || selector == bytes4(keccak256("configureProtections(bool,bool,bool,uint16)"))
             || selector == bytes4(keccak256("setOracleParams(uint16,uint32,uint32)"))
             || selector == bytes4(keccak256("configurePriceFeeds(address,address,address)"))
-            || selector == bytes4(keccak256("sendTokenForHedge(address,uint256,address)"))
             || selector == bytes4(keccak256("setInitMultiSwapTvl(uint256)"))
             || selector == bytes4(keccak256("setTreasuryAddress(address)"))
             || selector == bytes4(keccak256("setSafeAddress(address)"))
             || selector == bytes4(keccak256("setAuthorizedExecutor(address,bool)"));
+    }
+
+    /// @notice Bounded governance relay to the strategy engine owned by this Vault.
+    function executeStrategyEngineGovernance(bytes calldata data) external onlyOwner returns (bytes memory result) {
+        if (data.length < 4) revert E21();
+        bytes4 selector = bytes4(data[:4]);
+        if (!_isAllowedStrategyEngineGovernanceSelector(selector)) revert E21();
+        address engine = IRangeManagerExtended(address(rangeManager)).strategyEngine();
+        if (engine == address(0)) revert E21();
+        (bool ok, bytes memory ret) = engine.call(data);
+        if (!ok) revert E21();
+        return ret;
+    }
+
+    function _isAllowedStrategyEngineGovernanceSelector(bytes4 selector) private pure returns (bool) {
+        return selector == bytes4(keccak256("setDecisionMode(uint8)"))
+            || selector == bytes4(keccak256("setLearningInfluence(uint16)"))
+            || selector == bytes4(keccak256("setRiskParameters(uint16,uint16,uint16,uint16,uint16)"))
+            || selector == bytes4(keccak256("setRangeBounds(uint16,uint16,uint16,uint16)"))
+            || selector == bytes4(keccak256("setDnHedgePolicy(uint16,uint16)"));
     }
 
     // REFONTE DN (nettoyage EIP-170) : calculateUserShareOfFees + estimateTotalFees (+ helpers
@@ -489,7 +469,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         // Transferer les tokens au vault
         if (amount1 > 0) {
-            DnDepositLib.pullExact(address(token1), msg.sender, amount1);
+            DnDepositLib.pullExact(address(token1), amount1);
         }
 
         // Ajouter a la queue
@@ -565,12 +545,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // DnDepositLib lit lui-même priceCache/config via le RangeManager (évite de décoder les gros structs
         // côté Vault — EIP-170). On ne passe que le rangeManager + les montants du dépôt en tête.
         return DnDepositLib.getDepositSwapParams(address(rangeManager), pd.amount0, pd.amount1);
-    }
-
-    /// @notice Plan de swap DN pour rebalance permissionless compatible avec la dette AAVE fixe.
-    /// @dev Vue utilisée par les keepers avant d'appeler RangeManager.rebalance().
-    function getRebalanceSwapParams() external view returns (bool zeroForOne, uint256 amountIn) {
-        return DnDepositLib.getRebalanceSwapParams(address(rangeManager));
     }
 
     /// @notice Cristallise les fees LP avant de calculer un plan de dépôt.
@@ -686,15 +660,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // initiale hedgee. Les keepers anonymes gardent le traitement permissionless des depots de croissance.
         bool hasPosition = rangeManager.getOwnerPositions().length > 0;
         if (!hasPosition && msg.sender != botModule && msg.sender != owner()) revert E03();
-        // 3. Refresh oracle atomique. audit V1 (V3-R4 Point 3, retour Codex) : on REFRESH d'abord le cache
-        // (slot0+oracle LIVE) de façon INCONDITIONNELLE — avant ne se faisait que via recordPriceSnapshot()
-        // qui revert si le snapshot n'est pas dû (catché), laissant le check depositMaxCacheAge buter sur un
-        // cache ancien et BLOQUER le chemin permissionless. refreshPriceCache() ne dépend pas du timing snapshot.
+        // 3. Refresh oracle atomique avant toute valorisation du depot permissionless.
         rangeManager.refreshPriceCache();
-        // AUDIT MED-2 : on NE rappelle PLUS recordPriceSnapshot() ici. Le bounty metrics de cette fonction est
-        // versé à msg.sender = le VAULT (pas au keeper qui déclenche le dépôt) → fuite/incohérence de bounty.
-        // La fraîcheur du cache est déjà garantie par refreshPriceCache() ci-dessus ; le ring-buffer des
-        // snapshots est entretenu par la cadence keeper/bot dédiée (recordPriceSnapshot direct), pas ici.
+        // Le checkpoint strategique suit sa propre epoch permissionless. Le traitement d'un depot ne peut donc
+        // jamais cumuler artificiellement les bounties de depot et de checkpoint.
         RangeOperations.RangeConfig memory cfg = rangeManager.config();
         (uint128 price0, uint128 price1,,, uint64 ts, bool valid) = rangeManager.priceCache();
         if (!valid || price0 == 0 || price1 == 0) revert E72();

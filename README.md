@@ -4,7 +4,7 @@ Decentralized liquidity management protocol.
 
 ## Overview
 
-Liquid Hub automates range management: **dynamic ranges computed 100% on-chain**, permissionless rebalancing, multi-user vaults with fair share accounting, and protocol fee collection via an on-chain Treasury. It runs on concentrated-liquidity DEXs; the architecture is DEX-agnostic, and each deployed pool documents the specific DEX it targets in its own folder.
+Liquid Hub automates range management through **adaptive decisions computed 100% on-chain**, permissionless execution, multi-user vaults with fair share accounting, and protocol fee collection via an on-chain Treasury. It runs on concentrated-liquidity DEXs; the architecture is DEX-agnostic, and each deployed pool documents the specific DEX it targets in its own folder.
 
 3 pool types:
 - **Exposed** — Directional LP exposure on a concentrated-liquidity DEX
@@ -16,10 +16,11 @@ Liquid Hub automates range management: **dynamic ranges computed 100% on-chain**
 | Contract | Description |
 |---|---|
 | **MultiUserVault** | Multi-user vault managing deposits, withdrawals, share accounting, and LP position lifecycle |
-| **RangeManager** | DEX price range management, on-chain swaps via the DEX router, 100% on-chain dynamic-range computation, permissionless rebalancing + price snapshots |
-| **RangeOperations** | Library for tick/range calculations and the on-chain dynamic-range formula |
+| **RangeStrategyEngine** | Per-pool analytical controller, fixed multi-scenario optimizer and bounded online adaptation; publishes deterministic on-chain actions and exact target ticks |
+| **RangeManager** | DEX position execution, bounded on-chain swaps and permissionless execution of fresh engine-approved rebalances |
+| **RangeOperations** | Library for tick alignment, liquidity calculations, swaps, valuation and fee accounting |
 | **SecureBotModule** | Gnosis Safe module whitelisting specific function selectors for automated operations |
-| **Treasury** | Protocol fee collection, keeper / metrics / hedge bounties (+ Phase 2 bridge bounty), admin withdrawals with monthly cap |
+| **Treasury** | Protocol fee collection, keeper / strategy-checkpoint / hedge bounties (+ Phase 2 bridge bounty), admin withdrawals with monthly cap |
 | **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: governed hedge target, permissionless over- and under-hedge correction when on-chain safety checks pass, atomic-rebalance fallback, proportional flash-loan settlement, health-factor monitoring |
 | **LiquidHubVaultRegistry** | Chain-local, read-only vault discovery directory for wallet and portfolio integrations |
 

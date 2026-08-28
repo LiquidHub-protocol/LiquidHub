@@ -29,6 +29,7 @@ contract SecureBotModule {
     address public immutable safe;
     address public immutable botAddress;
     address public immutable rangeManager;
+    address public immutable strategyEngine;
     address public immutable vault;
     address public immutable pauseController;
     address public immutable hedgeManager;
@@ -49,6 +50,10 @@ contract SecureBotModule {
     // module start/burn/swap/mint et les appels solveur AAVE ne sont plus exposes.
     bytes4 private constant END_REBALANCE_SELECTOR = 0x0040718e; // endRebalance()
     bytes4 private constant REFRESH_PRICE_SELECTOR = 0x0be1c372; // refreshPriceCache()
+    bytes4 private constant CHECKPOINT_SELECTOR = bytes4(keccak256("checkpointMarketState()"));
+    bytes4 private constant REBALANCE_SELECTOR =
+        bytes4(keccak256("rebalance(bytes32,uint256[],uint256[],address,address)"));
+    bytes4 private constant ADJUST_HEDGE_SELECTOR = bytes4(keccak256("adjustHedge()"));
 
     // Events
     event FunctionExecuted(bytes4 indexed selector, uint256 dailyCount);
@@ -64,6 +69,7 @@ contract SecureBotModule {
         address _safe,
         address _botAddress,
         address _rangeManager,
+        address _strategyEngine,
         address _vault,
         address _pauseController,
         address _hedgeManager,
@@ -71,7 +77,8 @@ contract SecureBotModule {
         uint256 _dailyLimit
     ) {
         require(
-            _safe != address(0) && _botAddress != address(0) && _rangeManager != address(0) && _vault != address(0)
+            _safe != address(0) && _botAddress != address(0) && _rangeManager != address(0)
+                && _strategyEngine != address(0) && _strategyEngine.code.length > 0 && _vault != address(0)
                 && _pauseController != address(0) && _hedgeManager != address(0) && _treasury != address(0),
             "E_ZERO"
         );
@@ -79,6 +86,7 @@ contract SecureBotModule {
         safe = _safe;
         botAddress = _botAddress;
         rangeManager = _rangeManager;
+        strategyEngine = _strategyEngine;
         vault = _vault;
         pauseController = _pauseController;
         hedgeManager = _hedgeManager;
@@ -94,9 +102,8 @@ contract SecureBotModule {
         // (Safe Phase 1 / Timelock Phase 2).
         // Le bot rafraîchit le cache via refreshPriceCache() (ne change aucune adresse).
         allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
-        allowedFunctions[0x6ecfe0f8] = true; // recordPriceSnapshot() - snapshot de prix (fallback bot si aucun keeper)
-        // Setters de stratégie/risk retirés du module: configureRanges, setDynamicRangeEnabled,
-        // configureSlippage, configureProtections, configureTolerance.
+        allowedFunctions[CHECKPOINT_SELECTOR] = true;
+        allowedFunctions[REBALANCE_SELECTOR] = true;
 
         // Fonctions MultiUserVault
         // processPendingDeposits (0x99dd7ead) RETIRÉ (audit V1) : fonction batch supprimée du Vault.
@@ -117,10 +124,10 @@ contract SecureBotModule {
         // supplyAndBorrow(uint256,uint256) reste exposée sur le HedgeManager pour le Vault,
         // mais n'est pas une action bot/keeper récurrente : DnDepositLib l'appelle depuis le Vault pendant les
         // dépôts DN atomiques. Elle n'est donc PAS whitelistée dans le module bot.
-        // AUDIT H-02 : adjustHedge() permissionless — whitelisté pour que le bot puisse le déclencher en surge
-        // (sur-hedge critique). NB : le cooldown on-chain s'applique aussi au bot (pas de bypass) — garde-fou
-        // anti-spam légitime. Le sur-hedge non corrigé immédiatement le sera au cycle suivant ou par un keeper.
-        allowedFunctions[0x1e694f32] = true; // adjustHedge()
+        // AUDIT H-02 : adjustHedge() permissionless, whitelisté pour le bot sans privilège d'exécution.
+        // Les règles on-chain sont identiques pour tous : confirmation et cooldown sur le drift ordinaire,
+        // contournement uniquement pour le drift critique ou la réparation HF urgente.
+        allowedFunctions[ADJUST_HEDGE_SELECTOR] = true;
         // Les appels de solveur hedge (borrow/repay/withdraw/sweeps) ne sont plus des actions bot recurrentes.
         // Ils restent appelables par le Vault/Safe quand le code du Vault en a besoin, pas via ce module.
         // closeAll (0xf6b32008) RETIRÉE (audit V1) : fonction d'URGENCE rare qui envoie TOUT
@@ -233,6 +240,7 @@ contract SecureBotModule {
     // Fonction existante pour RangeManager
     function executeRangeManagerFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
         bytes4 selector = bytes4(data[:4]);
+        require(selector == REFRESH_PRICE_SELECTOR || selector == REBALANCE_SELECTOR, "Wrong target");
         _requireInflowsForSelector(selector);
         if (selector != REFRESH_PRICE_SELECTOR) {
             _consumeDailyLimit();
@@ -242,6 +250,14 @@ contract SecureBotModule {
 
         _execute(rangeManager, 0, data);
 
+        emit FunctionExecuted(selector, dailySpent);
+    }
+
+    function executeStrategyEngineFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
+        bytes4 selector = bytes4(data[:4]);
+        require(selector == CHECKPOINT_SELECTOR, "Wrong target");
+        _consumeDailyLimit();
+        _execute(strategyEngine, 0, data);
         emit FunctionExecuted(selector, dailySpent);
     }
 
@@ -270,6 +286,7 @@ contract SecureBotModule {
     function executeHedgeFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
         _resetDailyCounterIfNeeded();
         bytes4 selector = bytes4(data[:4]);
+        require(selector == ADJUST_HEDGE_SELECTOR, "Wrong target");
         _execute(hedgeManager, 0, data);
 
         emit FunctionExecuted(selector, dailySpent);
@@ -454,11 +471,9 @@ contract SecureBotModule {
 
     function _isCoreSelector(bytes4 selector) private pure returns (bool) {
         return selector == 0x0be1c372 // refreshPriceCache()
-            || selector == 0x6ecfe0f8 // recordPriceSnapshot()
-            || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
+            || selector == CHECKPOINT_SELECTOR || selector == REBALANCE_SELECTOR || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
             || selector == 0x0040718e // endRebalance()
-            || selector == 0x1e694f32 // adjustHedge()
-            || selector == 0xa5599124 // bridgeToStakers(uint256)
+            || selector == ADJUST_HEDGE_SELECTOR || selector == 0xa5599124 // bridgeToStakers(uint256)
             || selector == 0x56a12aca; // distributeToStakers(uint256)
     }
 }

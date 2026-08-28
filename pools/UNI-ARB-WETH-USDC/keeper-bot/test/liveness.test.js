@@ -392,7 +392,7 @@ test('chunk count and splitting stay in BigInt arithmetic', () => {
 });
 
 test('atomic action gas is buffered but never allowed to reach the block limit', async () => {
-  const rebalancer = new Rebalancer({}, {}, {}, {});
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
   const signer = { address: '0x0000000000000000000000000000000000000011' };
   const provider = {
     estimateGas: async () => 100n,
@@ -458,13 +458,21 @@ test('rebalance syncs fees before planning and refreshes only for a retryable re
       return { hash: '0xabc' };
     },
   };
-  const rebalancer = new Rebalancer(rangeManager, {}, wallet, rpcPool);
+  const rebalancer = new Rebalancer(rangeManager, {}, {}, wallet, rpcPool);
   let buildCount = 0;
   let simulationCount = 0;
   rebalancer._readPriceCache = async () => ({ valid: true });
+  rebalancer._readRebalanceDecision = async () => ({ decisionHash: '0x' + '11'.repeat(32) });
   rebalancer._buildRebalancePlan = async () => {
     events.push(`build:${++buildCount}`);
-    return { swapAmounts: [], minOuts: [], tokenIn: '0x1', tokenOut: '0x2', chunkCount: 0n };
+    return {
+      decisionHash: '0x' + '11'.repeat(32),
+      swapAmounts: [],
+      minOuts: [],
+      tokenIn: '0x1',
+      tokenOut: '0x2',
+      chunkCount: 0n,
+    };
   };
   rebalancer._simulateRebalance = async () => {
     events.push(`simulate:${++simulationCount}`);
@@ -491,9 +499,10 @@ test('rebalance syncs fees before planning and refreshes only for a retryable re
 });
 
 test('unrelated rebalance revert does not trigger an isolated price refresh', async () => {
-  const rebalancer = new Rebalancer({}, {}, {}, {});
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
   let refreshCount = 0;
   rebalancer._readPriceCache = async () => ({ valid: true });
+  rebalancer._readRebalanceDecision = async () => ({ decisionHash: '0x' + '11'.repeat(32) });
   rebalancer._syncFeesForActionPlan = async () => {};
   rebalancer._buildRebalancePlan = async () => ({ swapAmounts: [], minOuts: [] });
   rebalancer._simulateRebalance = async () => { throw new Error('E03 cooldown active'); };
@@ -505,16 +514,17 @@ test('unrelated rebalance revert does not trigger an isolated price refresh', as
 });
 
 test('router fill errors trigger one action-coupled refresh and plan recompute', () => {
-  const rebalancer = new Rebalancer({}, {}, {}, {});
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('Too little received')), true);
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: PartialFill()')), true);
 });
 
 test('rebalance no longer needed does not sync fees, refresh, or send a tx', async () => {
-  const rebalancer = new Rebalancer({}, {}, {}, {});
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
   let feeSyncCount = 0;
   let refreshCount = 0;
   rebalancer._readPriceCache = async () => ({ valid: true });
+  rebalancer._readRebalanceDecision = async () => ({ decisionHash: '0x' + '11'.repeat(32) });
   rebalancer._buildRebalancePlan = async () => ({ swapAmounts: [], minOuts: [] });
   rebalancer._simulateRebalance = async () => { throw new Error('E90'); };
   rebalancer._syncFeesForActionPlan = async () => { feeSyncCount += 1; };
@@ -530,16 +540,16 @@ test('rebalance no longer needed does not sync fees, refresh, or send a tx', asy
 test('deposit is deferred when the final on-chain instruction requires a rebalance', async () => {
   let feeSyncCount = 0;
   let signedTxCount = 0;
-  const rangeManager = {
+  const strategyEngine = {
     connect: () => ({
-      getBotInstructions: async () => [true, 1n, true, 'REBALANCE', 'dynamic range changed'],
+      previewDecision: async () => ({ action: 2n, dataFresh: true }),
     }),
   };
   const rpcPool = {
     executeWithRetry: async (fn) => await fn({}),
     executeSignedTxWithRetry: async () => { signedTxCount += 1; },
   };
-  const rebalancer = new Rebalancer(rangeManager, {}, {}, rpcPool);
+  const rebalancer = new Rebalancer({}, {}, strategyEngine, {}, rpcPool);
   rebalancer._syncFeesForActionPlan = async () => { feeSyncCount += 1; };
 
   const result = await rebalancer.processDeposit();

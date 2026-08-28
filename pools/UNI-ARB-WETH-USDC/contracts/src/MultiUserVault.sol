@@ -15,16 +15,7 @@ interface IRangeManagerExtended {
     function setAuthorizedExecutor(address _executor, bool _authorized) external;
     function safeAddress() external view returns (address);
     function authorizedExecutors(address) external view returns (bool);
-    function setDynamicRangeConfig(
-        bool _enabled,
-        uint8 _maxSnapshotsPerDay,
-        uint8 _volatMoyDay,
-        uint8 _volatTrimDay,
-        uint16 _rangeStepBps,
-        uint16 _rangeMultiplicatorBps,
-        uint16 _rangeMinBps,
-        uint16 _rangeMaxBps
-    ) external;
+    function strategyEngine() external view returns (address);
 }
 
 interface IRangeManager {
@@ -330,32 +321,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit ExecutorAuthorizedOnRangeManager(executor, authorized);
     }
 
-    /// @notice Relaie setDynamicRangeConfig au RangeManager (dont ce Vault est l'owner).
-    /// @dev Permet de configurer le range dynamique au deploiement : le RangeManager appartient
-    ///      au Vault des sa construction, donc le deployeur ne peut pas l'appeler directement
-    ///      (onlyAuthorized => E99). Le deployeur (owner du Vault a ce stade) passe par ici.
-    function setDynamicRangeConfigOnRangeManager(
-        bool _enabled,
-        uint8 _maxSnapshotsPerDay,
-        uint8 _volatMoyDay,
-        uint8 _volatTrimDay,
-        uint16 _rangeStepBps,
-        uint16 _rangeMultiplicatorBps,
-        uint16 _rangeMinBps,
-        uint16 _rangeMaxBps
-    ) external onlyOwner {
-        IRangeManagerExtended(address(rangeManager)).setDynamicRangeConfig(
-            _enabled,
-            _maxSnapshotsPerDay,
-            _volatMoyDay,
-            _volatTrimDay,
-            _rangeStepBps,
-            _rangeMultiplicatorBps,
-            _rangeMinBps,
-            _rangeMaxBps
-        );
-    }
-
     /// @notice Phase 2 governance relay for RangeManager settings.
     /// @dev RangeManager is owned by this Vault. Once the Vault owner is a timelock and Safe ops are disabled
     ///      on RangeManager, governance can still execute RangeManager setters through this relay.
@@ -369,10 +334,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function _isAllowedRangeManagerGovernanceSelector(bytes4 selector) private pure returns (bool) {
-        return selector == bytes4(keccak256("configureRanges(uint16,uint16)"))
-            || selector == bytes4(keccak256("setDynamicRangeConfig(bool,uint8,uint8,uint8,uint16,uint16,uint16,uint16)"))
-            || selector == bytes4(keccak256("setDynamicRangeEnabled(bool)"))
-            || selector == bytes4(keccak256("setRangeMultiplicator(uint16)"))
+        return selector == bytes4(keccak256("setStrategyEngine(address,address)"))
             || selector == bytes4(keccak256("configureSlippage(uint24)"))
             || selector == bytes4(keccak256("configureTolerance(uint16)"))
             || selector == bytes4(keccak256("configureProtections(bool,bool,bool,uint16)"))
@@ -382,6 +344,25 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             || selector == bytes4(keccak256("setTreasuryAddress(address)"))
             || selector == bytes4(keccak256("setSafeAddress(address)"))
             || selector == bytes4(keccak256("setAuthorizedExecutor(address,bool)"));
+    }
+
+    /// @notice Bounded governance relay to the strategy engine owned by this Vault.
+    function executeStrategyEngineGovernance(bytes calldata data) external onlyOwner returns (bytes memory result) {
+        require(data.length >= 4, "E20");
+        bytes4 selector = bytes4(data[:4]);
+        require(_isAllowedStrategyEngineGovernanceSelector(selector), "E20");
+        address engine = IRangeManagerExtended(address(rangeManager)).strategyEngine();
+        require(engine != address(0), "E20");
+        (bool ok, bytes memory ret) = engine.call(data);
+        require(ok, "E20");
+        return ret;
+    }
+
+    function _isAllowedStrategyEngineGovernanceSelector(bytes4 selector) private pure returns (bool) {
+        return selector == bytes4(keccak256("setDecisionMode(uint8)"))
+            || selector == bytes4(keccak256("setLearningInfluence(uint16)"))
+            || selector == bytes4(keccak256("setRiskParameters(uint16,uint16,uint16,uint16,uint16)"))
+            || selector == bytes4(keccak256("setRangeBounds(uint16,uint16,uint16,uint16)"));
     }
 
     // AUDIT (nettoyage code mort, parité avec la pool DN) : calculateUserShareOfFees + estimateTotalFees

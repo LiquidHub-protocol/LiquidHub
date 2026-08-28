@@ -4,7 +4,15 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 
 const { ethers } = require('ethers');
 const { RPCPool } = require('./utils/rpc');
-const { createContracts, assertKeeperTopology, TREASURY_ABI, ERC20_ABI } = require('./utils/contracts');
+const {
+  createContracts,
+  assertKeeperTopology,
+  TREASURY_ABI,
+  ERC20_ABI,
+  STRATEGY_ACTION,
+  STRATEGY_ACTION_LABELS,
+  STRATEGY_REASON_LABELS,
+} = require('./utils/contracts');
 const { PersistentActionAlerts } = require('./utils/action-alerts');
 const { Rebalancer } = require('./rebalancer');
 
@@ -32,26 +40,6 @@ async function logPriceCacheBeforeDecision(rangeManager, rpcPool) {
   if (!needsPriceCacheRefresh(priceCache)) return false;
   console.log('  priceCache stale/invalid before keeper decision — action paths refresh it atomically before use');
   return true;
-}
-
-async function isLivePositionOutOfRange(rangeManager, tokenId, rpcPool) {
-  return await rpcPool.executeWithRetry(async (provider) => {
-    const rm = rangeManager.connect(provider);
-    const [poolAddress, positionManagerAddress] = await Promise.all([rm.pool(), rm.positionManager()]);
-    const pool = new ethers.Contract(
-      poolAddress,
-      ['function slot0() view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)'],
-      provider
-    );
-    const positionManager = new ethers.Contract(
-      positionManagerAddress,
-      ['function positions(uint256) view returns (uint96,address,address,address,uint24,int24,int24,uint128,uint256,uint256,uint128,uint128)'],
-      provider
-    );
-    const [slot0, position] = await Promise.all([pool.slot0(), positionManager.positions(tokenId)]);
-    const tick = Number(slot0[1]);
-    return tick <= Number(position[5]) || tick >= Number(position[6]);
-  });
 }
 
 async function readContract(rpcPool, contract, method, ...args) {
@@ -109,12 +97,29 @@ async function trackAction(alerts, method, ...args) {
 
 function persistedActionName(label) {
   const value = String(label || '').toLowerCase();
-  if (value.includes('snapshot')) return 'snapshot';
+  if (value.includes('checkpoint')) return 'checkpoint';
   if (value.includes('rebalance')) return 'rebalance';
   if (value.includes('hedge')) return 'adjustHedge';
   if (value.includes('deposit')) return 'deposit';
   if (value.includes('syncfees')) return 'deposit';
   return 'cycle';
+}
+
+function strategyLabel(labels, value, fallback) {
+  return labels[Number(value)] || `${fallback}_${Number(value)}`;
+}
+
+async function readStrategyState(rpcPool, rangeManager, strategyEngine) {
+  return await rpcPool.executeWithRetry(async (provider) => {
+    const rm = rangeManager.connect(provider);
+    const engine = strategyEngine.connect(provider);
+    const [positions, decision, checkpointDue] = await Promise.all([
+      rm.getOwnerPositions(),
+      engine.previewDecision(),
+      engine.checkpointDue(),
+    ]);
+    return { positions, decision, checkpointDue };
+  });
 }
 
 async function reconcileSignerState(rpcPool, actionAlerts) {
@@ -140,12 +145,20 @@ async function reconcileSignerState(rpcPool, actionAlerts) {
 async function main() {
   console.log('=== Liquid Hub Keeper Bot (Standard Pool) ===');
   console.log(`RangeManager: ${process.env.RANGEMANAGER_ADDRESS}`);
+  console.log(`RangeStrategyEngine: ${process.env.RANGE_STRATEGY_ENGINE_ADDRESS}`);
   console.log(`Vault: ${process.env.VAULT_ADDRESS}`);
   console.log(`Check interval: ${CHECK_INTERVAL_MS / 60000} minutes`);
   console.log(`Mode: ${CHECK_ONLY ? 'CHECK ONLY' : 'ACTIVE'}\n`);
 
   // Validate required env vars (VAULT_ADDRESS kept for Treasury discovery)
-  const required = ['RPC_URL', 'RANGEMANAGER_ADDRESS', 'VAULT_ADDRESS', 'TOKEN0_ADDRESS', 'TOKEN1_ADDRESS'];
+  const required = [
+    'RPC_URL',
+    'RANGEMANAGER_ADDRESS',
+    'RANGE_STRATEGY_ENGINE_ADDRESS',
+    'VAULT_ADDRESS',
+    'TOKEN0_ADDRESS',
+    'TOKEN1_ADDRESS',
+  ];
   if (!CHECK_ONLY) required.push('KEEPER_PRIVATE_KEY');
   for (const key of required) {
     if (!process.env[key]) {
@@ -157,9 +170,9 @@ async function main() {
   const rpcPool = new RPCPool();
   await rpcPool.verifyProviderChains();
   const provider = rpcPool.getProvider();
-  const { rangeManager, vault, pauseController } = createContracts(provider);
-  await assertKeeperTopology(rpcPool, { rangeManager, vault });
-  console.log('Keeper topology: RangeManager/Vault/tokens verified\n');
+  const { rangeManager, vault, strategyEngine, pauseController } = createContracts(provider);
+  await assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine });
+  console.log('Keeper topology: RangeManager/Vault/RangeStrategyEngine/tokens verified\n');
 
   const actionAlerts = new PersistentActionAlerts({
     poolName: process.env.POOL_NAME || 'UNI-ARB-WETH-USDC',
@@ -172,13 +185,13 @@ async function main() {
     try {
       const keeperEnabled = await readContract(rpcPool, treasury, 'keeperBountyEnabled');
       const keeperAmount = await readContract(rpcPool, treasury, 'keeperBountyAmount');
-      const metricsEnabled = await readContract(rpcPool, treasury, 'metricsBountyEnabled');
-      const metricsAmount = await readContract(rpcPool, treasury, 'metricsBountyAmount');
+      const checkpointEnabled = await readContract(rpcPool, treasury, 'strategyCheckpointBountyEnabled');
+      const checkpointAmount = await readContract(rpcPool, treasury, 'strategyCheckpointBountyAmount');
       const depositEnabled = await readContract(rpcPool, treasury, 'depositBountyEnabled');
       const depositAmount = await readContract(rpcPool, treasury, 'depositBountyAmount');
       console.log(`Treasury: ${treasuryAddr}`);
       console.log(`Keeper bounty (rebalance): ${keeperEnabled ? ethers.formatUnits(keeperAmount, 6) + ' USDC' : 'disabled'}`);
-      console.log(`Metrics bounty (snapshot): ${metricsEnabled ? ethers.formatUnits(metricsAmount, 6) + ' USDC' : 'disabled'}`);
+      console.log(`Strategy checkpoint bounty: ${checkpointEnabled ? ethers.formatUnits(checkpointAmount, 6) + ' USDC' : 'disabled'}`);
       console.log(`Deposit bounty (process): ${depositEnabled ? ethers.formatUnits(depositAmount, 6) + ' USDC' : 'disabled'}`);
       if (usdc) {
         const bal = await readContract(rpcPool, usdc, 'balanceOf', treasuryAddr);
@@ -196,7 +209,7 @@ async function main() {
   let wallet, rebalancer;
   if (!CHECK_ONLY) {
     wallet = new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY, provider);
-    rebalancer = new Rebalancer(rangeManager, vault, wallet, rpcPool);
+    rebalancer = new Rebalancer(rangeManager, vault, strategyEngine, wallet, rpcPool);
     console.log(`Keeper wallet: ${wallet.address}\n`);
   }
 
@@ -208,23 +221,19 @@ async function main() {
 
       await logPriceCacheBeforeDecision(rangeManager, rpcPool);
 
-      let [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
-        async (p) => {
-          const rm = rangeManager.connect(p);
-          return await rm.getBotInstructions();
-        }
-      );
-      if (hasPosition && !needsRebalance
-          && await isLivePositionOutOfRange(rangeManager, tokenId, rpcPool)) {
-        needsRebalance = true;
-        action = 'REBALANCE';
-        reason = 'Live pool tick is outside the current range; action path will refresh and recompute';
-        console.log('  Live tick check: position is out of range; rebalance action enabled');
-      }
+      let strategyState = await readStrategyState(rpcPool, rangeManager, strategyEngine);
+      let { positions, decision, checkpointDue } = strategyState;
+      let hasPosition = positions.length > 0;
+      let tokenId = hasPosition ? positions[0] : 0n;
+      let strategyAction = Number(decision.action);
+      let actionLabel = strategyLabel(STRATEGY_ACTION_LABELS, decision.action, 'ACTION');
+      let reasonLabel = strategyLabel(STRATEGY_REASON_LABELS, decision.reason, 'REASON');
 
       console.log(`  Position: ${hasPosition ? '#' + tokenId.toString() : 'none'}`);
       if (hasPosition) {
-        console.log(`  Needs rebalance: ${needsRebalance}`);
+        console.log(`  Strategy action: ${actionLabel}`);
+        console.log(`  Strategy reason: ${reasonLabel}`);
+        console.log(`  Strategy epoch: ${decision.epoch.toString()} (${decision.dataFresh ? 'fresh' : 'not executable'})`);
       }
 
       // Pause reads fail closed for deposit processing only. Permissionless position
@@ -236,84 +245,71 @@ async function main() {
             return await pauseController.connect(p).inflowsPaused();
           });
           if (inflowsPaused) {
-            console.log('  PauseController: inflows paused — skip deposit processing; rebalance remains enabled');
+            console.log('  PauseController: inflows paused — skip deposit processing; strategy maintenance remains enabled');
           }
         } catch (e) {
           inflowsPaused = true;
           console.log(
             `  PauseController: unavailable (${(e.message || '').slice(0, 80)}) — ` +
-            'skip deposits; rebalance and snapshots remain enabled'
+            'skip deposits; strategy maintenance remains enabled'
           );
         }
       } else {
-        console.log('  PauseController: not configured — skip deposits; rebalance and snapshots remain enabled');
+        console.log('  PauseController: not configured — skip deposits; strategy maintenance remains enabled');
       }
 
-      // --- Dynamic range snapshot (permissionless, metrics bounty) ---
-      // The on-chain range is computed from price snapshots stored in a ring buffer. Anyone can
-      // record one when it is due (the contract spaces them by 24h/maxSnapshotsPerDay and reverts
-      // otherwise). A successful call earns the metrics bounty. Independent of the rebalance check.
-      // IMPORTANT (oracle freshness): recording a snapshot here keeps the ring buffer fresh and earns the
-      // metrics bounty. NOTE (audit): rebalance() DOES refresh the price cache itself (refresh-and-validate
-      // guard at the top), so rebalance freshness no longer depends on this snapshot — the ordering is kept
-      // only so one cycle can both snapshot and rebalance on a fresh price.
-      if (!CHECK_ONLY) {
-        let snapshotDue = false;
-        let snapshotStateChanged = false;
+      // The checkpoint is permissionless and computes the canonical market state on-chain.
+      // A keeper supplies no price, score, range or hedge target.
+      if (checkpointDue) {
+        if (CHECK_ONLY) {
+          console.log('  -> Strategy checkpoint due (check-only mode, skipping transaction)');
+        } else {
         try {
-          snapshotDue = await rpcPool.executeWithRetry(async (p) => {
-            return await rangeManager.connect(p).isSnapshotDue();
-          });
-          if (snapshotDue) {
-            const metricsEnabled = treasury ? await readContract(rpcPool, treasury, 'metricsBountyEnabled') : false;
-            const metricsAmount = treasury ? await readContract(rpcPool, treasury, 'metricsBountyAmount') : 0n;
-            await checkBountyFunding('metrics', metricsEnabled, metricsAmount, treasuryAddr, usdc, rpcPool);
-            console.log('  -> Snapshot due, recording price on-chain...');
-            const rcpt = await rpcPool.executeSignedTxWithRetry(async (p) => {
+            const checkpointEnabled = treasury
+              ? await readContract(rpcPool, treasury, 'strategyCheckpointBountyEnabled')
+              : false;
+            const checkpointAmount = treasury
+              ? await readContract(rpcPool, treasury, 'strategyCheckpointBountyAmount')
+              : 0n;
+            await checkBountyFunding(
+              'strategy checkpoint',
+              checkpointEnabled,
+              checkpointAmount,
+              treasuryAddr,
+              usdc,
+              rpcPool
+            );
+            console.log('  -> Recording canonical strategy checkpoint...');
+            const receipt = await rpcPool.executeSignedTxWithRetry(async (p) => {
               const signer = wallet.connect(p);
-              const rm = rangeManager.connect(signer);
+              const engine = strategyEngine.connect(signer);
               return {
                 wallet: signer,
-                request: await rm.recordPriceSnapshot.populateTransaction(),
+                request: await engine.checkpointMarketState.populateTransaction(),
               };
-            }, 'recordPriceSnapshot');
-            console.log(`  -> Snapshot recorded: ${rcpt.hash}`);
-            await trackAction(actionAlerts, 'success', 'snapshot', `Snapshot recorded: ${rcpt.hash}`);
-            snapshotStateChanged = true;
-          } else {
-            await trackAction(actionAlerts, 'success', 'snapshot', 'Snapshot no longer due');
-          }
-        } catch (e) {
-          let stillDue = true;
-          try {
-            stillDue = await rpcPool.executeWithRetry(async (p) => {
-              return await rangeManager.connect(p).isSnapshotDue();
-            });
-          } catch {
-            // Preserve the original failure if the reconciliation read is also unavailable.
-          }
-          if (!stillDue) {
-            snapshotStateChanged = true;
-            console.log('  Snapshot: completed by another keeper during this attempt');
-            await trackAction(actionAlerts, 'success', 'snapshot', 'Snapshot completed by another keeper');
-          } else {
-            console.log(`  Snapshot: skipped (${(e.reason || e.message || '').slice(0, 80)})`);
-            await trackAction(actionAlerts, 'failure', 'snapshot', e.reason || e.message);
+            }, 'checkpointMarketState');
+            console.log(`  -> Strategy checkpoint recorded: ${receipt.hash}`);
+            await trackAction(actionAlerts, 'success', 'checkpoint', `Checkpoint recorded: ${receipt.hash}`);
+          } catch (error) {
+            const stillDue = await readContract(rpcPool, strategyEngine, 'checkpointDue').catch(() => true);
+            if (stillDue) {
+              console.log(`  Strategy checkpoint skipped: ${(error.reason || error.message || '').slice(0, 90)}`);
+              await trackAction(actionAlerts, 'failure', 'checkpoint', error.reason || error.message);
+            } else {
+              console.log('  Strategy checkpoint completed by another keeper');
+              await trackAction(actionAlerts, 'success', 'checkpoint', 'Checkpoint completed by another keeper');
+            }
           }
         }
 
-        if (snapshotStateChanged) {
-          [hasPosition, tokenId, needsRebalance, action, reason] = await rpcPool.executeWithRetry(
-            async (p) => await rangeManager.connect(p).getBotInstructions()
-          );
-          if (hasPosition && !needsRebalance
-              && await isLivePositionOutOfRange(rangeManager, tokenId, rpcPool)) {
-            needsRebalance = true;
-            action = 'REBALANCE';
-            reason = 'Live pool tick is outside the current range after snapshot';
-          }
-          console.log(`  Instructions refreshed after snapshot: rebalance=${needsRebalance}, action=${action}`);
-        }
+        strategyState = await readStrategyState(rpcPool, rangeManager, strategyEngine);
+        ({ positions, decision, checkpointDue } = strategyState);
+        hasPosition = positions.length > 0;
+        tokenId = hasPosition ? positions[0] : 0n;
+        strategyAction = Number(decision.action);
+        actionLabel = strategyLabel(STRATEGY_ACTION_LABELS, decision.action, 'ACTION');
+        reasonLabel = strategyLabel(STRATEGY_REASON_LABELS, decision.reason, 'REASON');
+        console.log(`  Strategy refreshed: action=${actionLabel}, reason=${reasonLabel}`);
       }
 
       // --- Process queued user deposit (permissionless, deposit bounty) ---
@@ -345,9 +341,9 @@ async function main() {
             const message = `${pending} queued deposit(s) waiting for the main bot initial mint`;
             console.log(`  Deposit deferred: ${message}`);
             await trackAction(actionAlerts, 'failure', 'mint', message);
-          } else if (needsRebalance && action === 'REBALANCE') {
+          } else if (strategyAction === STRATEGY_ACTION.RANGE_REBALANCE) {
             await trackAction(actionAlerts, 'success', 'mint', 'Initial position is available');
-            console.log(`  Deposit deferred: known rebalance is due (${reason || 'on-chain signal'})`);
+            console.log(`  Deposit deferred: ${actionLabel} is eligible (${reasonLabel})`);
           } else if (!isRebalancing) {
             await trackAction(actionAlerts, 'success', 'mint', 'Initial position is available');
             const depEnabled = treasury ? await readContract(rpcPool, treasury, 'depositBountyEnabled') : false;
@@ -368,12 +364,9 @@ async function main() {
         }
       }
 
-      // Public keepers can call the allowed permissionless maintenance paths:
-      // snapshots, queued deposit processing and atomic rebalance().
-      // on the RangeManager. Other actions (MINT_INITIAL, etc.) are gated on-chain
-      // by `onlyAuthorized` and reserved for the protocol bot / Safe, so we just
-      // wait silently for the next cycle.
-      if (!needsRebalance || action !== 'REBALANCE') {
+      // Public keepers execute only the action authorized by the canonical on-chain enum.
+      // Initial mint remains the sole protocol-bot-only operational path.
+      if (strategyAction !== STRATEGY_ACTION.RANGE_REBALANCE) {
         console.log('  -> No rebalance needed\n');
         await trackAction(actionAlerts, 'success', 'rebalance', 'Rebalance completed elsewhere or no longer required');
       } else if (CHECK_ONLY) {
@@ -383,7 +376,7 @@ async function main() {
         const keeperAmount = treasury ? await readContract(rpcPool, treasury, 'keeperBountyAmount') : 0n;
         await checkBountyFunding('rebalance', keeperEnabled, keeperAmount, treasuryAddr, usdc, rpcPool);
         console.log('  -> Executing REBALANCE...');
-        const result = await rebalancer.executeRebalance(tokenId);
+        const result = await rebalancer.executeRebalance(tokenId, decision.decisionHash);
         if (result.noAction) {
           console.log('  -> Rebalance completed elsewhere or no longer required\n');
           await trackAction(actionAlerts, 'success', 'rebalance', 'Rebalance no longer required after simulation');

@@ -26,13 +26,13 @@ The `SecureBotModule` is a Gnosis Safe module that whitelists specific function 
 
 **Whitelisted operations (high-level):**
 
-- Operational module actions only: atomic queued-deposit processing, snapshots, cache refresh, and Treasury
+- Operational module actions only: atomic queued-deposit processing, canonical strategy checkpoints, eligible rebalances, cache refresh, and Treasury
   distribution/bridge calls when enabled.
 - Both pool variants use the atomic public `RangeManager.rebalance(...)` entrypoint. Legacy multi-transaction
   primitives are excluded from the module core-selector set and cannot be re-enabled through `allowFunction()`.
 - Refresh the price cache (`refreshPriceCache`, no address change) — oracle **addresses** themselves can only be
   set through the Vault governance relay (Safe in Phase 1, Timelock in Phase 2; never the module)
-- Record price snapshots (dynamic-range ring buffer; bot fallback when no keeper acts)
+- Advance a due canonical strategy epoch on the pool's immutable `RangeStrategyEngine`
 - Delta-Neutral routine hedge adjustment uses the public `adjustHedge()` path; broad AAVE sweep/repay/withdraw
   operations are not part of the public keeper/module allowlist.
 - Treasury bridging to stakers (Phase 2)
@@ -42,16 +42,18 @@ The `SecureBotModule` is a Gnosis Safe module that whitelists specific function 
 | Selector | Function | Target / pools |
 |---|---|---|
 | `0x0be1c372` | `refreshPriceCache()` | RangeManager / standard + DN |
-| `0x6ecfe0f8` | `recordPriceSnapshot()` | RangeManager / standard + DN |
+| `0x3af05dea` | `checkpointMarketState()` | RangeStrategyEngine / standard + DN |
+| `0x71b3853f` | `rebalance(bytes32,uint256[],uint256[],address,address)` | RangeManager / standard + DN |
 | `0x76919a59` | `processDepositPermissionless(uint256[],uint256[],address,address)` | Vault / standard + DN |
 | `0x0040718e` | `endRebalance()` | Vault unlock / standard + DN |
 | `0x1e694f32` | `adjustHedge()` | AaveHedgeManager / DN only |
 | `0xa5599124` | `bridgeToStakers(uint256)` | Treasury / standard + DN, Phase 2 |
 | `0x56a12aca` | `distributeToStakers(uint256)` | Treasury / standard + DN, Phase 2 |
 
-The execution entrypoint also restricts which target contract each selector can reach. `rebalance()`
-(`0xed375437`) is intentionally absent: both pool variants expose it as a guarded permissionless RangeManager
-function, so community keepers call it directly rather than through the Safe module.
+The execution entrypoint also restricts which target contract each selector can reach. In particular,
+`checkpointMarketState()` can target only the immutable strategy engine, and `rebalance(...)` only the linked
+RangeManager. Both remain directly callable through their guarded permissionless paths by community keepers; the
+module exists only for the protocol bot fallback.
 
 **Blocked operations (cannot be called via the module):**
 
@@ -156,7 +158,7 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 
 - **Targeted module pause**: `SecureBotModule.setPaused(true)` stops every privileged operation routed through
   that module, including module-routed maintenance. It does not pause the public, permissionless maintenance
-  entrypoints (`rebalance()`, snapshots, deposit processing and, on DN pools, `adjustHedge()`), which remain
+  entrypoints (`rebalance()`, strategy checkpoints, deposit processing and, on DN pools, `adjustHedge()`), which remain
   protected by their on-chain guards and callable by bot/keepers. In Phase 2 the Safe can pause immediately,
   but only the Timelock owner can unpause. The Safe can also revoke/disable a compromised module.
 - **PauseController**: controls user flows. Inflow pause blocks new deposit processing; withdrawal pause also
@@ -177,11 +179,11 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 
 | Function | Access | Description |
 |----------|--------|-------------|
-| `rebalance()` | Public (permissionless) | Atomic burn → swaps → mint; protected by the refresh + deviation guard, oracle-bounded `minAmountsOut`, exact-input consumption checks, and the on-chain rebalance-needed condition |
+| `rebalance()` | Public (permissionless) | Atomic burn → swaps → mint; protected by the fresh strategy decision/hash, refresh + deviation guard, oracle-bounded `minAmountsOut`, exact-input consumption checks and profile post-checks |
 | `executeSwap()` / `mintInitialPosition()` / `burnPosition()` | Restricted legacy primitives | Excluded from the `SecureBotModule`; production deposits use `processDepositPermissionless()` and rebalances use atomic `rebalance()` |
 | `configurePriceFeeds()` / `setOracleParams()` | Vault owner relay | Governance settings via `MultiUserVault.executeRangeManagerGovernance(bytes)`: Safe in phase 1, Timelock in phase 2 |
 | `refreshPriceCache()` | Public | Refreshes the price cache (no address change) |
-| `configureRanges()` | Vault owner relay | Governance setting via Safe/Timelock relay, not the bot module |
+| bounded strategy setters | RangeStrategyEngine owner/Vault relay | Governance settings within immutable caps via Safe/Timelock relay, never caller-supplied target ticks |
 | `setTreasuryAddress()` | Vault owner relay | Governance setting via Safe/Timelock relay |
 
 ### Treasury
@@ -191,6 +193,7 @@ the contracts remain fail-closed through oracle, TWAP, min-out and range checks.
 | `swapToUSDC()` | `onlyOwner` (Safe Phase 1 / Timelock Phase 2) | Converts configured ERC-20 tokens to USDC; the fee tier is fixed on-chain by the pool batch |
 | `adminWithdraw()` | `onlyOwner` (Safe Phase 1 / Timelock Phase 2) | Monthly cap enforced until the irreversible final Phase 2 lock disables it |
 | `payKeeperBounty()` | Authorized RangeManagers only | Called automatically after rebalance |
+| `payStrategyCheckpointBounty()` | Authorized RangeStrategyEngines only | Called after one valid new canonical epoch |
 | `disableAdminWithdraw()` | `onlyOwner` | **IRREVERSIBLE** |
 | `setBridgeConfig()` | `onlyOwner` | Configure cross-chain bridge |
 | `setKeeperBounty()` | `onlyOwner` | Enable/disable bounty and set amount |

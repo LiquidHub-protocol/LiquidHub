@@ -392,7 +392,7 @@ test('chunk count and splitting stay in BigInt arithmetic', () => {
 });
 
 test('atomic action gas is buffered but never allowed to reach the block limit', async () => {
-  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {}, {});
   const signer = { address: '0x0000000000000000000000000000000000000011' };
   const provider = {
     estimateGas: async () => 100n,
@@ -423,6 +423,31 @@ test('failure threshold and recovery survive a restart', async (t) => {
   await restarted.success('deposit', 'processed');
   assert.equal(messages.length, 2);
   assert.match(messages[1], /^\[POOL\] Keeper deposit recovered/);
+});
+
+test('critical keeper alert is immediate, persisted and deduplicated', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-critical-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const stateFile = path.join(dir, 'state.json');
+  const messages = [];
+  const alerts = new PersistentActionAlerts({
+    poolName: 'POOL',
+    stateFile,
+    sender: async (message) => { messages.push(message); return true; },
+  });
+  await alerts.init();
+  await alerts.critical('hfRepairPostCheck', 'HF 1.35 remains below 1.40');
+  await alerts.critical('hfRepairPostCheck', 'duplicate');
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /CRITICAL hfRepairPostCheck/);
+});
+
+test('confirmed hedge transactions require an on-chain HF post-check and Safe escalation', () => {
+  const keeper = fsSync.readFileSync(path.join(__dirname, '..', 'src', 'keeper.js'), 'utf8');
+  assert.match(keeper, /hfRepairTriggerBps\(\)/);
+  assert.match(keeper, /hfRepairPostCheck/);
+  assert.match(keeper, /hfBps <= 12_500n/);
+  assert.match(keeper, /HF impossible à vérifier après la transaction confirmée/);
 });
 
 function readJavaScriptTree(dir) {
@@ -458,13 +483,21 @@ test('rebalance syncs fees before planning and refreshes only for a retryable re
       return { hash: '0xabc' };
     },
   };
-  const rebalancer = new Rebalancer(rangeManager, {}, {}, wallet, rpcPool);
+  const rebalancer = new Rebalancer(rangeManager, {}, {}, {}, wallet, rpcPool);
   let buildCount = 0;
   let simulationCount = 0;
   rebalancer._readPriceCache = async () => ({ valid: true });
+  rebalancer._readRangeDecision = async () => ({ decisionHash: '0x' + '11'.repeat(32) });
   rebalancer._buildRebalancePlan = async () => {
     events.push(`build:${++buildCount}`);
-    return { swapAmounts: [], minOuts: [], tokenIn: '0x1', tokenOut: '0x2', chunkCount: 0n };
+    return {
+      decisionHash: '0x' + '11'.repeat(32),
+      swapAmounts: [],
+      minOuts: [],
+      tokenIn: '0x1',
+      tokenOut: '0x2',
+      chunkCount: 0n,
+    };
   };
   rebalancer._simulateRebalance = async () => {
     events.push(`simulate:${++simulationCount}`);
@@ -491,9 +524,10 @@ test('rebalance syncs fees before planning and refreshes only for a retryable re
 });
 
 test('unrelated rebalance revert does not trigger an isolated price refresh', async () => {
-  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {}, {});
   let refreshCount = 0;
   rebalancer._readPriceCache = async () => ({ valid: true });
+  rebalancer._readRangeDecision = async () => ({ decisionHash: '0x' + '11'.repeat(32) });
   rebalancer._syncFeesForActionPlan = async () => {};
   rebalancer._buildRebalancePlan = async () => ({ swapAmounts: [], minOuts: [] });
   rebalancer._simulateRebalance = async () => { throw new Error('E03 cooldown active'); };
@@ -505,10 +539,11 @@ test('unrelated rebalance revert does not trigger an isolated price refresh', as
 });
 
 test('DN rebalance no longer needed does not sync fees, refresh, or send a tx', async () => {
-  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {}, {});
   let feeSyncCount = 0;
   let refreshCount = 0;
   rebalancer._readPriceCache = async () => ({ valid: true });
+  rebalancer._readRangeDecision = async () => ({ decisionHash: '0x' + '11'.repeat(32) });
   rebalancer._buildRebalancePlan = async () => ({ swapAmounts: [], minOuts: [] });
   rebalancer._simulateRebalance = async () => { throw new Error('E96'); };
   rebalancer._syncFeesForActionPlan = async () => { feeSyncCount += 1; };
@@ -524,16 +559,16 @@ test('DN rebalance no longer needed does not sync fees, refresh, or send a tx', 
 test('deposit is deferred when the final on-chain instruction requires a rebalance', async () => {
   let feeSyncCount = 0;
   let signedTxCount = 0;
-  const rangeManager = {
+  const strategyEngine = {
     connect: () => ({
-      getBotInstructions: async () => [true, 1n, true, 'REBALANCE', 'dynamic range changed'],
+      previewDecision: async () => ({ action: 4n, dataFresh: true }),
     }),
   };
   const rpcPool = {
     executeWithRetry: async (fn) => await fn({}),
     executeSignedTxWithRetry: async () => { signedTxCount += 1; },
   };
-  const rebalancer = new Rebalancer(rangeManager, {}, {}, {}, rpcPool);
+  const rebalancer = new Rebalancer({}, {}, strategyEngine, {}, {}, rpcPool);
   rebalancer._syncFeesForActionPlan = async () => { feeSyncCount += 1; };
 
   const result = await rebalancer.processDeposit();
@@ -543,37 +578,31 @@ test('deposit is deferred when the final on-chain instruction requires a rebalan
   assert.equal(signedTxCount, 0);
 });
 
-test('critical hedge fallback refreshes and recomputes a stale rebalance plan once', async () => {
-  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
-  const events = [];
-  let simulationCount = 0;
-  rebalancer._readPriceCache = async () => ({ valid: true });
-  rebalancer._buildRebalancePlan = async () => {
-    events.push('build');
-    return { swapAmounts: [], minOuts: [] };
+test('DN range execution accepts only a fresh RANGE_AND_HEDGE decision', async () => {
+  const strategyEngine = {
+    connect: () => ({
+      previewDecision: async () => ({
+        action: 4n,
+        dataFresh: true,
+        decisionHash: '0x' + '22'.repeat(32),
+      }),
+    }),
   };
-  rebalancer._simulateRebalance = async () => {
-    events.push('simulate');
-    simulationCount += 1;
-    if (simulationCount === 1) throw new Error('stale price cache');
-  };
-  rebalancer._refreshPriceCacheForAction = async () => {
-    events.push('refresh');
-    return { valid: true };
-  };
-
-  assert.equal(await rebalancer.canExecuteCriticalHedgeRebalance(), true);
-  assert.deepEqual(events, ['build', 'simulate', 'refresh', 'build', 'simulate']);
+  const rpcPool = { executeWithRetry: async (fn) => await fn({}) };
+  const rebalancer = new Rebalancer({}, {}, strategyEngine, {}, {}, rpcPool);
+  const decision = await rebalancer._readRangeDecision();
+  assert.equal(Number(decision.action), 4);
+  assert.equal(decision.decisionHash, '0x' + '22'.repeat(32));
 });
 
 test('DN deposit plan errors E72 and E73 trigger refresh and recompute', () => {
-  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {}, {});
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: E72')), true);
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: E73')), true);
 });
 
 test('router fill errors trigger one action-coupled refresh and plan recompute', () => {
-  const rebalancer = new Rebalancer({}, {}, {}, {}, {});
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {}, {});
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('Too little received')), true);
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: PartialFill()')), true);
 });

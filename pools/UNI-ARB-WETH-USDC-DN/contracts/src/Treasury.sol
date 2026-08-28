@@ -127,13 +127,15 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     uint64 public lastBridgeBountyAt; // unix timestamp of the last paid bounty
     uint16 public bridgeBountyMinRatio; // bounty paid only if bridged >= bountyAmount * ratio
 
-    // --- Metrics Bounty (recordPriceSnapshot) — paye au keeper qui enregistre un snapshot de prix ---
-    // Anti-spam assure on-chain par le timing regulier (maxSnapshotsPerDay) cote RangeManager.
-    bool public metricsBountyEnabled;
-    uint256 public metricsBountyAmount;
-    uint256 public metricsBountyDailyCap; // max snapshot bounties paid per UTC day per RangeManager
-    mapping(address => uint64) public metricsBountyDay;
-    mapping(address => uint256) public metricsBountyDailySpent;
+    // --- Strategy checkpoint bounty ---
+    bool public strategyCheckpointBountyEnabled;
+    uint256 public strategyCheckpointBountyAmount;
+    uint256 public strategyCheckpointBountyDailyCap;
+    mapping(address => uint64) public strategyCheckpointBountyDay;
+    mapping(address => uint256) public strategyCheckpointBountyDailySpent;
+    mapping(address => uint64) public lastPaidStrategyCheckpointEpoch;
+    mapping(address => bool) public authorizedStrategyEngines;
+    uint32 public authorizedStrategyEngineCount;
 
     // --- Hedge Bounty (adjustHedge, pools DN) — paye au keeper qui reajuste le hedge ---
     // Anti-drain: adjustHedge() est deja borne cote AaveHedgeManager par drift+cooldown, et le Treasury ajoute
@@ -193,9 +195,10 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     event RangeManagerAuthorized(address indexed rangeManager, bool authorized);
     event SwapFeedConfigured(address indexed token, address feed, uint16 swapSlippageBps, uint32 maxAge);
     event SwapPoolFeeConfigured(address indexed token, uint24 fee);
-    event MetricsBountyPaid(address indexed keeper, uint256 amount);
-    event MetricsBountyConfigured(bool enabled, uint256 amount);
-    event MetricsBountyDailyCapConfigured(uint256 dailyCap);
+    event StrategyCheckpointBountyPaid(address indexed keeper, address indexed engine, uint64 epoch, uint256 amount);
+    event StrategyCheckpointBountyConfigured(bool enabled, uint256 amount);
+    event StrategyCheckpointBountyDailyCapConfigured(uint256 dailyCap);
+    event StrategyEngineAuthorized(address indexed engine, bool authorized);
     event HedgeBountyPaid(address indexed keeper, uint256 amount);
     event HedgeBountyConfigured(bool enabled, uint256 amount);
     event HedgeManagerAuthorized(address indexed hedgeManager, bool authorized);
@@ -381,7 +384,9 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
             reserve +=
                 (keeperBountyDailyCap > 0 ? keeperBountyDailyCap : keeperBountyAmount) * authorizedRangeManagerCount;
         }
-        if (metricsBountyEnabled) reserve += metricsBountyDailyCap * authorizedRangeManagerCount;
+        if (strategyCheckpointBountyEnabled) {
+            reserve += strategyCheckpointBountyDailyCap * authorizedStrategyEngineCount;
+        }
         if (hedgeBountyEnabled) {
             reserve += (hedgeBountyDailyCap > 0 ? hedgeBountyDailyCap : hedgeBountyAmount) * authorizedHedgeManagerCount;
         }
@@ -530,49 +535,50 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         emit KeeperBountyDailyCapConfigured(_dailyCap);
     }
 
-    // --- Metrics Bounty Functions (recordPriceSnapshot) ---
+    // --- Strategy checkpoint bounty functions ---
 
-    /// @notice Pay bounty to keeper who recorded a price snapshot. Called by authorized RangeManager.
-    /// @dev Appele en try/catch cote RangeManager => ne bloque jamais le snapshot si revert ici.
-    ///      Le RangeManager borne aussi la cadence; ce cap Treasury limite en plus chaque RM autorise.
-    function payMetricsBounty(address keeper) external {
-        require(keeper != address(0), "Invalid keeper");
-        require(authorizedRangeManagers[msg.sender], "Not authorized");
-        require(metricsBountyEnabled, "Bounty disabled");
-        require(metricsBountyAmount > 0, "Bounty is zero");
-        require(usdc.balanceOf(address(this)) >= metricsBountyAmount, "Insufficient USDC");
-        _consumeMetricsBountyLimit(msg.sender);
-
-        usdc.safeTransfer(keeper, metricsBountyAmount);
-        emit MetricsBountyPaid(keeper, metricsBountyAmount);
+    /// @notice Pays au plus un bounty par epoch canonique et par moteur autorise.
+    /// @dev Le moteur fixe lui-meme l'epoch; le cap quotidien borne aussi un moteur compromis.
+    function payStrategyCheckpointBounty(address keeper, uint64 epoch) external {
+        require(keeper != address(0) && epoch > lastPaidStrategyCheckpointEpoch[msg.sender], "Invalid checkpoint");
+        require(authorizedStrategyEngines[msg.sender], "Not authorized");
+        require(strategyCheckpointBountyEnabled, "Bounty disabled");
+        require(strategyCheckpointBountyAmount > 0, "Bounty is zero");
+        require(usdc.balanceOf(address(this)) >= strategyCheckpointBountyAmount, "Insufficient USDC");
+        _consumeStrategyCheckpointBountyLimit(msg.sender);
+        lastPaidStrategyCheckpointEpoch[msg.sender] = epoch;
+        usdc.safeTransfer(keeper, strategyCheckpointBountyAmount);
+        emit StrategyCheckpointBountyPaid(keeper, msg.sender, epoch, strategyCheckpointBountyAmount);
     }
 
-    function setMetricsBounty(bool _enabled, uint256 _amount) external onlyOwner {
-        if (_enabled) {
-            require(_amount > 0, "Bounty is zero");
-            require(metricsBountyDailyCap >= _amount, "Metrics cap missing");
+    function setStrategyCheckpointBounty(bool enabled, uint256 amount) external onlyOwner {
+        if (enabled) {
+            require(amount > 0, "Bounty is zero");
+            require(strategyCheckpointBountyDailyCap >= amount, "Checkpoint cap missing");
         }
-        metricsBountyEnabled = _enabled;
-        metricsBountyAmount = _amount;
-        emit MetricsBountyConfigured(_enabled, _amount);
+        strategyCheckpointBountyEnabled = enabled;
+        strategyCheckpointBountyAmount = amount;
+        emit StrategyCheckpointBountyConfigured(enabled, amount);
     }
 
-    function _consumeMetricsBountyLimit(address rangeManager) internal {
+    function _consumeStrategyCheckpointBountyLimit(address engine) internal {
         uint64 day = uint64(block.timestamp / 1 days);
-        if (metricsBountyDay[rangeManager] != day) {
-            metricsBountyDay[rangeManager] = day;
-            metricsBountyDailySpent[rangeManager] = 0;
+        if (strategyCheckpointBountyDay[engine] != day) {
+            strategyCheckpointBountyDay[engine] = day;
+            strategyCheckpointBountyDailySpent[engine] = 0;
         }
-        uint256 newSpent = metricsBountyDailySpent[rangeManager] + metricsBountyAmount;
-        require(newSpent <= metricsBountyDailyCap, "Metrics bounty daily cap");
-        metricsBountyDailySpent[rangeManager] = newSpent;
+        uint256 newSpent = strategyCheckpointBountyDailySpent[engine] + strategyCheckpointBountyAmount;
+        require(newSpent <= strategyCheckpointBountyDailyCap, "Checkpoint bounty daily cap");
+        strategyCheckpointBountyDailySpent[engine] = newSpent;
     }
 
-    function setMetricsBountyDailyCap(uint256 _dailyCap) external onlyOwner {
-        require(_dailyCap == 0 || _validMonthlyCap(_dailyCap), "Invalid cap");
-        if (metricsBountyEnabled || _dailyCap > 0) require(_dailyCap >= metricsBountyAmount, "Cap < bounty");
-        metricsBountyDailyCap = _dailyCap;
-        emit MetricsBountyDailyCapConfigured(_dailyCap);
+    function setStrategyCheckpointBountyDailyCap(uint256 dailyCap) external onlyOwner {
+        require(dailyCap == 0 || _validMonthlyCap(dailyCap), "Invalid cap");
+        if (strategyCheckpointBountyEnabled || dailyCap > 0) {
+            require(dailyCap >= strategyCheckpointBountyAmount, "Cap < bounty");
+        }
+        strategyCheckpointBountyDailyCap = dailyCap;
+        emit StrategyCheckpointBountyDailyCapConfigured(dailyCap);
     }
 
     // --- Hedge Bounty Functions (adjustHedge, pools DN) ---
@@ -762,6 +768,16 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         }
         authorizedRangeManagers[_rangeManager] = _authorized;
         emit RangeManagerAuthorized(_rangeManager, _authorized);
+    }
+
+    function authorizeStrategyEngine(address engine, bool authorized) external onlyOwner {
+        require(engine != address(0) && engine.code.length > 0, "Invalid engine");
+        if (authorizedStrategyEngines[engine] != authorized) {
+            if (authorized) authorizedStrategyEngineCount++;
+            else authorizedStrategyEngineCount--;
+        }
+        authorizedStrategyEngines[engine] = authorized;
+        emit StrategyEngineAuthorized(engine, authorized);
     }
 
     // --- Swap oracle floor config (onlyOwner: Safe Phase 1 / Timelock Phase 2) ---

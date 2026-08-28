@@ -33,21 +33,23 @@ function divideIntoChunks(totalAmount, numChunks) {
 }
 
 class Rebalancer {
-  constructor(rangeManager, vault, hedgeManager, wallet, rpcPool) {
+  constructor(rangeManager, vault, strategyEngine, hedgeManager, wallet, rpcPool) {
     this.rangeManager = rangeManager;
     this.vault = vault;
+    this.strategyEngine = strategyEngine;
     this.hedgeManager = hedgeManager;
     this.wallet = wallet;
     this.rpcPool = rpcPool;
   }
 
-  async executeRebalance(tokenId) {
+  async executeRebalance(tokenId, expectedDecisionHash) {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
     try {
       let plan = null;
       try {
-        plan = await this._buildRebalancePlan(await this._readPriceCache());
+        const decision = await this._readRangeDecision(expectedDecisionHash);
+        plan = await this._buildRebalancePlan(await this._readPriceCache(), decision.decisionHash);
         await this._simulateRebalance(plan);
       } catch (firstError) {
         plan = null;
@@ -58,7 +60,8 @@ class Rebalancer {
         if (this._isFeePlanError(firstError)) {
           await this._syncFeesForActionPlan('rebalance retry');
           try {
-            plan = await this._buildRebalancePlan(await this._readPriceCache());
+            const decision = await this._readRangeDecision();
+            plan = await this._buildRebalancePlan(await this._readPriceCache(), decision.decisionHash);
             await this._simulateRebalance(plan);
           } catch (postFeeError) {
             plan = null;
@@ -72,9 +75,17 @@ class Rebalancer {
           if (!this._shouldRefreshForPlanError(retryError)) throw retryError;
           console.log(`  Rebalance plan rejected; refreshing once and recomputing: ${this._errorText(retryError)}`);
           const refreshed = await this._refreshPriceCacheForAction('rebalance stale-plan retry');
-          plan = await this._buildRebalancePlan(refreshed);
+          const decision = await this._readRangeDecision();
+          plan = await this._buildRebalancePlan(refreshed, decision.decisionHash);
           await this._simulateRebalance(plan);
         }
+      }
+
+      const latestDecision = await this._readRangeDecision();
+      if (latestDecision.decisionHash !== plan.decisionHash) {
+        console.log('  Strategy decision changed before submission; rebuilding the DN plan once.');
+        plan = await this._buildRebalancePlan(await this._readPriceCache(), latestDecision.decisionHash);
+        await this._simulateRebalance(plan);
       }
 
       this._logPlan(plan);
@@ -82,7 +93,13 @@ class Rebalancer {
       const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
         const signer = this.wallet.connect(provider);
         const rm = this.rangeManager.connect(signer);
-        const request = await rm.rebalance.populateTransaction(plan.swapAmounts, plan.minOuts, plan.tokenIn, plan.tokenOut);
+        const request = await rm.rebalance.populateTransaction(
+          plan.decisionHash,
+          plan.swapAmounts,
+          plan.minOuts,
+          plan.tokenIn,
+          plan.tokenOut
+        );
         return {
           wallet: signer,
           request: await this._boundTransactionGas(provider, signer, request, `rebalance ${plan.chunkCount} chunk(s)`),
@@ -96,38 +113,15 @@ class Rebalancer {
     }
   }
 
-  async canExecuteCriticalHedgeRebalance() {
-    try {
-      let plan;
-      try {
-        plan = await this._buildRebalancePlan(await this._readPriceCache());
-        await this._simulateRebalance(plan);
-      } catch (firstError) {
-        if (this._isFeePlanError(firstError)) return true;
-        if (this._rebalanceControlResult(firstError)) return false;
-        if (!this._shouldRefreshForPlanError(firstError)) return false;
-        console.log(`  Critical hedge fallback preflight rejected; refreshing and recomputing once: ${this._errorText(firstError)}`);
-        const refreshed = await this._refreshPriceCacheForAction('critical hedge fallback preflight');
-        plan = await this._buildRebalancePlan(refreshed);
-        await this._simulateRebalance(plan);
-      }
-      return true;
-    } catch (error) {
-      // E93/E94 signifie que rebalance() a deja franchi son garde E96 (range/drift critique),
-      // mais que les fees latentes ont change le plan. executeRebalance() les synchronisera avant retry.
-      return this._isFeePlanError(error);
-    }
-  }
-
   async processDeposit() {
     console.log('\n=== Processing queued deposit (permissionless) ===');
     try {
-      const [, , needsRebalance, action, reason] = await this.rpcPool.executeWithRetry(async (provider) => {
-        return await this.rangeManager.connect(provider).getBotInstructions();
+      const decision = await this.rpcPool.executeWithRetry(async (provider) => {
+        return await this.strategyEngine.connect(provider).previewDecision();
       });
-      if (needsRebalance) {
-        console.log(`  DN deposit deferred: ${action || 'REBALANCE'} is required first (${reason || 'on-chain signal'}).`);
-        return { success: false, deferred: true, error: 'rebalance required before DN deposit', txHashes: [] };
+      if ([3, 4, 5].includes(Number(decision.action))) {
+        console.log('  DN deposit deferred: canonical range/hedge maintenance is eligible first.');
+        return { success: false, deferred: true, error: 'DN maintenance required before deposit', txHashes: [] };
       }
 
       await this._syncFeesForActionPlan('deposit');
@@ -204,11 +198,31 @@ class Rebalancer {
     return priceCache;
   }
 
-  async _buildRebalancePlan(priceCache) {
-    const [zeroForOne, amountIn] = await this.rpcPool.executeWithRetry(async (provider) => {
-      return await this.vault.connect(provider).getRebalanceSwapParams();
+  async _buildRebalancePlan(priceCache, decisionHash) {
+    const swapParams = await this.rpcPool.executeWithRetry(async (provider) => {
+      return await this.rangeManager.connect(provider).getOptimalSwapParams();
     });
-    return await this._buildPlan(zeroForOne, amountIn, priceCache, false);
+    const plan = await this._buildPlan(
+      swapParams.zeroForOne,
+      swapParams.swapNeeded ? swapParams.amountIn : 0n,
+      priceCache,
+      false
+    );
+    plan.decisionHash = decisionHash;
+    return plan;
+  }
+
+  async _readRangeDecision(expectedDecisionHash = null) {
+    const decision = await this.rpcPool.executeWithRetry(async (provider) => {
+      return await this.strategyEngine.connect(provider).previewDecision();
+    });
+    if (Number(decision.action) !== 4 || !decision.dataFresh) {
+      throw new Error('E90: canonical strategy decision does not authorize RANGE_AND_HEDGE');
+    }
+    if (expectedDecisionHash && decision.decisionHash !== expectedDecisionHash) {
+      console.log('  Strategy decision advanced since the cycle read; using the latest canonical hash.');
+    }
+    return decision;
   }
 
   async _buildDepositPlan(priceCache) {
@@ -258,7 +272,13 @@ class Rebalancer {
   async _simulateRebalance(plan) {
     await this.rpcPool.executeWithRetry(async (provider) => {
       const rm = this.rangeManager.connect(this.wallet.connect(provider));
-      return await rm.rebalance.staticCall(plan.swapAmounts, plan.minOuts, plan.tokenIn, plan.tokenOut);
+      return await rm.rebalance.staticCall(
+        plan.decisionHash,
+        plan.swapAmounts,
+        plan.minOuts,
+        plan.tokenIn,
+        plan.tokenOut
+      );
     });
   }
 

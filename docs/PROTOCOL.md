@@ -8,9 +8,9 @@ Liquid Hub manages concentrated-liquidity DEX positions for multiple users via a
 
 1. **Deposit** — Standard pools accept token0, token1, or both according to the deployed pair; DN pools accept token1 collateral only. Funds are queued permissionlessly, and shares representing proportional ownership are minted when the deposit is processed.
 2. **Deposit processing (permissionless)** — Anyone can call `processDepositPermissionless()` to convert a queued deposit into LP liquidity in one atomic transaction (see Deposit Processing). Earns the deposit bounty.
-3. **Delegation** — The vault delegates LP management to `RangeManager`, which handles all concentrated-liquidity position logic.
-4. **Position Creation** — `RangeManager` creates concentrated-liquidity positions with **dynamic ranges computed 100% on-chain** (see Dynamic Range Calculation). The tuning parameters are set by a Gnosis Safe multisig; the math runs in the contract.
-5. **Rebalance** — When price moves out of range, a keeper triggers a rebalance: burn the old position, swap tokens to rebalance the ratio, then mint a new position at the on-chain-computed range.
+3. **Decision** — The pool's immutable-profile `RangeStrategyEngine` updates canonical market epochs and publishes a bounded on-chain action, reason code and exact target ticks.
+4. **Execution** — The vault delegates LP execution to `RangeManager`, which creates or rebuilds the concentrated-liquidity position only after validating the current engine decision.
+5. **Rebalance** — When `RANGE_REBALANCE` or `RANGE_AND_HEDGE` is eligible, a keeper can trigger one atomic transaction: burn the old position, execute bounded swaps, mint the exact validated range and, for DN, synchronize the hedge.
 6. **Fee Collection** — Accrued LP fees are crystallized before value-sensitive share operations and during position maintenance. The protocol commission is sent to the pool Treasury; the net remainder stays in the strategy and auto-compounds.
 7. **Withdrawal** — Users withdraw by burning their shares. The vault burns the proportional LP position and returns the underlying tokens to the user.
 
@@ -31,19 +31,48 @@ It reverts if the queue is empty, the required position state is missing, or liv
 
 ---
 
-## Dynamic Range Calculation (100% on-chain)
+## Adaptive Range Intelligence (100% on-chain)
 
-The range is computed entirely by `RangeManager` — no off-chain bot or database is involved in the math, so any keeper can reproduce it.
+Each Liquid Hub pool has one stateful `RangeStrategyEngine`. Its DEX pool, strategy profile, owner/Vault, linked
+RangeManager and optional AAVE HedgeManager are fixed and validated during deployment. It holds no user funds.
 
-- `RangeManager` keeps a ring buffer of token0/token1 oracle-ratio snapshots. `recordPriceSnapshot()` is **permissionless** and stores `token0/USD ÷ token1/USD`, normalized to 8 decimals; this remains correct when token1 is not a stablecoin. The contract spaces snapshots regularly (`24h / maxSnapshotsPerDay`) and reverts if one is not yet due.
-- When a due snapshot is recorded, the contract evaluates the high/low amplitude of observations inside the last `volatMoyDay` days — `(highest − lowest) / current price`. It removes the `volatTrimDay` highest and the same number of lowest observations, scales the result by `RANGE_MULTIPLICATOR`, and rounds it up to `RANGE_STEP_BPS`. At least two observations must remain after trimming; during cold start the previous/base range is retained. The computed symmetric half-range is stored on-chain and bounded per side by `RANGE_MIN_BPS` and `RANGE_MAX_BPS` (for example `100` means at least -1%/+1%, not 1% total width). Subsequent mint and rebalance actions use that stored range until a later due snapshot updates it.
-- When `DYNAMIC_RANGE_ENABLED` is `false` (e.g. stablecoin pools), the range stays fixed at `RANGE_UP_BASE` / `RANGE_DOWN_BASE` (in basis points), configured by the Safe in Phase 1 or Timelock governance in Phase 2.
+`checkpointMarketState()` is permissionless and advances at most one canonical epoch. The caller supplies no
+price, forecast, score or target ticks. The engine reads the configured DEX and oracle state and combines:
+
+1. an **Analytical controller**, which builds a bounded range anchor from canonical TWAP horizons, trend,
+   volatility, fee intensity, uncertainty and profile constraints;
+2. a **Multi-scenario optimizer**, which compares a fixed set of admissible tick-aligned candidates against the
+   current position after potential fees, transition costs, inactivity and tail risk;
+3. **Bounded online adaptation**, which gradually adjusts fixed estimator families from realized observations.
+   Influence, losses and update speed are capped, and learning freezes on stale or incoherent data.
+
+Every new asymmetric candidate must keep its center displacement from the live execution tick inside the governed
+`maxSkewBps` budget. This constraint also applies to Delta Neutral hedge-recovery candidates, so a wide total range
+cannot conceal a live price placed only a few ticks from one boundary. The condition is checked again immediately
+before execution.
+
+The public decision enum is `NO_ACTION`, `CHECKPOINT_ONLY`, `RANGE_REBALANCE`, `HEDGE_ONLY`,
+`RANGE_AND_HEDGE` or `HF_REPAIR`. A range exit is an input, not automatic authorization. The engine also considers
+economic edge, uncertainty, cooldown and how deep or persistent the exit is. Ordinary DN hedge drift must persist in
+the same direction over the tactical confirmation horizon and clears below a lower hysteresis boundary. It respects
+the four-hour hedge cooldown and may be grouped with a range action already expected within the strategic horizon.
+Critical hedge drift bypasses those ordinary controls. Critical DN health-factor repair remains an independent,
+immediately permissionless safety path.
+
+For a Stable profile, the engine also compares the independently configured oracle prices. A material divergence
+activates a depeg guard and fails closed with no executable range change until the pair returns within the on-chain
+safety boundary.
+
+`previewDecision()` exposes the current epoch, validity, action, reason code, target ticks, edge, threshold and
+decision hash. Execution calls revalidate the same result and current safety conditions. No keeper or protocol bot
+can choose a different range. Governance may change only bounded parameters or temporarily select
+`ANALYTIC_ONLY`; it cannot submit an arbitrary forecast or range.
 
 ---
 
 ## Pool Types
 
-### Standard Pool
+### Exposed Pool
 
 - Directional exposure to both tokens (WETH and USDC).
 - LP earns swap fees from the DEX pool.
@@ -55,7 +84,7 @@ The range is computed entirely by `RangeManager` — no off-chain bot or databas
 - Additionally uses an **AAVE V3 hedge** to neutralize directional price exposure:
   - USDC is supplied as AAVE collateral and WETH is borrowed against it.
   - The borrowed WETH offsets the LP's long WETH exposure. The hedge is piloted on the **net effective short** (`effectiveShort = debt − idle WETH`, idle on the HedgeManager and RangeManager) versus a target of `hedgeTargetBps × wethInLP` (100% = strict delta-neutral by default). The borrowed WETH is integrated into the LP (never left idle), so the AAVE debt is a real short covering the LP's WETH.
-- **Permissionless hedge adjustment** — `adjustHedge()` (see Hedge Adjustment below) is callable by any keeper for a bounty. It corrects over-hedge and under-hedge without caller-supplied sizing; every path is atomic and guarded by oracle/TWAP, drift, cooldown and final AAVE health-factor checks. The atomic LP rebalance remains the fallback when direct under-hedge repair lacks safe HF headroom or market liquidity.
+- **Permissionless hedge adjustment** — `adjustHedge()` (see Hedge Adjustment below) is callable by any keeper. It corrects over-hedge and under-hedge without caller-supplied sizing. Ordinary drift requires same-direction confirmation, hysteresis and the four-hour cooldown; it may be grouped with an imminent range action. Critical drift and an urgent HF repair below the on-chain trigger bypass those ordinary controls. A critical but safely executable hedge correction remains eligible near a range edge and does not remint the shared NFT. The atomic LP rebalance is considered for hedge recovery only when direct repair is genuinely infeasible, remains so for the configured persistence period, and the replacement range demonstrably reduces the drift. Bounties remain subject to on-chain eligibility.
 - **USDC reserve** — a small USDC reserve is kept on the HedgeManager so adjustments don't have to touch the LP; it is **reconstituted on-chain inside `adjustHedge()`** when the health factor is above target (no separate action).
 - **Net effect**: the strategy targets reduced token0 directional exposure while earning LP fees. Hedge drift, AAVE interest, basis, range composition and execution conditions mean neutrality is a target, not a guarantee.
 - **Withdrawals are atomic**: burn LP, flash loan settlement (if needed), return tokens to user in a single transaction.
@@ -63,7 +92,7 @@ The range is computed entirely by `RangeManager` — no off-chain bot or databas
 
 #### Hedge Adjustment (`adjustHedge`, on-chain)
 
-`adjustHedge()` is permissionless. It reads the LP position and on-chain prices and pilots on the **net effective short** (`effectiveShort = debt − idle token0`) versus the target (`hedgeTargetBps × token0InLP`). It corrects both directions without caller-provided sizing: a flash-assisted, oracle-bounded repay for over-hedge; or an atomic borrow, oracle/TWAP-bounded token0 sale and token1 collateral supply for under-hedge. It **reverts unless the drift exceeds the dynamic threshold** and the on-chain cooldown has elapsed; the cooldown applies to **all callers**. Large idle token0 balances cannot inflate the borrow path and are handled by the atomic rebalance fallback. A successful correction pays the **hedge bounty**.
+`adjustHedge()` is permissionless. It reads the LP position and on-chain prices and pilots on the **net effective short** (`effectiveShort = debt − idle token0`) versus the target (`hedgeTargetBps × token0InLP`). It corrects both directions without caller-provided sizing. Ordinary drift must exceed the governed relative threshold and minimum portfolio exposure, remain in the same direction over the tactical confirmation horizon and wait for the four-hour on-chain cooldown. A lower hysteresis boundary clears fading signals, while an eligible correction may be grouped with an imminent range action. Critical drift bypasses confirmation, grouping and cooldown. Separately, when HF falls below `HF_REPAIR_TRIGGER_BPS`, an urgent repair also bypasses those ordinary controls and restores toward `HF_REPAIR_TARGET_BPS`. The urgent repair always remains executable, but it earns a bounty only when the AAVE debt actually repaid reaches `HF_REPAIR_BOUNTY_MIN_USD`; smaller repairs execute without a bounty.
 
 ---
 
@@ -92,7 +121,7 @@ The nominal flow is a single public transaction:
    vault and pays the keeper bounty if enabled.
 2. If any check fails, the whole transaction reverts and the next bot/keeper cycle can retry with a fresh plan.
 
-On DN pools, routine drift in either direction is adjusted independently and permissionlessly via `adjustHedge()` (see Hedge Adjustment). If a direct under-hedge repair cannot preserve the configured AAVE health factor, the permissionless `rebalance()` path rebuilds the LP composition with strict post-checks; a badly hedged result reverts atomically.
+On DN pools, routine drift in either direction is adjusted independently and permissionlessly via `adjustHedge()` (see Hedge Adjustment). A `RANGE_AND_HEDGE` decision rebuilds the LP composition and synchronizes the hedge in one atomic path with strict post-checks; a badly hedged result reverts atomically.
 
 ---
 

@@ -9,6 +9,7 @@ import "v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "./RangeOperations.sol";
+import "./interfaces/IRangeStrategyEngine.sol";
 
 /// @dev Interfaces minimales (la library reçoit les adresses en paramètre — aucun accès au storage du Vault).
 interface IHedgeDep {
@@ -20,9 +21,10 @@ interface IHedgeDep {
         view
         returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase);
     function hedgeTargetBps() external view returns (uint16);
-    function adjustHedgeRangeDivisor() external view returns (uint16);
-    function criticalHedgeRangeDivisor() external view returns (uint16);
+    function criticalHedgeBps() external view returns (uint16);
     function reserveHfTargetBps() external view returns (uint16);
+    function operationalHfTargetBps() external view returns (uint16);
+    function hfRepairTriggerBps() external view returns (uint16);
     function liqThresholdBps() external view returns (uint16);
     function donationDustToken0() external view returns (uint256); // filtre dust cohérent (audit M-02)
     function supplyAndBorrow(uint256 collateralAmountUsdc, uint256 borrowAmountWeth) external;
@@ -44,18 +46,7 @@ interface IRmDep {
     function config()
         external
         view
-        returns (
-            uint24 fee,
-            uint8 dec0,
-            uint8 dec1,
-            uint16 tol,
-            uint24 slip,
-            uint64 lrt,
-            bool oc,
-            uint16 up,
-            uint16 down,
-            uint32 maxPos
-        );
+        returns (uint24 fee, uint8 dec0, uint8 dec1, uint16 tol, uint24 slip, uint64 lrt, bool oc, uint32 maxPos);
     function getOwnerPositions() external view returns (uint256[] memory);
     function calculateTargetTicks() external view returns (int24 tickLower, int24 tickUpper);
     function positionManager() external view returns (INonfungiblePositionManager);
@@ -65,6 +56,8 @@ interface IRmDep {
         external
         returns (uint256 amountOut);
     function collectFeesForVault() external returns (uint256 fees0, uint256 fees1);
+    function strategyEngine() external view returns (IRangeStrategyEngine);
+    function isProtocolBotCaller(address caller) external view returns (bool);
 }
 
 interface IVaultDep {
@@ -82,6 +75,8 @@ interface IHedgeRepairContext {
     function swapPoolFee() external view returns (uint24);
     function liqThresholdBps() external view returns (uint16);
     function reserveHfTargetBps() external view returns (uint16);
+    function operationalHfTargetBps() external view returns (uint16);
+    function hfRepairTriggerBps() external view returns (uint16);
     function swapSlippageBps() external view returns (uint16);
     function volatileDecimals() external view returns (uint8);
     function stableDecimals() external view returns (uint8);
@@ -115,6 +110,7 @@ library DnDepositLib {
 
     error ProtectedVaultFunds();
     error ExactTransferRequired();
+    error InvalidStrategyDecision();
     /// @dev Adresses regroupées (anti stack-too-deep).
 
     struct Addrs {
@@ -124,10 +120,12 @@ library DnDepositLib {
         address token1;
     }
 
-    function pullExact(address token, address from, uint256 amount) external {
+    function pullExact(address token, uint256 amount) external {
         IERC20 asset = IERC20(token);
         uint256 beforeBalance = asset.balanceOf(address(this));
-        asset.safeTransferFrom(from, address(this), amount);
+        // Library calls execute by delegatecall, so msg.sender remains the depositor
+        // authenticated by MultiUserVault.deposit(). No arbitrary payer is accepted.
+        asset.safeTransferFrom(msg.sender, address(this), amount);
         if (asset.balanceOf(address(this)) - beforeBalance != amount) revert ExactTransferRequired();
     }
 
@@ -168,14 +166,17 @@ library DnDepositLib {
         IHedgeRepairContext context = IHedgeRepairContext(address(this));
         address aavePool = context.pool();
         address debtToken = context.variableDebtWeth();
-        uint16 targetHfBps = context.reserveHfTargetBps();
+        uint16 targetHfBps = context.operationalHfTargetBps();
+        uint16 triggerHfBps = context.hfRepairTriggerBps();
         uint16 swapSlippageBps = context.swapSlippageBps();
         uint256 bufferedTarget = uint256(targetHfBps) + 10;
         uint256 premiumBps = IAavePoolDep(aavePool).FLASHLOAN_PREMIUM_TOTAL();
         uint256 costBps = 10000 + uint256(swapSlippageBps) + premiumBps + 5;
         (uint256 collateralBase, uint256 debtBase,, uint256 liveThreshold,, uint256 hf) =
             IAavePoolDep(aavePool).getUserAccountData(address(this));
-        if (debtBase == 0 || collateralBase == 0 || liveThreshold == 0 || hf >= bufferedTarget * 1e14) return (0, 0);
+        if (debtBase == 0 || collateralBase == 0 || liveThreshold == 0 || hf >= uint256(triggerHfBps) * 1e14) {
+            return (0, 0);
+        }
 
         uint256 protectedCollateral = uint256(liveThreshold) * collateralBase;
         uint256 required = bufferedTarget * debtBase;
@@ -243,7 +244,7 @@ library DnDepositLib {
         uint256 depositAmount0,
         uint256 depositAmount1
     ) external {
-        (, uint8 dec0, uint8 dec1,,,,,,,) = IRmDep(a.rangeManager).config();
+        (, uint8 dec0, uint8 dec1,,,,,) = IRmDep(a.rangeManager).config();
         // Les fonds du depot sont deja sur le RM, mais seuls les montants explicites de ce depot
         // participent au calcul et au plafond de collateral.
         (uint256 collateralUsdc, uint256 borrowWeth) = _computeDepositHedge(
@@ -266,7 +267,7 @@ library DnDepositLib {
         IHedgeDep hm = IHedgeDep(hedgeManager);
         (uint128 price0, uint128 price1,,,, bool valid) = rm.priceCache();
         if (!valid) return 0;
-        (, uint8 dec0, uint8 dec1,,,,,,,) = rm.config();
+        (, uint8 dec0, uint8 dec1,,,,,) = rm.config();
         valueUsd = _toUsd(hm.getWethBalance(), price0, dec0);
         valueUsd += (hm.getUsdcBalance() * uint256(price1)) / (10 ** dec1);
     }
@@ -312,7 +313,7 @@ library DnDepositLib {
 
         uint256 nftUsd = _toUsd(nftWeth, price0, dec0);
         uint16 hedgeTargetBps = hm.hedgeTargetBps();
-        uint16 ltvBps = uint16((uint256(hm.liqThresholdBps()) * 10000) / uint256(hm.reserveHfTargetBps()));
+        uint16 ltvBps = uint16((uint256(hm.liqThresholdBps()) * 10000) / uint256(hm.operationalHfTargetBps()));
         (uint256 collateralUsd, uint256 borrowUsd) = RangeOperations.computeHedgeDeposit(
             RangeOperations.HedgeDepositParams({
                 investableUsd: investableUsd,
@@ -393,7 +394,7 @@ library DnDepositLib {
         IRmDep rmI = IRmDep(rangeManager);
         (uint128 price0, uint128 price1,,,, bool valid) = rmI.priceCache();
         if (!valid) return (false, 0);
-        (, uint8 dec0, uint8 dec1,,,,,,,) = rmI.config();
+        (, uint8 dec0, uint8 dec1,,,,,) = rmI.config();
         address token0 = rmI.token0();
         address hedgeManager = IVaultDep(rmI.vault()).hedgeManager();
 
@@ -466,7 +467,7 @@ library DnDepositLib {
         tokenInIsToken0 = tokenIn == token0;
         uint256 n = swapAmountsIn.length;
         if (n == 0) {
-            (,,, toleranceBps,,,,,,) = rm.config();
+            (,,, toleranceBps,,,,) = rm.config();
             return (0, toleranceBps, tokenInIsToken0);
         }
         if (!((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0))) {
@@ -475,10 +476,10 @@ library DnDepositLib {
 
         (uint128 price0, uint128 price1,,, uint64 ts, bool valid) = rm.priceCache();
         if (!valid || price0 == 0 || price1 == 0) revert InvalidSwapPlan();
-        (, uint8 dec0, uint8 dec1, uint16 tol, uint24 slip,,,,,) = rm.config();
+        (, uint8 dec0, uint8 dec1, uint16 tol, uint24 slip,,,) = rm.config();
         toleranceBps = tol;
         RangeOperations.PriceCache memory pc = RangeOperations.PriceCache(price0, price1, 0, 0, ts, valid);
-        RangeOperations.RangeConfig memory cfg = RangeOperations.RangeConfig(0, dec0, dec1, tol, slip, 0, true, 0, 0, 1);
+        RangeOperations.RangeConfig memory cfg = RangeOperations.RangeConfig(0, dec0, dec1, tol, slip, 0, true, 1);
         RangeOperations.validateMinOutsAgainstOracle(
             tokenInIsToken0, swapAmountsIn, minAmountsOut, pc, cfg, rm.initMultiSwapTvl(), maxTotalSwapUsd
         );
@@ -607,6 +608,22 @@ library DnDepositLib {
         debtUsd = (IERC20(debtToken).balanceOf(address(this)) * uint256(price0)) / (10 ** volatileDecimals);
     }
 
+    /// @notice Reads the annualized Aave variable borrow rate (RAY) used by the strategy engine.
+    function strategyAaveBorrowRateRay(address hedgeManager) external view returns (bool available, uint256 rateRay) {
+        (bool poolOk, bytes memory poolData) = hedgeManager.staticcall(abi.encodeWithSignature("pool()"));
+        (bool assetOk, bytes memory assetData) = hedgeManager.staticcall(abi.encodeWithSignature("weth()"));
+        if (!poolOk || !assetOk || poolData.length < 32 || assetData.length < 32) return (false, 0);
+        address aavePool = abi.decode(poolData, (address));
+        address asset = abi.decode(assetData, (address));
+        (bool reserveOk, bytes memory reserveData) =
+            aavePool.staticcall(abi.encodeWithSignature("getReserveData(address)", asset));
+        if (!reserveOk || reserveData.length < 5 * 32) return (false, 0);
+        assembly ("memory-safe") {
+            rateRay := mload(add(reserveData, 0xa0))
+        }
+        available = rateRay > 0 && rateRay <= 10e27;
+    }
+
     function aaveReserveExcessStable(
         address aavePool,
         address aToken,
@@ -641,52 +658,6 @@ library DnDepositLib {
         if (submittedAmountIn > expectedAmountIn + tolerance) revert InvalidSwapPlan();
     }
 
-    /// @notice AUDIT M-01 : plan de swap d'un REBALANCE DN compatible avec la dette AAVE FIXE. rebalance() ne
-    ///         touche pas AAVE -> pour passer le post-check, la LP remintée doit avoir token0InLP ~= effectiveShort/H
-    ///         (le short net est fixé par la dette). On calcule le swap depuis les balances TOTALES post-burn
-    ///         (libres + NFT, via getCurrentBalances qui reflète l'état post-burn) vers cette cible token0.
-    /// @dev    À utiliser par le keeper quand le rebalance est déclenché par drift DN (sous-hedge in-range) —
-    ///         le plan range standard (getOptimalSwapParams) ne viserait pas la compo compatible dette fixe.
-    ///         Renvoie (zeroForOne, amountIn natif). No-op si std/HF nul.
-    function getRebalanceSwapParams(address rangeManager) external view returns (bool zeroForOne, uint256 amountIn) {
-        IRmDep rm = IRmDep(rangeManager);
-        address hedgeManager = IVaultDep(rm.vault()).hedgeManager();
-        if (hedgeManager == address(0)) return (false, 0);
-        IHedgeDep hm = IHedgeDep(hedgeManager);
-        (uint128 price0, uint128 price1,,,, bool valid) = rm.priceCache();
-        if (!valid) return (false, 0);
-        (, uint8 dec0, uint8 dec1,,,,,,,) = rm.config();
-        // The RM balance is already included in totalBal0 below. Subtracting it here would count the same
-        // token0 twice; only idle token0 held by the HedgeManager reduces the fixed short before reconstruction.
-        // Si idle >= dette, la cible token0 LP est 0 : le rebalance doit pouvoir vendre le token0 LP restant
-        // vers token1 au lieu de retourner "no swap", sinon le post-check DN resterait impossible a satisfaire.
-        uint256 dustTok0 = hm.donationDustToken0();
-        uint256 debtUsd = _toUsd(hm.getWethDebt(), price0, dec0);
-        uint256 idleUsd = _toUsd(_dust(hm.getWethBalance(), dustTok0), price0, dec0);
-        uint256 effShortUsd = debtUsd > idleUsd ? debtUsd - idleUsd : 0;
-
-        uint256 H = hm.hedgeTargetBps();
-        if (H == 0) return (false, 0);
-        // Cible : token0InLP_usd tel que H * token0InLP = effectiveShort => token0InLP_usd = effectiveShort * 10000 / H.
-        uint256 targetWethLpUsd = (effShortUsd * 10000) / H;
-
-        // Balances TOTALES post-burn (libres + NFT) = capital disponible pour reconstruire la LP.
-        (uint256 totalBal0, uint256 totalBal1) = rm.getCurrentBalances();
-        uint256 v0 = _toUsd(totalBal0, price0, dec0);
-        // On vise v0 == targetWethLpUsd (le reste part en token1). Borne : on ne peut pas dépasser le capital total.
-        uint256 totUsd = v0 + (totalBal1 * uint256(price1)) / (10 ** dec1);
-        uint256 targetV0 = targetWethLpUsd > totUsd ? totUsd : targetWethLpUsd;
-
-        if (v0 > targetV0) {
-            amountIn = ((v0 - targetV0) * (10 ** dec0)) / uint256(price0); // swap token0->token1 (reduit token0InLP)
-            return (true, amountIn);
-        } else if (targetV0 > v0) {
-            amountIn = ((targetV0 - v0) * (10 ** dec1)) / uint256(price1); // swap token1→token0
-            return (false, amountIn);
-        }
-        return (false, 0);
-    }
-
     /// @notice Post-check DN après addLiquidity (DÉPÔT). Revert PreAdjustRequired si hors tolérance/HF.
     /// @dev maxDriftBps est un plafond configuré ; le seuil effectif est resserré au seuil critique dynamique
     ///      quand le range courant est étroit, afin qu'un dépôt ne puisse pas ressortir déjà "critique".
@@ -719,7 +690,7 @@ library DnDepositLib {
 
     /// @dev Cœur du post-check DN (partagé dépôt + rebalance). Audit H-03/M-02 : dette EXACTE (getWethDebt),
     ///      wethInLp = NFT seulement (total − libre RM, pas de double comptage avec idleRm), filtre dust cohérent.
-    ///      Le drift max effectif = min(maxDriftBps configuré, seuil critique dynamique range/divisor).
+    ///      Le drift max effectif = min(maxDriftBps configure, seuil critique gouverne du HedgeManager).
     function _postCheck(
         address hedgeManager,
         address rangeManager,
@@ -730,7 +701,7 @@ library DnDepositLib {
         uint256 dustFloorUsd
     ) private view {
         IHedgeDep hm = IHedgeDep(hedgeManager);
-        uint16 effectiveMaxDriftBps = _postCheckMaxDriftBps(hedgeManager, rangeManager, maxDriftBps);
+        uint16 effectiveMaxDriftBps = _postCheckMaxDriftBps(hedgeManager, maxDriftBps);
         (bool ok,,) = _driftBps(hedgeManager, rangeManager, token0, price0, dec0, effectiveMaxDriftBps, dustFloorUsd);
         if (!ok) revert PreAdjustRequired();
 
@@ -741,15 +712,10 @@ library DnDepositLib {
         }
     }
 
-    /// @dev Le post-check garde le paramètre .env comme plafond, puis se resserre automatiquement avec le range.
-    function _postCheckMaxDriftBps(address hedgeManager, address rangeManager, uint16 configuredMaxBps)
-        private
-        view
-        returns (uint16)
-    {
+    /// @dev Le post-check garde le parametre .env comme plafond, puis applique le seuil critique gouverne.
+    function _postCheckMaxDriftBps(address hedgeManager, uint16 configuredMaxBps) private view returns (uint16) {
         uint16 effectiveMaxBps = configuredMaxBps;
-        uint16 criticalBps =
-            _rangeHedgeThresholdBps(rangeManager, IHedgeDep(hedgeManager).criticalHedgeRangeDivisor(), 250);
+        uint16 criticalBps = IHedgeDep(hedgeManager).criticalHedgeBps();
         if (criticalBps < effectiveMaxBps) effectiveMaxBps = criticalBps;
         return effectiveMaxBps;
     }
@@ -781,66 +747,6 @@ library DnDepositLib {
         (bool rawOk,) =
             RangeOperations.checkHedgeDelta(debtUsd, 0, 0, wethInLpUsd, hm.hedgeTargetBps(), maxDriftBps, dustFloorUsd);
         rawDebtDriftExceeds_ = !rawOk;
-    }
-
-    /// @notice Indique si le drift DN depasse le seuil dynamique critique (sous/sur-hedge), pour autoriser
-    ///         un rebalance permissionless meme quand la LP est in-range. Le drift normal reste traite par
-    ///         adjustHedge(); le rebalance LP n'est que le fallback critique. Le parametre fixe reste le
-    ///         fallback fail-closed si le HedgeManager ne fournit pas encore le diviseur dynamique.
-    ///         Args plats (RangeManager appelle avec address(this)). No-op→false si pool std (hedgeManager==0).
-    function dnHedgeDriftExceeds(
-        address rangeManager,
-        address token0,
-        uint128 price0,
-        uint8 dec0,
-        uint16 critBps,
-        uint256 dustFloorUsd
-    ) external view returns (bool effectiveDriftExceeds, bool rawDebtDriftExceeds_) {
-        address hedgeManager = IVaultDep(IRmDep(rangeManager).vault()).hedgeManager();
-        if (hedgeManager == address(0)) return (false, false);
-        uint16 effectiveCritBps = critBps;
-        uint16 dynamicCriticalBps =
-            _rangeHedgeThresholdBps(rangeManager, IHedgeDep(hedgeManager).criticalHedgeRangeDivisor(), 250);
-        if (dynamicCriticalBps < effectiveCritBps) effectiveCritBps = dynamicCriticalBps;
-        (bool ok,, bool rawExceeds) =
-            _driftBps(hedgeManager, rangeManager, token0, price0, dec0, effectiveCritBps, dustFloorUsd);
-        return (!ok, rawExceeds); // effective drift pilote la maintenance; raw drift qualifie seul le bounty
-    }
-
-    /// @notice Qualification de bounty independante des soldes token0 idle/donnes.
-    function rawDebtDriftExceeds(uint256 debt, uint256 target, uint16 minDriftBps, uint256 dustFloor)
-        external
-        pure
-        returns (bool)
-    {
-        uint256 diff = debt > target ? debt - target : target - debt;
-        if (target == 0) return diff > dustFloor;
-        return Math.mulDiv(diff, 10000, target) >= uint256(minDriftBps);
-    }
-
-    /// @notice Seuil dynamique depuis la config range d'un RangeManager.
-    function rangeHedgeThresholdBps(address rangeManager, uint16 rangeDivisor, uint16 floorBps)
-        external
-        view
-        returns (uint16)
-    {
-        return _rangeHedgeThresholdBps(rangeManager, rangeDivisor, floorBps);
-    }
-
-    function _rangeHedgeThresholdBps(address rangeManager, uint16 rangeDivisor, uint16 floorBps)
-        private
-        view
-        returns (uint16)
-    {
-        if (rangeManager == address(0) || rangeDivisor == 0) return floorBps;
-        (bool ok, bytes memory data) = rangeManager.staticcall(abi.encodeWithSelector(IRmDep.config.selector));
-        if (!ok || data.length < 320) return floorBps;
-        (,,,,,,, uint16 rangeUpBps, uint16 rangeDownBps,) =
-            abi.decode(data, (uint24, uint8, uint8, uint16, uint24, uint64, bool, uint16, uint16, uint32));
-        uint256 threshold = (uint256(rangeUpBps) + uint256(rangeDownBps)) / uint256(rangeDivisor);
-        if (threshold < uint256(floorBps)) threshold = uint256(floorBps);
-        if (threshold > type(uint16).max) threshold = type(uint16).max;
-        return uint16(threshold);
     }
 
     /// @notice Composition token0 du NFT LP + ticks, utilisée par AaveHedgeManager.adjustHedge().
@@ -960,6 +866,96 @@ library DnDepositLib {
         sqrtPriceLimitX96 = uint160(
             (uint256(sqrtP) * (zeroForOne ? 20000 - uint256(slippageBps) : 20000 + uint256(slippageBps))) / 20000
         );
+    }
+
+    /// @notice Returns the only strategy fields consumed by AaveHedgeManager and validates HEDGE_ONLY in-engine.
+    /// @dev Large fixed-width structs are decoded selectively to keep AaveHedgeManager below EIP-170.
+    function hedgeStrategyDecision(address rangeManager, address hedgeManager, address caller)
+        external
+        view
+        returns (uint8 action, bytes32 decisionHash, uint64 checkpointTimestamp, bool protocolBotCaller)
+    {
+        IRangeStrategyEngine engine = IRmDep(rangeManager).strategyEngine();
+        if (address(engine) == address(0) || engine.hedgeManager() != hedgeManager) revert InvalidStrategyDecision();
+        (action, decisionHash) = _readDecision(address(engine), bytes32(0), false);
+        if (action == uint8(IRangeStrategyEngine.Action.HEDGE_ONLY)) {
+            (uint8 validatedAction, bytes32 validatedHash) = _readDecision(address(engine), decisionHash, true);
+            if (validatedAction != action || validatedHash != decisionHash) revert InvalidStrategyDecision();
+        }
+        checkpointTimestamp = _readCheckpointTimestamp(address(engine));
+        protocolBotCaller = _isProtocolBotCaller(rangeManager, caller);
+    }
+
+    function rawDebtDriftExceeds(uint256 debt, uint256 target, uint16 thresholdBps, uint256 dustFloor)
+        external
+        pure
+        returns (bool)
+    {
+        uint256 diff = debt > target ? debt - target : target - debt;
+        if (target == 0) return diff > dustFloor;
+        return (diff * 10000) / target >= uint256(thresholdBps);
+    }
+
+    function strategyCanonicalTwaps(
+        address pool,
+        uint64 epoch,
+        uint32 epochSeconds,
+        uint32 tacticalHorizonSeconds,
+        uint32 strategicHorizonSeconds
+    ) external view returns (int24 tacticalTick, int24 strategicTick) {
+        uint32 endAgo = uint32(block.timestamp - uint256(epoch) * epochSeconds);
+        uint32[] memory secondsAgos = new uint32[](3);
+        secondsAgos[0] = endAgo + strategicHorizonSeconds;
+        secondsAgos[1] = endAgo + tacticalHorizonSeconds;
+        secondsAgos[2] = endAgo;
+        (int56[] memory cumulatives,) = IUniswapV3Pool(pool).observe(secondsAgos);
+        strategicTick = _meanStrategyTick(cumulatives[2] - cumulatives[0], strategicHorizonSeconds);
+        tacticalTick = _meanStrategyTick(cumulatives[2] - cumulatives[1], tacticalHorizonSeconds);
+    }
+
+    function _readDecision(address engine, bytes32 expectedHash, bool validate)
+        private
+        view
+        returns (uint8 action, bytes32 decisionHash)
+    {
+        bytes memory payload = validate
+            ? abi.encodeWithSelector(IRangeStrategyEngine.validateDecision.selector, expectedHash)
+            : abi.encodeWithSelector(IRangeStrategyEngine.previewDecision.selector);
+        (bool ok, bytes memory result) = engine.staticcall(payload);
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(result, 0x20), mload(result))
+            }
+        }
+        if (result.length < 18 * 32) revert InvalidStrategyDecision();
+        uint256 rawAction;
+        assembly ("memory-safe") {
+            rawAction := mload(add(result, 0x60))
+            decisionHash := mload(add(result, 0x240))
+        }
+        if (rawAction > uint256(IRangeStrategyEngine.Action.HF_REPAIR)) revert InvalidStrategyDecision();
+        action = uint8(rawAction);
+    }
+
+    function _readCheckpointTimestamp(address engine) private view returns (uint64 timestamp) {
+        (bool ok, bytes memory result) =
+            engine.staticcall(abi.encodeWithSelector(IRangeStrategyEngine.currentTelemetry.selector));
+        if (!ok || result.length < 64) revert InvalidStrategyDecision();
+        uint256 rawTimestamp;
+        assembly ("memory-safe") {
+            rawTimestamp := mload(add(result, 0x40))
+        }
+        if (rawTimestamp > type(uint64).max) revert InvalidStrategyDecision();
+        timestamp = uint64(rawTimestamp);
+    }
+
+    function _isProtocolBotCaller(address rangeManager, address caller) private view returns (bool) {
+        return IRmDep(rangeManager).isProtocolBotCaller(caller);
+    }
+
+    function _meanStrategyTick(int56 delta, uint32 seconds_) private pure returns (int24 tick) {
+        tick = int24(delta / int56(uint56(seconds_)));
+        if (delta < 0 && delta % int56(uint56(seconds_)) != 0) tick--;
     }
 
     // ===== helpers internes (inlinés dans la library) =====

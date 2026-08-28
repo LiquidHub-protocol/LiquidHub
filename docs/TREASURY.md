@@ -73,14 +73,14 @@ The Treasury rewards community keepers who execute the protocol's permissionless
 |--------|--------------|----------------|
 | Keeper (rebalance) | `rebalance()` on the RangeManager | `setKeeperBounty(enabled, amount)` |
 | Deposit (process) | `processDepositPermissionless()` on the Vault | `setDepositBounty(enabled, amount)` |
-| Metrics (snapshot) | `recordPriceSnapshot()` on the RangeManager | `setMetricsBounty(enabled, amount)` |
+| Strategy checkpoint | `checkpointMarketState()` on the RangeStrategyEngine | `setStrategyCheckpointBounty(enabled, amount)` |
 | Hedge (DN) | `adjustHedge()` on the AaveHedgeManager | `setHedgeBounty(enabled, amount)` |
 | Bridge _(Phase 2)_ | `bridgeToStakers()` | `setBridgeBounty(enabled, amount)` |
 
-> **Amounts** are not listed here. The current bounty amounts are published on the protocol's Decentralization page (https://liquidhub.app/docs#decentralization) and are the source of truth on-chain — read the live value on the Treasury contract (`keeperBountyAmount()`, `depositBountyAmount()`, etc.) before relying on it.
+> **Amounts** are not listed here. The current bounty amounts are published on the protocol's Protocol Design page (https://liquidhub.app/docs#protocol) and are the source of truth on-chain. Read the live value on the Treasury contract (`keeperBountyAmount()`, `depositBountyAmount()`, `strategyCheckpointBountyAmount()`, etc.) before relying on it.
 
-- The RangeManager must be authorized via `authorizeRangeManager()`, the Vault via `authorizeVault()` (deposit bounty), and (DN) the AaveHedgeManager via `authorizeHedgeManager()` before they can trigger bounty payments. This is irrelevant to which keeper executes the action — the bounty always goes to whoever called the function (`msg.sender`).
-- **Anti-drain**: `processDepositPermissionless()` reverts unless a deposit is queued; community keepers also require an existing position NFT because the one-time initial mint is reserved to the protocol bot/Safe path. The deposit bounty is paid only when the processed deposit is at least 100× the bounty value, after the per-Vault cooldown, after the same-keeper cooldown for that Vault, and below the per-Vault daily cap; `recordPriceSnapshot()` reverts unless a snapshot is due (capped by `maxSnapshotsPerDay`); `adjustHedge()` reverts unless the hedge drift exceeds the on-chain threshold **and** the on-chain cooldown (`hedgeAdjustCooldown`) has elapsed.
+- The RangeManager must be authorized via `authorizeRangeManager()`, the Vault via `authorizeVault()`, each RangeStrategyEngine via `authorizeStrategyEngine()`, and (DN) the AaveHedgeManager via `authorizeHedgeManager()` before they can trigger bounty payments. This does not restrict the keeper: the bounty is still paid to the permissionless caller.
+- **Anti-drain**: `processDepositPermissionless()` reverts unless a deposit is queued; community keepers also require an existing position NFT because the one-time initial mint is reserved to the protocol bot/Safe path. Deposit bounties retain their ratio, cooldown and daily-cap guards. `checkpointMarketState()` advances only a due canonical epoch; `payStrategyCheckpointBounty()` also requires a strictly newer epoch and applies a per-engine daily cap. Normal `adjustHedge()` drift requires the on-chain threshold and cooldown; urgent HF repair is enabled only below its separate trigger and has separate bounty eligibility.
 - The **bridge bounty** mechanism is deployed but disabled until the staking contract is live (Phase 2). Activation is a single `setBridgeBounty(true, …)` transaction — no redeployment.
 
 ### Bounty payment semantics
@@ -113,11 +113,13 @@ Both functions are `onlyOwner`.
 | `setKeeperBounty(enabled, amount)` | Configure the rebalance bounty | Active (Phase 1) |
 | `setDepositBounty(enabled, amount)` | Configure the deposit-processing bounty | Active (Phase 1) |
 | `setDepositBountyLimits(vaultCooldown, keeperCooldown, dailyCap)` | Configure anti-drain limits for deposit-processing bounties | Active (Phase 1) |
-| `setMetricsBounty(enabled, amount)` | Configure the snapshot bounty | Active (Phase 1) |
+| `setStrategyCheckpointBounty(enabled, amount)` | Configure the canonical strategy checkpoint bounty | Active (Phase 1) |
+| `setStrategyCheckpointBountyDailyCap(dailyCap)` | Configure the per-engine checkpoint daily cap | Active (Phase 1) |
 | `setHedgeBounty(enabled, amount)` | Configure the hedge bounty (DN) | Active (Phase 1) |
 | `setBridgeBounty(enabled, amount)` | Configure the bridge bounty | _Phase 2 — disabled by default_ |
 | `setDistributionsPaused(paused)` | Emergency-stop permissionless staking distributions/bridges; Rescue Safe may pause, owner resumes | Active |
-| `authorizeRangeManager(rm, authorized)` | Whitelist a RangeManager for `payKeeperBounty()` / `payMetricsBounty()` | Active (Phase 1) |
+| `authorizeRangeManager(rm, authorized)` | Authorize a RangeManager for `payKeeperBounty()` | Active (Phase 1) |
+| `authorizeStrategyEngine(engine, authorized)` | Authorize an engine for `payStrategyCheckpointBounty()` | Active (Phase 1) |
 | `authorizeVault(vault, authorized)` | Whitelist a Vault for `payDepositBounty()` | Active (Phase 1) |
 | `authorizeHedgeManager(hm, authorized)` | Whitelist an AaveHedgeManager for `payHedgeBounty()` | Active (Phase 1) |
 | `disableAdminWithdraw()` | Irreversibly lock the Treasury against admin withdrawals | _Phase 2_ |
@@ -136,7 +138,7 @@ Both functions are `onlyOwner`.
 | `keeperBountyEnabled()` / `keeperBountyAmount()` | Rebalance bounty config |
 | `depositBountyEnabled()` / `depositBountyAmount()` | Deposit-processing bounty config |
 | `depositBountyCooldown()` / `depositBountyKeeperCooldown()` / `depositBountyDailyCap()` | Deposit bounty anti-drain limits |
-| `metricsBountyEnabled()` / `metricsBountyAmount()` | Snapshot bounty config |
+| `strategyCheckpointBountyEnabled()` / `strategyCheckpointBountyAmount()` / `strategyCheckpointBountyDailyCap()` | Per-pool strategy checkpoint bounty config |
 | `hedgeBountyEnabled()` / `hedgeBountyAmount()` | Hedge bounty config (DN) |
 | `distributionsPaused()` | Whether permissionless staking distributions and bridges are stopped |
 | `usdc()` | Address of the USDC token (used to read the Treasury balance) |
@@ -155,8 +157,9 @@ Both functions are `onlyOwner`.
 | `DepositBountyLimitsConfigured(vaultCooldown, keeperCooldown, dailyCap)` | `setDepositBountyLimits()` |
 | `DistributionsPauseUpdated(paused, caller)` | `setDistributionsPaused()` |
 | `VaultAuthorized(vault, authorized)` | `authorizeVault()` |
-| `MetricsBountyPaid(keeper, amount)` | `payMetricsBounty()` |
-| `MetricsBountyConfigured(enabled, amount)` | `setMetricsBounty()` |
+| `StrategyCheckpointBountyPaid(keeper, engine, epoch, amount)` | `payStrategyCheckpointBounty()` |
+| `StrategyCheckpointBountyConfigured(enabled, amount)` | `setStrategyCheckpointBounty()` |
+| `StrategyCheckpointBountyDailyCapConfigured(dailyCap)` | `setStrategyCheckpointBountyDailyCap()` |
 | `HedgeBountyPaid(keeper, amount)` | `payHedgeBounty()` (DN) |
 | `HedgeBountyConfigured(enabled, amount)` | `setHedgeBounty()` (DN) |
 | `MonthlyCapUpdated(oldCap, newCap)` | `setMonthlyCap()` |

@@ -43,20 +43,22 @@ function divideIntoChunks(totalAmount, numChunks) {
  * Permissionless: no keeper role required — anyone can trigger when needsRebalance is true.
  */
 class Rebalancer {
-  constructor(rangeManager, vault, wallet, rpcPool) {
+  constructor(rangeManager, vault, strategyEngine, wallet, rpcPool) {
     this.rangeManager = rangeManager;
     this.vault = vault;
+    this.strategyEngine = strategyEngine;
     this.wallet = wallet;
     this.rpcPool = rpcPool;
   }
 
-  async executeRebalance(tokenId) {
+  async executeRebalance(tokenId, expectedDecisionHash) {
     console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
 
     try {
       let plan = null;
       try {
-        plan = await this._buildRebalancePlan(await this._readPriceCache());
+        const decision = await this._readRebalanceDecision(expectedDecisionHash);
+        plan = await this._buildRebalancePlan(await this._readPriceCache(), decision.decisionHash);
         await this._simulateRebalance(plan);
       } catch (firstError) {
         plan = null;
@@ -67,7 +69,8 @@ class Rebalancer {
         if (this._isFeePlanError(firstError)) {
           await this._syncFeesForActionPlan('rebalance retry');
           try {
-            plan = await this._buildRebalancePlan(await this._readPriceCache());
+            const decision = await this._readRebalanceDecision();
+            plan = await this._buildRebalancePlan(await this._readPriceCache(), decision.decisionHash);
             await this._simulateRebalance(plan);
           } catch (postFeeError) {
             plan = null;
@@ -81,9 +84,17 @@ class Rebalancer {
           if (!this._shouldRefreshForPlanError(retryError)) throw retryError;
           console.log(`  Rebalance plan rejected; refreshing once and recomputing: ${this._errorText(retryError)}`);
           const refreshed = await this._refreshPriceCacheForAction('rebalance stale-plan retry');
-          plan = await this._buildRebalancePlan(refreshed);
+          const decision = await this._readRebalanceDecision();
+          plan = await this._buildRebalancePlan(refreshed, decision.decisionHash);
           await this._simulateRebalance(plan);
         }
+      }
+
+      const latestDecision = await this._readRebalanceDecision();
+      if (latestDecision.decisionHash !== plan.decisionHash) {
+        console.log('  Strategy decision changed before submission; rebuilding the plan once.');
+        plan = await this._buildRebalancePlan(await this._readPriceCache(), latestDecision.decisionHash);
+        await this._simulateRebalance(plan);
       }
 
       this._logPlan(plan);
@@ -91,7 +102,13 @@ class Rebalancer {
       const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
         const signer = this.wallet.connect(provider);
         const rm = this.rangeManager.connect(signer);
-        const request = await rm.rebalance.populateTransaction(plan.swapAmounts, plan.minOuts, plan.tokenIn, plan.tokenOut);
+        const request = await rm.rebalance.populateTransaction(
+          plan.decisionHash,
+          plan.swapAmounts,
+          plan.minOuts,
+          plan.tokenIn,
+          plan.tokenOut
+        );
         return {
           wallet: signer,
           request: await this._boundTransactionGas(provider, signer, request, `rebalance ${plan.chunkCount} chunk(s)`),
@@ -117,11 +134,11 @@ class Rebalancer {
   async processDeposit() {
     console.log('\n=== Processing queued deposit (permissionless) ===');
     try {
-      const [, , needsRebalance, action, reason] = await this.rpcPool.executeWithRetry(async (provider) => {
-        return await this.rangeManager.connect(provider).getBotInstructions();
+      const decision = await this.rpcPool.executeWithRetry(async (provider) => {
+        return await this.strategyEngine.connect(provider).previewDecision();
       });
-      if (needsRebalance) {
-        console.log(`  Deposit deferred: ${action || 'REBALANCE'} is required first (${reason || 'on-chain signal'}).`);
+      if (Number(decision.action) === 2) {
+        console.log('  Deposit deferred: the canonical strategy decision requires a range rebalance first.');
         return { success: false, deferred: true, error: 'rebalance required before deposit', txHashes: [] };
       }
 
@@ -199,11 +216,30 @@ class Rebalancer {
     return priceCache;
   }
 
-  async _buildRebalancePlan(priceCache) {
+  async _buildRebalancePlan(priceCache, decisionHash) {
     const swapParams = await this.rpcPool.executeWithRetry(async (provider) => {
       return await this.rangeManager.connect(provider).getOptimalSwapParams();
     });
-    return await this._buildPlan(swapParams.zeroForOne, swapParams.swapNeeded ? swapParams.amountIn : 0n, priceCache);
+    const plan = await this._buildPlan(
+      swapParams.zeroForOne,
+      swapParams.swapNeeded ? swapParams.amountIn : 0n,
+      priceCache
+    );
+    plan.decisionHash = decisionHash;
+    return plan;
+  }
+
+  async _readRebalanceDecision(expectedDecisionHash = null) {
+    const decision = await this.rpcPool.executeWithRetry(async (provider) => {
+      return await this.strategyEngine.connect(provider).previewDecision();
+    });
+    if (Number(decision.action) !== 2 || !decision.dataFresh) {
+      throw new Error('E90: canonical strategy decision does not authorize a range rebalance');
+    }
+    if (expectedDecisionHash && decision.decisionHash !== expectedDecisionHash) {
+      console.log('  Strategy decision advanced since the cycle read; using the latest canonical hash.');
+    }
+    return decision;
   }
 
   async _buildDepositPlan(priceCache) {
@@ -250,7 +286,13 @@ class Rebalancer {
   async _simulateRebalance(plan) {
     await this.rpcPool.executeWithRetry(async (provider) => {
       const rm = this.rangeManager.connect(this.wallet.connect(provider));
-      return await rm.rebalance.staticCall(plan.swapAmounts, plan.minOuts, plan.tokenIn, plan.tokenOut);
+      return await rm.rebalance.staticCall(
+        plan.decisionHash,
+        plan.swapAmounts,
+        plan.minOuts,
+        plan.tokenIn,
+        plan.tokenOut
+      );
     });
   }
 

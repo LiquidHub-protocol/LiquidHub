@@ -11,10 +11,14 @@ import "v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "./RangeOperations.sol";
+import "./interfaces/IRangeStrategyEngine.sol";
 
 interface ITreasury {
     function payKeeperBounty(address keeper) external;
-    function payMetricsBounty(address keeper) external;
+}
+
+interface IProtocolBotIdentity {
+    function botAddress() external view returns (address);
 }
 
 interface IMultiUserVault {
@@ -54,21 +58,16 @@ contract RangeManager is Ownable, ReentrancyGuard {
     error E13();
     error E15();
     error E16();
-    error E17();
-    error E18();
     error E19();
     error E20();
     error E21();
-    error E38();
     error E40();
-    error E44();
-    error E45();
-    error E46();
     error E94();
     error E99();
 
     uint256 private constant MAX_UINT128 = type(uint128).max;
     uint256 private constant MIN_REBALANCE_INTERVAL = 300;
+    uint256 private constant MAIN_BOT_KEEPER_DELAY = 60;
 
     // ===== SYSTEME D'AUTORISATION DOUBLE =====
     address public safeAddress;
@@ -93,6 +92,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
     ISwapRouter public immutable swapRouter;
     address public treasuryAddress;
     uint256 public initMultiSwapTvl;
+    IRangeStrategyEngine public strategyEngine;
+    address public protocolBotAddress;
+    address private protocolBotOperator;
 
     // ===== VARIABLES D'ETAT (utilisant les structs de la library) =====
 
@@ -100,25 +102,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
     RangeOperations.ProtectionConfig public protectionConfig;
     RangeOperations.PriceCache public priceCache;
     RangeOperations.SystemStats public systemStats;
-
-    // ===== DYNAMIC RANGE (calcul on-chain) =====
-    RangeOperations.DynamicRangeConfig public dynRangeConfig;
-    RangeOperations.PriceSnapshot[] private _priceRing;
-    uint16 private _ringHead;
-    uint16 private _ringCap;
-
-    event PriceSnapshotRecorded(uint128 price, uint64 timestamp, address indexed keeper);
-    event DynamicRangeConfigured(
-        bool enabled,
-        uint8 maxSnapshotsPerDay,
-        uint8 volatMoyDay,
-        uint8 volatTrimDay,
-        uint16 rangeStepBps,
-        uint16 rangeMultiplicatorBps,
-        uint16 rangeMinBps,
-        uint16 rangeMaxBps
-    );
-    event DynamicRangeApplied(uint16 halfRangeBps);
 
     // ===== ORACLES =====
 
@@ -144,6 +127,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     event TreasuryAddressUpdated(address indexed oldTreasury, address indexed newTreasury); // audit LOW-5
     event InitMultiSwapTvlUpdated(uint256 oldValue, uint256 newValue);
     event LiquidityAdded(uint256 indexed tokenId, uint256 amount0, uint256 amount1, uint128 liquidity);
+    event StrategyEngineSet(address indexed strategyEngine, address indexed protocolBot);
 
     // ===== NOUVEAUX MODIFIERS =====
 
@@ -209,9 +193,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint8 _token1Decimals,
         address _swapRouter,
         address _treasuryAddress,
-        uint256 _initMultiSwapTvl,
-        uint16 _rangeUpPercent,
-        uint16 _rangeDownPercent
+        uint256 _initMultiSwapTvl
     ) {
         require(_vault != address(0), "E09");
         require(_pauseController != address(0), "E09");
@@ -223,9 +205,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
             "E10"
         );
 
-        // Validation des ranges (mêmes limites que configureRanges)
-        require(_rangeUpPercent >= 10 && _rangeUpPercent <= 5000, "E17");
-        require(_rangeDownPercent >= 10 && _rangeDownPercent <= 5000, "E18");
         require(_initMultiSwapTvl > 0 && _initMultiSwapTvl <= 1_000_000, "E97");
 
         positionManager = INonfungiblePositionManager(_positionManager);
@@ -245,8 +224,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
             maxSlippageBps: 100, //1% en basis points
             lastRebalanceTime: 0,
             oraclesConfigured: false,
-            rangeUpPercent: _rangeUpPercent,
-            rangeDownPercent: _rangeDownPercent,
             maxPositions: 1
         });
 
@@ -304,118 +281,37 @@ contract RangeManager is Ownable, ReentrancyGuard {
         emit ExecutorAuthorized(_executor, _authorized);
     }
 
+    /// @notice Returns whether `caller` belongs to the protocol-operated execution path.
+    /// @dev RangeStrategyEngine uses this view to enforce the community keeper priority window on-chain.
+    function isProtocolBotCaller(address caller) public view returns (bool) {
+        return caller != address(0)
+            && (
+                caller == protocolBotAddress || caller == protocolBotOperator || caller == safeAddress
+                    || authorizedExecutors[caller]
+            );
+    }
+
     // ===== FONCTIONS DE CONFIGURATION (gouvernance via Vault owner) =====
 
-    function _minTotalRangeBps() private view returns (uint16) {
-        uint24 f = config.fee;
-        if (f == 100) return 10;
-        if (f == 500) return 100;
-        if (f == 3000) return 600;
-        if (f == 10000) return 2000;
-        return 100;
-    }
-
-    function configureRanges(uint16 _rangeUpPercent, uint16 _rangeDownPercent) external onlyVaultOwner {
-        if (_rangeUpPercent < 10 || _rangeUpPercent > 5000) revert E17();
-        if (_rangeDownPercent < 10 || _rangeDownPercent > 5000) revert E18();
-        if (uint256(_rangeUpPercent) + _rangeDownPercent < _minTotalRangeBps()) revert E40();
-
-        config.rangeUpPercent = _rangeUpPercent;
-        config.rangeDownPercent = _rangeDownPercent;
-    }
-
-    // ===== CONFIGURATION DYNAMIC RANGE (gouvernance) =====
-
-    /// @notice Configure le calcul dynamique des ranges (parametres de gouvernance, lus par les keepers).
-    function setDynamicRangeConfig(
-        bool _enabled,
-        uint8 _maxSnapshotsPerDay,
-        uint8 _volatMoyDay,
-        uint8 _volatTrimDay,
-        uint16 _rangeStepBps,
-        uint16 _rangeMultiplicatorBps,
-        uint16 _rangeMinBps,
-        uint16 _rangeMaxBps
-    ) external onlyVaultOwner {
+    /// @notice One-time reciprocal link to this pool's immutable strategy engine.
+    function setStrategyEngine(address engine, address protocolBot) external onlyVaultOwner {
         if (
-            !(
-                _maxSnapshotsPerDay >= 1 && _maxSnapshotsPerDay <= 24 && _volatMoyDay >= 1 && _volatMoyDay <= 20
-                    && uint16(_volatTrimDay) * 2 + 2 <= uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay)
-                    && _rangeStepBps >= 10 && _rangeStepBps <= 1000 && _rangeMultiplicatorBps >= 5000
-                    && _rangeMultiplicatorBps <= 30000 && _rangeMinBps >= 10 && _rangeMinBps <= _rangeMaxBps
-                    && _rangeMaxBps <= 5000 && uint256(_rangeMinBps) * 2 >= _minTotalRangeBps()
-            )
+            address(strategyEngine) != address(0) || engine.code.length == 0 || protocolBot.code.length == 0
+                || protocolBotAddress != address(0)
         ) revert E40();
-        _ringCap = uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay);
-        dynRangeConfig.dynamicRangeEnabled = _enabled;
-        dynRangeConfig.maxSnapshotsPerDay = _maxSnapshotsPerDay;
-        dynRangeConfig.volatMoyDay = _volatMoyDay;
-        dynRangeConfig.volatTrimDay = _volatTrimDay;
-        dynRangeConfig.rangeStepBps = _rangeStepBps;
-        dynRangeConfig.rangeMultiplicatorBps = _rangeMultiplicatorBps;
-        dynRangeConfig.rangeMinBps = _rangeMinBps;
-        dynRangeConfig.rangeMaxBps = _rangeMaxBps;
-        delete _priceRing;
-        _ringHead = 0;
-        dynRangeConfig.lastSnapshotAt = 0;
-        emit DynamicRangeConfigured(
-            _enabled,
-            _maxSnapshotsPerDay,
-            _volatMoyDay,
-            _volatTrimDay,
-            _rangeStepBps,
-            _rangeMultiplicatorBps,
-            _rangeMinBps,
-            _rangeMaxBps
-        );
-    }
-
-    function setDynamicRangeEnabled(bool _enabled) external onlyVaultOwner {
-        dynRangeConfig.dynamicRangeEnabled = _enabled;
-    }
-
-    function setRangeMultiplicator(uint16 _rangeMultiplicatorBps) external onlyVaultOwner {
-        if (_rangeMultiplicatorBps < 5000 || _rangeMultiplicatorBps > 30000) revert E44();
-        dynRangeConfig.rangeMultiplicatorBps = _rangeMultiplicatorBps;
-    }
-
-    function isSnapshotDue() external view returns (bool) {
-        if (!dynRangeConfig.dynamicRangeEnabled) return false;
-        return RangeOperations.isSnapshotDue(dynRangeConfig, uint64(block.timestamp));
-    }
-
-    /// @notice Enregistre le ratio oracle token0/token1 normalise en 8 decimales et verse le metrics bounty.
-    function recordPriceSnapshot() external nonReentrant {
-        if (!dynRangeConfig.dynamicRangeEnabled) revert E45();
-        if (!RangeOperations.isSnapshotDue(dynRangeConfig, uint64(block.timestamp))) revert E46();
-
-        _updatePriceCache();
-        if (!(priceCache.valid && priceCache.price0 > 0 && priceCache.price1 > 0)) revert E38();
-        uint256 pairPriceRaw = (uint256(priceCache.price0) * 1e8) / uint256(priceCache.price1);
-        if (pairPriceRaw == 0 || pairPriceRaw > type(uint128).max) revert E38();
-        uint128 pairPrice = uint128(pairPriceRaw);
-
-        _ringHead = RangeOperations.writeRing(
-            _priceRing,
-            _ringHead,
-            _ringCap,
-            RangeOperations.PriceSnapshot({price: pairPrice, timestamp: uint64(block.timestamp)})
-        );
-        dynRangeConfig.lastSnapshotAt = uint64(block.timestamp);
-        _applyDynamicRangeIfDue(pairPrice);
-
-        _payBounty(true);
-        emit PriceSnapshotRecorded(pairPrice, uint64(block.timestamp), msg.sender);
-    }
-
-    /// @dev Recalcule et applique le range dynamique (calcul + decision delegues a la library).
-    function _applyDynamicRangeIfDue(uint128 pairPrice) private {
-        (uint16 halfBps, bool shouldApply) =
-            RangeOperations.evaluateDynamicRange(_priceRing, pairPrice, dynRangeConfig, uint64(block.timestamp));
-        if (!shouldApply) return;
-        config.rangeUpPercent = halfBps;
-        config.rangeDownPercent = halfBps;
-        emit DynamicRangeApplied(halfBps);
+        address botOperator = IProtocolBotIdentity(protocolBot).botAddress();
+        if (botOperator == address(0)) revert E40();
+        IRangeStrategyEngine candidate = IRangeStrategyEngine(engine);
+        IRangeStrategyEngine.StrategyProfile candidateProfile = candidate.profile();
+        if (
+            candidate.rangeManager() != address(this) || candidate.pool() != address(pool)
+                || candidate.hedgeManager() != address(0)
+                || candidateProfile == IRangeStrategyEngine.StrategyProfile.DELTA_NEUTRAL
+        ) revert E40();
+        strategyEngine = candidate;
+        protocolBotAddress = protocolBot;
+        protocolBotOperator = botOperator;
+        emit StrategyEngineSet(engine, protocolBot);
     }
 
     function configureSlippage(uint24 _maxSlippageBps) external onlyVaultOwner {
@@ -511,8 +407,22 @@ contract RangeManager is Ownable, ReentrancyGuard {
         returns (uint256 tokenId, uint128 liquidity)
     {
         require(config.oraclesConfigured, "E26");
+        // The bot module calls processDepositPermissionless() on the Vault. The Vault enforces that
+        // only its configured bot module (or governance) can process the first queued deposit, then
+        // calls this function itself. Requiring the module here would make the atomic call chain
+        // impossible because Solidity does not preserve the original caller across contracts.
+        require(msg.sender == vault, "E99");
+        _refreshAndRequireValid();
+        IRangeStrategyEngine.Decision memory decision = _validatedStrategyDecision();
+        require(
+            decision.reason == IRangeStrategyEngine.ReasonCode.INITIAL_MINT_REQUIRED
+                && decision.targetTickLower < priceCache.poolTick && decision.targetTickUpper > priceCache.poolTick,
+            "E90"
+        );
 
-        try this._mintInternal() returns (uint256 _tokenId, uint128 _liquidity) {
+        try this._mintInternal(decision.targetTickLower, decision.targetTickUpper) returns (
+            uint256 _tokenId, uint128 _liquidity
+        ) {
             _recordSuccessfulOperation();
             return (_tokenId, _liquidity);
         } catch (bytes memory reason) {
@@ -545,20 +455,18 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * @return tokenId The ID of the newly minted position
      * @return liquidity The amount of liquidity minted
      */
-    function _mintInternal() external returns (uint256 tokenId, uint128 liquidity) {
+    function _mintInternal(int24 tickLower, int24 tickUpper) external returns (uint256 tokenId, uint128 liquidity) {
         require(msg.sender == address(this), "E29"); // Self-call only - see NatSpec above
 
         // audit V1 (V3-H2) : refresh + barrière déviation/staleness AVANT de minter (cohérent DN). Cache invalidé
         // si le pool diverge de l'oracle => on refuse de poser de la liquidité sur un prix manipulé.
         _refreshAndRequireValid();
+        require(tickLower < priceCache.poolTick && tickUpper > priceCache.poolTick, "E90");
 
         // Verifier qu'on a des tokens a minter (swaps deja faits via executeSwap)
         uint256 balance0 = IERC20(token0).balanceOf(address(this));
         uint256 balance1 = IERC20(token1).balanceOf(address(this));
         require(balance0 > 0 || balance1 > 0, "E30");
-
-        // Calculer les ticks cibles
-        (int24 tickLower, int24 tickUpper) = RangeOperations.calculateTargetTicks(priceCache, config, pool);
 
         // PAS DE SWAP ICI - les swaps sont faits via executeSwap (multi-swap) avant d'appeler cette fonction
 
@@ -665,26 +573,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         }
     }
 
-    /// @dev Helper privé mutualisant l'appel (9 args) à RangeOperations.getBotInstructions, factorisé pour
-    ///      éviter de dupliquer le marshalling dans getBotInstructions()/needsRebalance()/rebalance(). DN-coh.
-    function _botInstructions()
-        private
-        view
-        returns (bool hasPosition, uint256 tokenId, bool shouldRebalance, string memory action, string memory reason)
-    {
-        return RangeOperations.getBotInstructions(
-            positionCount, config.maxPositions, getOwnerPositions(), positionManager, priceCache
-        );
-    }
-
-    function getBotInstructions()
-        external
-        view
-        returns (bool hasPosition, uint256 tokenId, bool shouldRebalance, string memory action, string memory reason)
-    {
-        return _botInstructions();
-    }
-
     /**
      * @notice Fonction publique pour calculer les target ticks (appelable par le bot)
      * @dev Utilise le cache prix interne mis a jour
@@ -693,8 +581,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
      */
     function calculateTargetTicks() external view returns (int24 tickLower, int24 tickUpper) {
         _requireOperational();
-        // Utiliser la library avec le cache interne
-        return RangeOperations.calculateTargetTicks(priceCache, config, pool);
+        IRangeStrategyEngine.Decision memory decision = _validatedStrategyDecision();
+        tickLower = decision.targetTickLower;
+        tickUpper = decision.targetTickUpper;
+        require(tickLower < priceCache.poolTick && tickUpper > priceCache.poolTick, "E90");
     }
 
     /**
@@ -748,13 +638,22 @@ contract RangeManager is Ownable, ReentrancyGuard {
      */
     function getOptimalSwapParams() external view returns (RangeOperations.OptimalSwapParams memory) {
         _requireOperational();
+        IRangeStrategyEngine.Decision memory decision = _validatedStrategyDecision();
+        return _optimalSwapParams(decision.targetTickLower, decision.targetTickUpper);
+    }
+
+    function _optimalSwapParams(int24 tickLower, int24 tickUpper)
+        private
+        view
+        returns (RangeOperations.OptimalSwapParams memory)
+    {
         // AUDIT C-02 : balances TOTALES (libres + principal NFT) = composition POST-burn que rebalance()
         // rééquilibrera. Sinon une position hors-range (quasi mono-token, ~0 libre) → 0 swap calculé → mint
         // revert après burn. getCurrentBalances() reflète l'état post-burn → dimensionnement keeper correct.
         (uint256 bal0, uint256 bal1) = RangeOperations.getCurrentBalances(
             token0, token1, address(this), getOwnerPositions(), positionManager, pool
         );
-        return RangeOperations.calculateOptimalSwapParams(bal0, bal1, priceCache, config, pool);
+        return RangeOperations.calculateOptimalSwapParams(bal0, bal1, priceCache, config, tickLower, tickUpper);
     }
 
     function validateDepositSwapPlan(
@@ -791,6 +690,12 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     // ===== FONCTIONS INTERNES =====
 
+    function _validatedStrategyDecision() private view returns (IRangeStrategyEngine.Decision memory decision) {
+        if (address(strategyEngine) == address(0)) revert E40();
+        decision = strategyEngine.previewDecision();
+        decision = strategyEngine.validateDecision(decision.decisionHash);
+    }
+
     /// @dev (audit V1 — V3-H2) Refresh + barrière déviation/staleness mutualisée. updatePriceCache invalide le
     ///      cache si le pool diverge de l'oracle ou si un feed est stale ; on revert alors avant toute action LP.
     function _refreshAndRequireValid() private {
@@ -812,15 +717,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
         require(priceCache.valid, "E38");
     }
 
-    /// @dev Verse un bounty au msg.sender (silent : ne bloque jamais l'action). isMetrics => payMetricsBounty,
-    ///      sinon payKeeperBounty. Factorisé (recordPriceSnapshot + rebalance) pour le bytecode. DN-coh.
-    function _payBounty(bool isMetrics) private {
+    /// @dev Pays le bounty de rebalance sans jamais bloquer l'action principale.
+    function _payBounty() private {
         if (treasuryAddress == address(0)) return;
-        if (isMetrics) {
-            try ITreasury(treasuryAddress).payMetricsBounty(msg.sender) {} catch {}
-        } else {
-            try ITreasury(treasuryAddress).payKeeperBounty(msg.sender) {} catch {}
-        }
+        try ITreasury(treasuryAddress).payKeeperBounty(msg.sender) {} catch {}
     }
 
     function _updatePriceCache() private {
@@ -1022,18 +922,17 @@ contract RangeManager is Ownable, ReentrancyGuard {
         return amountOut;
     }
 
-    // needsRebalance() wrapper removed: every active consumer reads getBotInstructions(), which
-    // returns the same boolean together with the tokenId/action/reason needed to act safely.
-
     /// @notice Atomic rebalance: burn → N swaps → mint → pay keeper bounty. Permissionless.
     /// @dev Each swap chunk must be ≤ initMultiSwapTvl in USD. Pass empty arrays if no swap needed.
     ///      Intentionally keeps the position-maintenance path open when PauseController blocks user flows:
-    ///      live oracle/deviation checks, needsRebalance, oracle minOuts, swap caps and the vault lock guard remain active.
+    ///      live oracle/deviation checks, the validated strategy decision, oracle minOuts, swap caps and the vault
+    ///      lock guard remain active.
     /// @param swapAmountsIn Amounts to swap per chunk (must match minAmountsOut length)
     /// @param minAmountsOut Minimum swap outputs per chunk (slippage protection)
     /// @param tokenIn Source token for all swaps
     /// @param tokenOut Destination token for all swaps
     function rebalance(
+        bytes32 expectedDecisionHash,
         uint256[] calldata swapAmountsIn,
         uint256[] calldata minAmountsOut,
         address tokenIn,
@@ -1051,14 +950,19 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // swaps (plancher minOut), mais ne dépend plus de la présence de swaps pour la déviation. Cohérent DN.
         _refreshAndRequireValid();
 
-        // Verify rebalance is needed
-        (bool hasPosition, uint256 tokenId, bool _needsRebalance,,) = _botInstructions();
-        require(hasPosition && _needsRebalance, "E90");
+        IRangeStrategyEngine.Decision memory decision = strategyEngine.validateDecision(expectedDecisionHash);
+        require(decision.action == IRangeStrategyEngine.Action.RANGE_REBALANCE && positionCount == 1, "E90");
+        uint256 tokenId = indexToPosition[0];
+        if (isProtocolBotCaller(msg.sender)) {
+            IRangeStrategyEngine.Telemetry memory telemetry = strategyEngine.currentTelemetry();
+            require(block.timestamp >= uint256(telemetry.checkpointTimestamp) + MAIN_BOT_KEEPER_DELAY, "E03");
+        }
 
         // Crystallise les fees avant de figer le plan. Toute la sequence reste atomique : une validation,
         // un swap ou un mint qui revert annule aussi collect, commission et accounting Vault.
         _collectFeesForVault(tokenId);
-        RangeOperations.OptimalSwapParams memory expectedPlan = this.getOptimalSwapParams();
+        RangeOperations.OptimalSwapParams memory expectedPlan =
+            _optimalSwapParams(decision.targetTickLower, decision.targetTickUpper);
 
         uint256 n = swapAmountsIn.length;
         uint256 totalSwapIn;
@@ -1085,12 +989,13 @@ contract RangeManager is Ownable, ReentrancyGuard {
             totalSwapIn,
             config.toleranceBps
         );
+        strategyEngine.recordExecution(decision.decisionHash, decision.action, msg.sender);
 
         // 1. Lock vault
         IMultiUserVault(vault).startRebalance();
 
         // 2. Burn existing position if any
-        if (hasPosition && tokenId > 0) {
+        if (tokenId > 0) {
             _burnTrackedPosition(tokenId);
         }
 
@@ -1104,14 +1009,14 @@ contract RangeManager is Ownable, ReentrancyGuard {
         }
 
         // 4. Mint new position
-        this._mintInternal();
+        this._mintInternal(decision.targetTickLower, decision.targetTickUpper);
         _recordSuccessfulOperation();
 
         // 5. Unlock vault
         IMultiUserVault(vault).endRebalance();
 
         // 6. Pay keeper bounty (silent - don't revert if bounty fails)
-        _payBounty(false);
+        _payBounty();
     }
 
     /// @dev Bounds one swap to roughly config.maxSlippageBps of price movement from the validated live pool price.

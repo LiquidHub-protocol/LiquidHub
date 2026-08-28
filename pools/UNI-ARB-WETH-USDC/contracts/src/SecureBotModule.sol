@@ -37,8 +37,6 @@ interface IRangeManagerBotState {
             uint24 maxSlippageBps,
             uint64 lastRebalanceTime,
             bool oraclesConfigured,
-            uint16 rangeUpPercent,
-            uint16 rangeDownPercent,
             uint32 maxPositions
         );
 }
@@ -47,6 +45,7 @@ contract SecureBotModule {
     address public immutable safe;
     address public immutable botAddress;
     address public immutable rangeManager;
+    address public immutable strategyEngine;
     address public immutable vault;
     address public immutable pauseController;
     address public immutable treasury;
@@ -66,6 +65,9 @@ contract SecureBotModule {
     // start/burn/swap/mint n'est plus expose.
     bytes4 private constant END_REBALANCE_SELECTOR = 0x0040718e; // endRebalance()
     bytes4 private constant REFRESH_PRICE_SELECTOR = 0x0be1c372; // refreshPriceCache()
+    bytes4 private constant CHECKPOINT_SELECTOR = bytes4(keccak256("checkpointMarketState()"));
+    bytes4 private constant REBALANCE_SELECTOR =
+        bytes4(keccak256("rebalance(bytes32,uint256[],uint256[],address,address)"));
 
     // Events
     event FunctionExecuted(bytes4 indexed selector, uint256 dailyCount);
@@ -81,13 +83,15 @@ contract SecureBotModule {
         address _safe,
         address _botAddress,
         address _rangeManager,
+        address _strategyEngine,
         address _vault,
         address _pauseController,
         address _treasury,
         uint256 _dailyLimit
     ) {
         require(
-            _safe != address(0) && _botAddress != address(0) && _rangeManager != address(0) && _vault != address(0)
+            _safe != address(0) && _botAddress != address(0) && _rangeManager != address(0)
+                && _strategyEngine != address(0) && _strategyEngine.code.length > 0 && _vault != address(0)
                 && _pauseController != address(0) && _treasury != address(0),
             "E_ZERO"
         );
@@ -95,6 +99,7 @@ contract SecureBotModule {
         safe = _safe;
         botAddress = _botAddress;
         rangeManager = _rangeManager;
+        strategyEngine = _strategyEngine;
         vault = _vault;
         pauseController = _pauseController;
         treasury = _treasury;
@@ -108,9 +113,9 @@ contract SecureBotModule {
         // Le bot rafraîchit le cache
         // via refreshPriceCache() ci-dessous, qui ne change aucune adresse.
         allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
-        allowedFunctions[0x6ecfe0f8] = true; // recordPriceSnapshot() - snapshot de prix (fallback bot si aucun keeper)
-        // Setters de stratégie/risk retirés du module: configureRanges, setDynamicRangeEnabled,
-        // configureSlippage, configureProtections, configureTolerance.
+        allowedFunctions[CHECKPOINT_SELECTOR] = true;
+        allowedFunctions[REBALANCE_SELECTOR] = true;
+        // Les setters de strategie/risk du moteur et du RangeManager restent reserves a la gouvernance.
 
         // Fonctions MultiUserVault
         // processPendingDeposits (0x99dd7ead) RETIRÉ (audit V1) : fonction batch supprimée du Vault.
@@ -134,7 +139,7 @@ contract SecureBotModule {
         IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
         (uint128 price0, uint128 price1, uint160 cachedSqrt,,, bool valid) = rm.priceCache();
         require(valid && price0 > 0 && price1 > 0 && cachedSqrt > 0, "E_NAV");
-        (, uint8 dec0, uint8 dec1,,,,,,,) = rm.config();
+        (, uint8 dec0, uint8 dec1,,,,,) = rm.config();
         uint160 oracleSqrt = _oracleSqrtPrice(price0, price1, cachedSqrt, dec0, dec1);
         (uint256 balance0, uint256 balance1) = _balancesAtPrice(rm, oracleSqrt);
         valueUsd = Math.mulDiv(balance0, price0, 10 ** dec0) + Math.mulDiv(balance1, price1, 10 ** dec1);
@@ -232,6 +237,7 @@ contract SecureBotModule {
     // Fonction existante pour RangeManager
     function executeRangeManagerFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
         bytes4 selector = bytes4(data[:4]);
+        require(selector == REFRESH_PRICE_SELECTOR || selector == REBALANCE_SELECTOR, "Wrong target");
         _requireInflowsForSelector(selector);
         if (selector != REFRESH_PRICE_SELECTOR) {
             _consumeDailyLimit();
@@ -241,6 +247,14 @@ contract SecureBotModule {
 
         _execute(rangeManager, 0, data);
 
+        emit FunctionExecuted(selector, dailySpent);
+    }
+
+    function executeStrategyEngineFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
+        bytes4 selector = bytes4(data[:4]);
+        require(selector == CHECKPOINT_SELECTOR, "Wrong target");
+        _consumeDailyLimit();
+        _execute(strategyEngine, 0, data);
         emit FunctionExecuted(selector, dailySpent);
     }
 
@@ -438,8 +452,7 @@ contract SecureBotModule {
 
     function _isCoreSelector(bytes4 selector) private pure returns (bool) {
         return selector == 0x0be1c372 // refreshPriceCache()
-            || selector == 0x6ecfe0f8 // recordPriceSnapshot()
-            || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
+            || selector == CHECKPOINT_SELECTOR || selector == REBALANCE_SELECTOR || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
             || selector == 0x0040718e // endRebalance()
             || selector == 0xa5599124 // bridgeToStakers(uint256)
             || selector == 0x56a12aca; // distributeToStakers(uint256)

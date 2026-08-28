@@ -12,10 +12,18 @@ import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/Aggrega
 import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "./RangeOperations.sol";
 import "./DnDepositLib.sol";
+import "./interfaces/IRangeStrategyEngine.sol";
 
 interface ITreasury {
     function payKeeperBounty(address keeper) external;
-    function payMetricsBounty(address keeper) external;
+}
+
+interface IProtocolBotIdentity {
+    function botAddress() external view returns (address);
+}
+
+interface IHedgeRangeSync {
+    function syncAfterRangeChange(address keeper) external;
 }
 
 interface IMultiUserVault {
@@ -56,21 +64,16 @@ contract RangeManager is Ownable, ReentrancyGuard {
     error E13();
     error E15();
     error E16();
-    error E17();
-    error E18();
     error E19();
     error E20();
     error E21();
-    error E38();
     error E40();
-    error E44();
-    error E45();
-    error E46();
     error E94();
     error E99();
 
     uint256 private constant MAX_UINT128 = type(uint128).max;
     uint256 private constant MIN_REBALANCE_INTERVAL = 300;
+    uint256 private constant MAIN_BOT_KEEPER_DELAY = 60;
 
     // ===== SYSTEME D'AUTORISATION DOUBLE =====
     address public safeAddress;
@@ -95,41 +98,21 @@ contract RangeManager is Ownable, ReentrancyGuard {
     ISwapRouter public immutable swapRouter;
     address public treasuryAddress;
     uint256 public initMultiSwapTvl;
+    IRangeStrategyEngine public strategyEngine;
+    address public protocolBotAddress;
+    address private protocolBotOperator;
 
     // ===== POST-CHECK DN AU REBALANCE (refonte DN) =====
     // Après un rebalance permissionless, le short net effectif doit ≈ targetShort (sinon le keeper a mal
     // dimensionné la composition LP). Constantes (pas de setter / SLOAD : économie EIP-170).
     uint16 private constant DN_REBAL_MAX_DRIFT_BPS = 300; // plafond fixe ; DnDepositLib applique dynamiquement min(plafond, seuil critique range)
     uint256 private constant DN_REBAL_DUST_FLOOR_USD = 10e8; // 10 USD (8 déc) : ignore seulement le vrai dust
-    // AUDIT H-06 : seuil de drift DN au-delà duquel un rebalance() permissionless est autorisé même si la LP est
-    // in-range. Fallback si le divisor dynamique n'est pas lisible ; chemin normal = range/HEDGE_CRIT_RANGE_DIVISOR.
-    uint16 private constant DN_REBAL_CRIT_DRIFT_BPS = 900;
-
     // ===== VARIABLES D'ETAT (utilisant les structs de la library) =====
 
     RangeOperations.RangeConfig public config;
     RangeOperations.ProtectionConfig public protectionConfig;
     RangeOperations.PriceCache public priceCache;
     RangeOperations.SystemStats public systemStats;
-
-    // ===== DYNAMIC RANGE (calcul on-chain) =====
-    RangeOperations.DynamicRangeConfig public dynRangeConfig;
-    RangeOperations.PriceSnapshot[] private _priceRing; // ring buffer borne (cap = volatMoyDay * maxSnapshotsPerDay)
-    uint16 private _ringHead; // index circulaire d'ecriture
-    uint16 private _ringCap; // capacite max du ring (calculee a la config)
-
-    event PriceSnapshotRecorded(uint128 price, uint64 timestamp, address indexed keeper);
-    event DynamicRangeConfigured(
-        bool enabled,
-        uint8 maxSnapshotsPerDay,
-        uint8 volatMoyDay,
-        uint8 volatTrimDay,
-        uint16 rangeStepBps,
-        uint16 rangeMultiplicatorBps,
-        uint16 rangeMinBps,
-        uint16 rangeMaxBps
-    );
-    event DynamicRangeApplied(uint16 halfRangeBps);
 
     // ===== ORACLES =====
 
@@ -155,6 +138,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     event TreasuryAddressUpdated(address indexed oldTreasury, address indexed newTreasury); // audit LOW-5
     event InitMultiSwapTvlUpdated(uint256 oldValue, uint256 newValue);
     event LiquidityAdded(uint256 indexed tokenId, uint256 amount0, uint256 amount1, uint128 liquidity);
+    event StrategyEngineSet(address indexed strategyEngine, address indexed protocolBot);
 
     // ===== NOUVEAUX MODIFIERS =====
 
@@ -220,9 +204,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint8 _token1Decimals,
         address _swapRouter,
         address _treasuryAddress,
-        uint256 _initMultiSwapTvl,
-        uint16 _rangeUpPercent,
-        uint16 _rangeDownPercent
+        uint256 _initMultiSwapTvl
     ) {
         require(_vault != address(0), "E09");
         require(_pauseController != address(0), "E09");
@@ -234,9 +216,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
             "E10"
         );
 
-        // Validation des ranges (mêmes limites que configureRanges)
-        require(_rangeUpPercent >= 10 && _rangeUpPercent <= 5000, "E17");
-        require(_rangeDownPercent >= 10 && _rangeDownPercent <= 5000, "E18");
         require(_initMultiSwapTvl > 0 && _initMultiSwapTvl <= 1_000_000, "E97");
 
         positionManager = INonfungiblePositionManager(_positionManager);
@@ -256,8 +235,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
             maxSlippageBps: 100, //1% en basis points
             lastRebalanceTime: 0,
             oraclesConfigured: false,
-            rangeUpPercent: _rangeUpPercent,
-            rangeDownPercent: _rangeDownPercent,
             maxPositions: 1
         });
 
@@ -315,138 +292,36 @@ contract RangeManager is Ownable, ReentrancyGuard {
         emit ExecutorAuthorized(_executor, _authorized);
     }
 
+    /// @notice Returns whether `caller` belongs to the protocol-operated execution path.
+    /// @dev RangeStrategyEngine uses this view to enforce the community keeper priority window on-chain.
+    function isProtocolBotCaller(address caller) public view returns (bool) {
+        return caller != address(0)
+            && (
+                caller == protocolBotAddress || caller == protocolBotOperator || caller == safeAddress
+                    || authorizedExecutors[caller]
+            );
+    }
+
     // ===== FONCTIONS DE CONFIGURATION (gouvernance via Vault owner) =====
 
-    function _minTotalRangeBps() private view returns (uint16) {
-        uint24 f = config.fee;
-        if (f == 100) return 10;
-        if (f == 500) return 100;
-        if (f == 3000) return 600;
-        if (f == 10000) return 2000;
-        return 100;
-    }
-
-    function configureRanges(uint16 _rangeUpPercent, uint16 _rangeDownPercent) external onlyVaultOwner {
-        if (_rangeUpPercent < 10 || _rangeUpPercent > 5000) revert E17();
-        if (_rangeDownPercent < 10 || _rangeDownPercent > 5000) revert E18();
-        if (uint256(_rangeUpPercent) + _rangeDownPercent < _minTotalRangeBps()) revert E40();
-
-        config.rangeUpPercent = _rangeUpPercent;
-        config.rangeDownPercent = _rangeDownPercent;
-    }
-
-    // ===== CONFIGURATION DYNAMIC RANGE (gouvernance) =====
-
-    /// @notice Configure le calcul dynamique des ranges (parametres de gouvernance, lus par les keepers).
-    /// @dev Si _enabled=false, les ranges restent fixes (config.rangeUp/DownPercent via configureRanges) — utile stablecoin.
-    function setDynamicRangeConfig(
-        bool _enabled,
-        uint8 _maxSnapshotsPerDay,
-        uint8 _volatMoyDay,
-        uint8 _volatTrimDay,
-        uint16 _rangeStepBps,
-        uint16 _rangeMultiplicatorBps,
-        uint16 _rangeMinBps,
-        uint16 _rangeMaxBps
-    ) external onlyVaultOwner {
+    /// @notice One-time reciprocal link to this pool's immutable Delta Neutral strategy engine.
+    function setStrategyEngine(address engine, address protocolBot) external onlyVaultOwner {
         if (
-            !(
-                _maxSnapshotsPerDay >= 1 && _maxSnapshotsPerDay <= 24 && _volatMoyDay >= 1 && _volatMoyDay <= 20
-                    && uint16(_volatTrimDay) * 2 + 2 <= uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay)
-                    && _rangeStepBps >= 10 && _rangeStepBps <= 1000 && _rangeMultiplicatorBps >= 5000
-                    && _rangeMultiplicatorBps <= 30000 && _rangeMinBps >= 10 && _rangeMinBps <= _rangeMaxBps
-                    && _rangeMaxBps <= 5000 && uint256(_rangeMinBps) * 2 >= _minTotalRangeBps()
-            )
+            address(strategyEngine) != address(0) || engine.code.length == 0 || protocolBot.code.length == 0
+                || protocolBotAddress != address(0)
         ) revert E40();
-        _ringCap = uint16(_volatMoyDay) * uint16(_maxSnapshotsPerDay);
-
-        dynRangeConfig.dynamicRangeEnabled = _enabled;
-        dynRangeConfig.maxSnapshotsPerDay = _maxSnapshotsPerDay;
-        dynRangeConfig.volatMoyDay = _volatMoyDay;
-        dynRangeConfig.volatTrimDay = _volatTrimDay;
-        dynRangeConfig.rangeStepBps = _rangeStepBps;
-        dynRangeConfig.rangeMultiplicatorBps = _rangeMultiplicatorBps;
-        dynRangeConfig.rangeMinBps = _rangeMinBps;
-        dynRangeConfig.rangeMaxBps = _rangeMaxBps;
-        delete _priceRing;
-        _ringHead = 0;
-        dynRangeConfig.lastSnapshotAt = 0;
-
-        emit DynamicRangeConfigured(
-            _enabled,
-            _maxSnapshotsPerDay,
-            _volatMoyDay,
-            _volatTrimDay,
-            _rangeStepBps,
-            _rangeMultiplicatorBps,
-            _rangeMinBps,
-            _rangeMaxBps
-        );
-    }
-
-    /// @notice Active/desactive rapidement le calcul dynamique (toggle stablecoin).
-    function setDynamicRangeEnabled(bool _enabled) external onlyVaultOwner {
-        dynRangeConfig.dynamicRangeEnabled = _enabled;
-    }
-
-    /// @notice Ajuste le facteur d'amplitude du range (bps : 10000 = x1,0).
-    function setRangeMultiplicator(uint16 _rangeMultiplicatorBps) external onlyVaultOwner {
-        if (_rangeMultiplicatorBps < 5000 || _rangeMultiplicatorBps > 30000) revert E44();
-        dynRangeConfig.rangeMultiplicatorBps = _rangeMultiplicatorBps;
-    }
-
-    /// @notice Indique si un snapshot de prix est du (timing regulier). Lu par keepers et bot.
-    function isSnapshotDue() external view returns (bool) {
-        if (!dynRangeConfig.dynamicRangeEnabled) return false;
-        return RangeOperations.isSnapshotDue(dynRangeConfig, uint64(block.timestamp));
-    }
-
-    /// @notice Enregistre le ratio oracle token0/token1 normalise en 8 decimales et verse le metrics bounty.
-    /// @dev Timing regulier impose on-chain (revert si snapshot pas encore du). Lit le prix Chainlink.
-    function recordPriceSnapshot() external nonReentrant {
-        if (!dynRangeConfig.dynamicRangeEnabled) revert E45();
-        if (!RangeOperations.isSnapshotDue(dynRangeConfig, uint64(block.timestamp))) revert E46();
-
-        _updatePriceCache();
-        if (!(priceCache.valid && priceCache.price0 > 0 && priceCache.price1 > 0)) revert E38();
-        uint256 pairPriceRaw = (uint256(priceCache.price0) * 1e8) / uint256(priceCache.price1);
-        if (pairPriceRaw == 0 || pairPriceRaw > type(uint128).max) revert E38();
-        uint128 pairPrice = uint128(pairPriceRaw);
-
-        _ringHead = RangeOperations.writeRing(
-            _priceRing,
-            _ringHead,
-            _ringCap,
-            RangeOperations.PriceSnapshot({price: pairPrice, timestamp: uint64(block.timestamp)})
-        );
-        dynRangeConfig.lastSnapshotAt = uint64(block.timestamp);
-        _applyDynamicRangeIfDue(pairPrice);
-
-        // Bounty (silent: ne jamais bloquer l'action si treasury vide / desactive)
-        _payBounty(true);
-
-        emit PriceSnapshotRecorded(pairPrice, uint64(block.timestamp), msg.sender);
-    }
-
-    /// @dev Verse un bounty au msg.sender (silent : ne bloque jamais l'action). isMetrics => payMetricsBounty,
-    ///      sinon payKeeperBounty. Factorisé (recordPriceSnapshot + rebalance) pour le bytecode.
-    function _payBounty(bool isMetrics) private {
-        if (treasuryAddress == address(0)) return;
-        if (isMetrics) {
-            try ITreasury(treasuryAddress).payMetricsBounty(msg.sender) {} catch {}
-        } else {
-            try ITreasury(treasuryAddress).payKeeperBounty(msg.sender) {} catch {}
-        }
-    }
-
-    /// @dev Recalcule et applique le range dynamique (calcul + decision delegues a la library).
-    function _applyDynamicRangeIfDue(uint128 pairPrice) private {
-        (uint16 halfBps, bool shouldApply) =
-            RangeOperations.evaluateDynamicRange(_priceRing, pairPrice, dynRangeConfig, uint64(block.timestamp));
-        if (!shouldApply) return;
-        config.rangeUpPercent = halfBps;
-        config.rangeDownPercent = halfBps;
-        emit DynamicRangeApplied(halfBps);
+        address botOperator = IProtocolBotIdentity(protocolBot).botAddress();
+        if (botOperator == address(0)) revert E40();
+        IRangeStrategyEngine candidate = IRangeStrategyEngine(engine);
+        if (
+            candidate.rangeManager() != address(this) || candidate.pool() != address(pool)
+                || candidate.profile() != IRangeStrategyEngine.StrategyProfile.DELTA_NEUTRAL
+                || candidate.hedgeManager() != IMultiUserVault(vault).hedgeManager()
+        ) revert E40();
+        strategyEngine = candidate;
+        protocolBotAddress = protocolBot;
+        protocolBotOperator = botOperator;
+        emit StrategyEngineSet(engine, protocolBot);
     }
 
     function configureSlippage(uint24 _maxSlippageBps) external onlyVaultOwner {
@@ -569,8 +444,22 @@ contract RangeManager is Ownable, ReentrancyGuard {
         returns (uint256 tokenId, uint128 liquidity)
     {
         require(config.oraclesConfigured, "E26");
+        // The bot module calls processDepositPermissionless() on the Vault. The Vault enforces that
+        // only its configured bot module (or governance) can process the first queued deposit, then
+        // calls this function itself. Requiring the module here would make the atomic call chain
+        // impossible because Solidity does not preserve the original caller across contracts.
+        require(msg.sender == vault, "E99");
+        _refreshAndRequireValid();
+        IRangeStrategyEngine.Decision memory decision = _validatedStrategyDecision();
+        require(
+            decision.reason == IRangeStrategyEngine.ReasonCode.INITIAL_MINT_REQUIRED
+                && decision.targetTickLower < priceCache.poolTick && decision.targetTickUpper > priceCache.poolTick,
+            "E90"
+        );
 
-        try this._mintInternal() returns (uint256 _tokenId, uint128 _liquidity) {
+        try this._mintInternal(decision.targetTickLower, decision.targetTickUpper) returns (
+            uint256 _tokenId, uint128 _liquidity
+        ) {
             _recordSuccessfulOperation();
             return (_tokenId, _liquidity);
         } catch (bytes memory reason) {
@@ -596,27 +485,25 @@ contract RangeManager is Ownable, ReentrancyGuard {
      *      In Solidity, try/catch only works with external calls, so to catch errors from internal
      *      logic, we must:
      *      1. Make the function external
-     *      2. Call it via `this._mintInternal()` (external call to self)
+     *      2. Call it via `this._mintInternal(...)` (external call to self)
      *      3. Protect with `require(msg.sender == address(this))` to prevent external exploitation
      *      This is NOT a security vulnerability - it's a design pattern. The only entry point is
      *      mintInitialPosition() which is protected by onlyAuthorized modifier.
      * @return tokenId The ID of the newly minted position
      * @return liquidity The amount of liquidity minted
      */
-    function _mintInternal() external returns (uint256 tokenId, uint128 liquidity) {
+    function _mintInternal(int24 tickLower, int24 tickUpper) external returns (uint256 tokenId, uint128 liquidity) {
         require(msg.sender == address(this), "E29"); // Self-call only - see NatSpec above
 
         // audit V1 (V3-H2) : refresh + barrière déviation/staleness AVANT de minter. updatePriceCache invalide
         // le cache si le pool diverge de l'oracle ; on refuse alors de poser de la liquidité sur un prix manipulé.
         _refreshAndRequireValid();
+        require(tickLower < priceCache.poolTick && tickUpper > priceCache.poolTick, "E90");
 
         // Verifier qu'on a des tokens a minter (swaps deja faits via executeSwap)
         uint256 balance0 = IERC20(token0).balanceOf(address(this));
         uint256 balance1 = IERC20(token1).balanceOf(address(this));
         require(balance0 > 0 || balance1 > 0, "E30");
-
-        // Calculer les ticks cibles
-        (int24 tickLower, int24 tickUpper) = RangeOperations.calculateTargetTicks(priceCache, config, pool);
 
         // PAS DE SWAP ICI - les swaps sont faits via executeSwap (multi-swap) avant d'appeler cette fonction
 
@@ -736,26 +623,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         }
     }
 
-    /// @dev Helper privé mutualisant l'appel (9 args) à RangeOperations.getBotInstructions, factorisé pour
-    ///      éviter de dupliquer le marshalling dans getBotInstructions()/needsRebalance()/rebalance() (gain bytecode).
-    function _botInstructions()
-        private
-        view
-        returns (bool hasPosition, uint256 tokenId, bool shouldRebalance, string memory action, string memory reason)
-    {
-        return RangeOperations.getBotInstructions(
-            positionCount, config.maxPositions, getOwnerPositions(), positionManager, priceCache
-        );
-    }
-
-    function getBotInstructions()
-        external
-        view
-        returns (bool hasPosition, uint256 tokenId, bool shouldRebalance, string memory action, string memory reason)
-    {
-        return _botInstructions();
-    }
-
     /**
      * @notice Fonction publique pour calculer les target ticks (appelable par le bot)
      * @dev Utilise le cache prix interne mis a jour
@@ -770,8 +637,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     function calculateTargetTicks() external view returns (int24 tickLower, int24 tickUpper) {
         _requireOperational();
-        // Utiliser la library avec le cache interne
-        return RangeOperations.calculateTargetTicks(priceCache, config, pool);
+        IRangeStrategyEngine.Decision memory decision = _validatedStrategyDecision();
+        tickLower = decision.targetTickLower;
+        tickUpper = decision.targetTickUpper;
+        require(tickLower < priceCache.poolTick && tickUpper > priceCache.poolTick, "E90");
     }
 
     /**
@@ -820,6 +689,15 @@ contract RangeManager is Ownable, ReentrancyGuard {
      */
     function getOptimalSwapParams() external view returns (RangeOperations.OptimalSwapParams memory) {
         _requireOperational();
+        IRangeStrategyEngine.Decision memory decision = _validatedStrategyDecision();
+        return _optimalSwapParams(decision.targetTickLower, decision.targetTickUpper);
+    }
+
+    function _optimalSwapParams(int24 tickLower, int24 tickUpper)
+        private
+        view
+        returns (RangeOperations.OptimalSwapParams memory)
+    {
         // AUDIT C-02 : utiliser les balances TOTALES (libres + principal du NFT), pas seulement les libres.
         // rebalance() BRÛLE d'abord le NFT (qui libère son principal sur le RM) PUIS exécute les swaps fournis
         // par le keeper. Si on ne comptait que les soldes libres pré-burn, une position hors-range (quasi
@@ -828,13 +706,25 @@ contract RangeManager is Ownable, ReentrancyGuard {
         (uint256 bal0, uint256 bal1) = RangeOperations.getCurrentBalances(
             token0, token1, address(this), getOwnerPositions(), positionManager, pool
         );
-        return RangeOperations.calculateOptimalSwapParams(bal0, bal1, priceCache, config, pool);
+        return RangeOperations.calculateOptimalSwapParams(bal0, bal1, priceCache, config, tickLower, tickUpper);
     }
 
     // Le solveur rebalance DN compatible dette vit dans DnDepositLib et est utilisé/testé côté bot/library.
     // Il n'est pas exposé ici pour préserver la marge EIP-170 du RangeManager.
 
     // ===== FONCTIONS INTERNES =====
+
+    function _validatedStrategyDecision() private view returns (IRangeStrategyEngine.Decision memory decision) {
+        if (address(strategyEngine) == address(0)) revert E40();
+        decision = strategyEngine.previewDecision();
+        decision = strategyEngine.validateDecision(decision.decisionHash);
+    }
+
+    /// @dev Best-effort range action bounty; Treasury availability never blocks maintenance.
+    function _payBounty() private {
+        if (treasuryAddress == address(0)) return;
+        try ITreasury(treasuryAddress).payKeeperBounty(msg.sender) {} catch {}
+    }
 
     /// @dev (audit V1 — V3-H2) Refresh + barrière déviation/staleness mutualisée. updatePriceCache invalide le
     ///      cache si le pool diverge de l'oracle ou si un feed est stale ; on revert alors avant toute action LP.
@@ -1036,10 +926,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         return amountOut;
     }
 
-    /// @notice Check if the current position needs rebalancing
-    // needsRebalance() (view) RETIRÉ (EIP-170) : non utilisé off-chain (le bot lit getBotInstructions) ni
-    // on-chain. La logique reste accessible via getBotInstructions() (3e valeur de retour).
-
     /// @notice Atomic rebalance: burn → N swaps → mint → pay keeper bounty. Permissionless.
     /// @dev Each swap chunk must be ≤ initMultiSwapTvl in USD. Pass empty arrays if no swap needed.
     ///      Intentionally keeps the position-maintenance path open when PauseController blocks user flows:
@@ -1049,6 +935,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     /// @param tokenIn Source token for all swaps
     /// @param tokenOut Destination token for all swaps
     function rebalance(
+        bytes32 expectedDecisionHash,
         uint256[] calldata swapAmountsIn,
         uint256[] calldata minAmountsOut,
         address tokenIn,
@@ -1070,25 +957,18 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // swap), qui auparavant n'était pas couvert. validateMinOutsAgainstOracle reste appelée plus bas pour les
         // swaps (plancher minOut), mais la barrière de déviation ne dépend plus de la présence de swaps.
 
-        // Verify rebalance is needed — soit le range l'exige, soit (AUDIT H-06) le hedge DN a dérivé de façon
-        // CRITIQUE alors que la LP est encore in-range. Ce second chemin reste le fallback permissionless si
-        // adjustHedge ne peut pas satisfaire le HF ou si de gros soldes token0 idle exigent une recomposition.
-        // Le rebalance reconstruit alors la composition LP pour viser la cible,
-        // et le post-check DN (étape 4b) garantit que le résultat est dans la tolérance (sinon toute la tx revert).
-        (bool hasPosition, uint256 tokenId, bool _needsRebalance,,) = _botInstructions();
-        // collect() pousse le feeGrowth latent avant le drift et le plan DN. Si la decision refuse le
-        // rebalance, le revert annule aussi cette collecte: aucun refresh de fees isole n'est requis.
-        if (hasPosition) _collectPositionFees(tokenId);
-        (bool dnDriftCritical, bool rawDnDriftCritical) = DnDepositLib.dnHedgeDriftExceeds(
-            address(this),
-            token0,
-            priceCache.price0,
-            config.token0Decimals,
-            DN_REBAL_CRIT_DRIFT_BPS,
-            DN_REBAL_DUST_FLOOR_USD
-        );
-        require(hasPosition && (_needsRebalance || dnDriftCritical), "E96"); // pas de mint initial permissionless
-        (bool expectedZeroForOne, uint256 expectedAmountIn) = DnDepositLib.getRebalanceSwapParams(address(this));
+        IRangeStrategyEngine.Decision memory decision = strategyEngine.validateDecision(expectedDecisionHash);
+        require(decision.action == IRangeStrategyEngine.Action.RANGE_AND_HEDGE && positionCount == 1, "E90");
+        uint256 tokenId = indexToPosition[0];
+        if (isProtocolBotCaller(msg.sender)) {
+            IRangeStrategyEngine.Telemetry memory telemetry = strategyEngine.currentTelemetry();
+            require(block.timestamp >= uint256(telemetry.checkpointTimestamp) + MAIN_BOT_KEEPER_DELAY, "E03");
+        }
+
+        // Crystallise fees before fixing the post-burn LP composition. Any later failure rolls this back too.
+        _collectPositionFees(tokenId);
+        RangeOperations.OptimalSwapParams memory expectedPlan =
+            _optimalSwapParams(decision.targetTickLower, decision.targetTickUpper);
 
         uint256 n = swapAmountsIn.length;
         uint256 totalSwapIn;
@@ -1111,14 +991,19 @@ contract RangeManager is Ownable, ReentrancyGuard {
             }
         }
         _requireSubmittedSwapPlan(
-            expectedAmountIn, expectedZeroForOne, tokenInIsToken0, totalSwapIn, config.toleranceBps
+            expectedPlan.swapNeeded ? expectedPlan.amountIn : 0,
+            expectedPlan.zeroForOne,
+            tokenInIsToken0,
+            totalSwapIn,
+            config.toleranceBps
         );
+        strategyEngine.recordExecution(decision.decisionHash, decision.action, msg.sender);
 
         // 1. Lock vault
         IMultiUserVault(vault).startRebalance();
 
         // 2. Burn existing position if any
-        if (hasPosition && tokenId > 0) {
+        if (tokenId > 0) {
             _burnTrackedPosition(tokenId);
         }
 
@@ -1132,14 +1017,15 @@ contract RangeManager is Ownable, ReentrancyGuard {
         }
 
         // 4. Mint new position
-        this._mintInternal();
+        this._mintInternal(decision.targetTickLower, decision.targetTickUpper);
         _recordSuccessfulOperation();
 
-        // 4b. POST-CHECK DN (refonte DN) : la composition LP fraîchement remintée doit ramener le short net
-        // effectif ≈ targetShort (tolérance dnRebalanceMaxDriftBps) + HF sain. Ce chemin est le repli canonique
-        // lorsque l'ajustement direct d'un sous-hedge ne peut pas conserver le HF cible : la composition LP visée
-        // réduit token0InLP sans ajouter de dette. Si le keeper a mal dimensionné, TOUT le rebalance revert →
-        // pas de bounty, position inchangée (le burn/mint est rollback). No-op si pas de hedgeManager (std).
+        // 4b. Synchronise debt/collateral against the token0 actually minted in the new NFT.
+        address hm = IMultiUserVault(vault).hedgeManager();
+        if (hm == address(0)) revert E40();
+        IHedgeRangeSync(hm).syncAfterRangeChange(msg.sender);
+
+        // 4c. Strict final delta/HF post-check. Any Aave, swap or post-check failure reverts the whole cycle.
         DnDepositLib.postCheckRebalanceHedge(
             address(this),
             token0,
@@ -1152,9 +1038,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // 5. Unlock vault
         IMultiUserVault(vault).endRebalance();
 
-        // 6. Range movement remains rewarded. A drift-only rebalance is rewarded only when the raw
-        // debt-vs-LP target also qualifies, so idle/donated token0 cannot farm the keeper bounty.
-        if (_needsRebalance || rawDnDriftCritical) _payBounty(false);
+        // 6. Pay only the range action bounty; the atomic hedge sync cannot earn a second bounty.
+        _payBounty();
     }
 
     /// @dev Bounds one swap to roughly config.maxSlippageBps of price movement from the validated live pool price.
