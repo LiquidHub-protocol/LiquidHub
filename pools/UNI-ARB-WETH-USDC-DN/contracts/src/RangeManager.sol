@@ -29,12 +29,6 @@ interface IHedgeRangeSync {
 interface IMultiUserVault {
     function hedgeManager() external view returns (address);
     function getCurrentPortfolioValue() external view returns (uint256);
-    function recordFeesCollected(uint256 fees0, uint256 fees1, uint256 commission0, uint256 commission1) external;
-    function getUserCount() external view returns (uint256);
-    function getUserAtIndex(uint256 index) external view returns (address);
-    function totalShares() external view returns (uint256);
-    function commissionRate() external view returns (uint256);
-    function treasuryAddress() external view returns (address);
     function dnMaxDepositUsd() external view returns (uint256);
     function startRebalance() external;
     function endRebalance() external;
@@ -92,7 +86,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     // ===== MULTI-USER VAULT INTEGRATION =====
     address public immutable vault;
-    mapping(address => bool) public authorizedRecipients;
 
     // ===== SWAP & TREASURY =====
     ISwapRouter public immutable swapRouter;
@@ -112,7 +105,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
     RangeOperations.RangeConfig public config;
     RangeOperations.ProtectionConfig public protectionConfig;
     RangeOperations.PriceCache public priceCache;
-    RangeOperations.SystemStats public systemStats;
 
     // ===== ORACLES =====
 
@@ -241,14 +233,11 @@ contract RangeManager is Ownable, ReentrancyGuard {
         protectionConfig = RangeOperations.ProtectionConfig({
             sandwichDetectionEnabled: false,
             mevProtectionEnabled: true,
-            failureProtectionEnabled: true,
             sandwichThresholdBps: 50,
             maxOracleDeviationBps: 100,
             maxAge0: 90000, // heartbeat par défaut (25h, marge pour stablecoins/ETH feeds Chainlink)
             maxAge1: 90000
         });
-
-        systemStats.initialized = true;
 
         // Swap & Treasury config
         require(_swapRouter != address(0), "E51");
@@ -338,20 +327,16 @@ contract RangeManager is Ownable, ReentrancyGuard {
         emit ToleranceUpdated(oldTolerance, _toleranceBps);
     }
 
-    function configureProtections(
-        bool _twapGuardEnabled,
-        bool _mevProtection,
-        bool _failureProtection,
-        uint16 _maxTwapDeviationBps
-    ) external onlyVaultOwner {
-        // Historical field names kept for ABI/storage compatibility:
-        // sandwichDetectionEnabled = spot/TWAP guard enabled, sandwichThresholdBps = max TWAP tick drift.
+    function configureProtections(bool _twapGuardEnabled, bool _mevProtection, uint16 _maxTwapDeviationBps)
+        external
+        onlyVaultOwner
+    {
+        // Les champs de stockage historiques portent le guard spot/TWAP et son seuil maximal.
         if (_maxTwapDeviationBps > 1000) revert E21();
         if (_twapGuardEnabled && _maxTwapDeviationBps == 0) revert E21();
 
         protectionConfig.sandwichDetectionEnabled = _twapGuardEnabled;
         protectionConfig.mevProtectionEnabled = _mevProtection;
-        protectionConfig.failureProtectionEnabled = _failureProtection;
         protectionConfig.sandwichThresholdBps = _maxTwapDeviationBps;
     }
 
@@ -391,8 +376,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         require(priceCache.valid, "E38");
 
         config.oraclesConfigured = true;
-
-        _recordSuccessfulOperation();
     }
 
     /// @notice Rafraîchit le cache de prix (feeds déjà configurés). NE change aucune adresse → sûr en
@@ -460,7 +443,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         try this._mintInternal(decision.targetTickLower, decision.targetTickUpper) returns (
             uint256 _tokenId, uint128 _liquidity
         ) {
-            _recordSuccessfulOperation();
             return (_tokenId, _liquidity);
         } catch (bytes memory reason) {
             if (reason.length > 0) {
@@ -516,7 +498,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         uint256 totalValueUSD = _getCurrentPortfolioValue();
         config.lastRebalanceTime = uint64(block.timestamp);
-        _updateSystemStats(totalValueUSD);
 
         emit PositionCreated(tokenId, tickLower, tickUpper, _safeUint128(totalValueUSD), "m");
 
@@ -804,16 +785,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         }
     }
 
-    function _recordSuccessfulOperation() private {
-        systemStats.successfulOperations++;
-    }
-
-    function _updateSystemStats(uint256 newValue) private {
-        systemStats.totalRebalances++;
-        systemStats.totalVolume += _safeUint128(newValue);
-        systemStats.lastRebalanceBlock = uint64(block.number);
-    }
-
     function _getCurrentPortfolioValue() private view returns (uint256) {
         return IMultiUserVault(vault).getCurrentPortfolioValue();
     }
@@ -872,6 +843,13 @@ contract RangeManager is Ownable, ReentrancyGuard {
      */
     function burnPosition(uint256 tokenId) external onlyVaultOrAuthorized nonReentrant {
         _refreshAndRequireValid();
+        _burnTrackedPosition(tokenId);
+    }
+
+    /// @notice Removes all liquidity and burns one tracked NFT during Safe-led recovery.
+    /// @dev Vault-only and intentionally independent from Chainlink/TWAP availability. No swap is performed;
+    ///      the position principal and collected fees remain in this RangeManager for user/AAVE settlement.
+    function emergencyBurnPosition(uint256 tokenId) external onlyVault nonReentrant {
         _burnTrackedPosition(tokenId);
     }
 
@@ -1018,7 +996,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
         // 4. Mint new position
         this._mintInternal(decision.targetTickLower, decision.targetTickUpper);
-        _recordSuccessfulOperation();
 
         // 4b. Synchronise debt/collateral against the token0 actually minted in the new NFT.
         address hm = IMultiUserVault(vault).hedgeManager();

@@ -101,7 +101,9 @@ The Treasury includes recovery functions for tokens or native ETH accidentally s
 - **`rescueToken(tokenAddr, to, amount)`**: recovers any ERC-20 except USDC (which goes through `adminWithdraw` to respect the monthly cap).
 - **`rescueETH(to, amount)`**: recovers native ETH (the Treasury can receive ETH via `receive() payable`).
 
-Both functions are `onlyOwner`.
+Both functions are restricted to the dedicated Rescue Safe, including after ownership is transferred or
+`adminWithdraw()` is irreversibly disabled. `rescueToken()` categorically rejects USDC; Treasury USDC remains
+subject to the capped `adminWithdraw()` path while that path is active.
 
 ---
 

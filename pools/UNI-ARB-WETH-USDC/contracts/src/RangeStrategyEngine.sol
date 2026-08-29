@@ -11,7 +11,6 @@ import "./RangeOperations.sol";
 interface IRangeManagerStrategy {
     function vault() external view returns (address);
     function pool() external view returns (IUniswapV3Pool);
-    function token0() external view returns (address);
     function positionManager() external view returns (INonfungiblePositionManager);
     function getOwnerPositions() external view returns (uint256[] memory);
     function refreshPriceCache() external;

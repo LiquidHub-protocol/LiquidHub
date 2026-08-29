@@ -53,7 +53,7 @@ contract SecureBotModule {
     address public pendingOwner;
 
     // Sécurité renforcée
-    mapping(bytes4 => bool) public allowedFunctions;
+    mapping(bytes4 => bool) private _allowedFunctions;
     uint256 public dailyLimit;
     uint256 public dailySpent;
     uint256 public lastResetDay;
@@ -112,21 +112,21 @@ contract SecureBotModule {
         // (Safe Phase 1 / Timelock Phase 2). Une clé bot compromise ne peut pas empoisonner les prix.
         // Le bot rafraîchit le cache
         // via refreshPriceCache() ci-dessous, qui ne change aucune adresse.
-        allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
-        allowedFunctions[CHECKPOINT_SELECTOR] = true;
-        allowedFunctions[REBALANCE_SELECTOR] = true;
+        _allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
+        _allowedFunctions[CHECKPOINT_SELECTOR] = true;
+        _allowedFunctions[REBALANCE_SELECTOR] = true;
         // Les setters de strategie/risk du moteur et du RangeManager restent reserves a la gouvernance.
 
         // Fonctions MultiUserVault
         // processPendingDeposits (0x99dd7ead) RETIRÉ (audit V1) : fonction batch supprimée du Vault.
         // processSingleDeposit (0xac1df9bd) RETIRÉ de la whitelist : le bot traite désormais aussi le
         // mint initial standard via processDepositPermissionless(), en une transaction atomique bot-only.
-        allowedFunctions[0x76919a59] = true; // processDepositPermissionless(uint256[],uint256[],address,address)
-        allowedFunctions[0x0040718e] = true; // endRebalance()
+        _allowedFunctions[0x76919a59] = true; // processDepositPermissionless(uint256[],uint256[],address,address)
+        _allowedFunctions[0x0040718e] = true; // endRebalance()
 
         // Fonctions Treasury (bridge Stargate v2 vers staking contract Phase 2)
-        allowedFunctions[0xa5599124] = true; // bridgeToStakers(uint256)
-        allowedFunctions[0x56a12aca] = true; // distributeToStakers(uint256) - bridge treasury same-chain
+        _allowedFunctions[0xa5599124] = true; // bridgeToStakers(uint256)
+        _allowedFunctions[0x56a12aca] = true; // distributeToStakers(uint256) - bridge treasury same-chain
     }
 
     receive() external payable {}
@@ -209,7 +209,7 @@ contract SecureBotModule {
     modifier onlyAllowedFunction(bytes calldata data) {
         require(data.length >= 4, "Invalid data");
         bytes4 selector = bytes4(data[:4]);
-        require(allowedFunctions[selector], "Function not allowed");
+        require(_allowedFunctions[selector], "Function not allowed");
         _;
     }
 
@@ -313,7 +313,7 @@ contract SecureBotModule {
     // Fonctions d'administration (Phase 1: Safe owner, Phase 2: Timelock owner)
     function allowFunction(bytes4 selector, bool allowed) external onlyOwner {
         require(_isCoreSelector(selector), "Selector not core");
-        allowedFunctions[selector] = allowed;
+        _allowedFunctions[selector] = allowed;
         emit FunctionAllowed(selector, allowed);
     }
 
@@ -431,7 +431,7 @@ contract SecureBotModule {
     }
 
     function isFunctionAllowed(bytes4 selector) external view returns (bool) {
-        return allowedFunctions[selector];
+        return _allowedFunctions[selector];
     }
 
     function _requireInflowsForSelector(bytes4 selector) private view {

@@ -122,10 +122,6 @@ contract PauseController {
         if (block.timestamp < inflowsPausedUntil) revert E_PAUSED();
     }
 
-    function requireWithdrawalsActive() external view {
-        if (block.timestamp < withdrawalsPausedUntil) revert E_PAUSED();
-    }
-
     function requireWithdrawalsActiveAfter(uint256 lastDepositTime) external view {
         if (block.timestamp < withdrawalsPausedUntil) revert E_PAUSED();
         if (lastDepositTime != 0 && block.timestamp < lastDepositTime + uint256(depositCooldown)) revert E_COOLDOWN();

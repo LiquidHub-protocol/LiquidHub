@@ -38,7 +38,7 @@ contract SecureBotModule {
     address public pendingOwner;
 
     // Sécurité renforcée
-    mapping(bytes4 => bool) public allowedFunctions;
+    mapping(bytes4 => bool) private _allowedFunctions;
     uint256 public dailyLimit;
     uint256 public dailySpent;
     uint256 public lastResetDay;
@@ -102,9 +102,9 @@ contract SecureBotModule {
         // configurePriceFeeds (0x6509c2dd) RETIRÉ (audit V1) : repointage oracles = gouvernance
         // (Safe Phase 1 / Timelock Phase 2).
         // Le bot rafraîchit le cache via refreshPriceCache() (ne change aucune adresse).
-        allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
-        allowedFunctions[CHECKPOINT_SELECTOR] = true;
-        allowedFunctions[REBALANCE_SELECTOR] = true;
+        _allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
+        _allowedFunctions[CHECKPOINT_SELECTOR] = true;
+        _allowedFunctions[REBALANCE_SELECTOR] = true;
 
         // Fonctions MultiUserVault
         // processPendingDeposits (0x99dd7ead) RETIRÉ (audit V1) : fonction batch supprimée du Vault.
@@ -113,13 +113,13 @@ contract SecureBotModule {
         // AUDIT H-02 : le relais bot des dépôts de CROISSANCE passe par le chemin ATOMIQUE
         // processDepositPermissionless (hedge on-chain via DnDepositLib + post-check). Sélecteur à whitelister
         // sinon le fallback bot revert avant d'atteindre le Vault. Le Vault re-valide tout (paused, plafond, oracle).
-        allowedFunctions[0x76919a59] = true; // processDepositPermissionless(uint256[],uint256[],address,address)
-        allowedFunctions[0x0040718e] = true; // endRebalance()
+        _allowedFunctions[0x76919a59] = true; // processDepositPermissionless(uint256[],uint256[],address,address)
+        _allowedFunctions[0x0040718e] = true; // endRebalance()
         // withdrawReservedCollateral() RETIRÉ (audit) : fonction supprimée du Vault (réserve gérée off-chain)
         // AUDIT M-02 : decreaseLiquidityPartial(uint128) (0x41f60e3c) RETIRÉ de la whitelist — entrée publique DN
         // supprimée (trimming LP indépendant abandonné en DN strict). Plus aucune surface pour une clé bot compromise.
-        // Emergency functions (EmergencyBurnPositions, EmergencyRecoverUser, sendTokenForHedgeRepay)
-        // are NOT whitelisted here — they can only be called directly from the Safe
+        // EmergencyBurnPositions et EmergencyRecoverUser ne sont PAS whitelistees ici : elles restent
+        // exclusivement appelees sur le Vault par l'Emergency Safe.
 
         // Fonctions AaveHedgeManager (Delta Neutral AAVE V3)
         // supplyAndBorrow(uint256,uint256) reste exposée sur le HedgeManager pour le Vault,
@@ -128,16 +128,16 @@ contract SecureBotModule {
         // AUDIT H-02 : adjustHedge() permissionless, whitelisté pour le bot sans privilège d'exécution.
         // Les règles on-chain sont identiques pour tous : confirmation et cooldown sur le drift ordinaire,
         // contournement uniquement pour le drift critique ou la réparation HF urgente.
-        allowedFunctions[ADJUST_HEDGE_SELECTOR] = true;
-        allowedFunctions[REPAIR_HF_SELECTOR] = true;
+        _allowedFunctions[ADJUST_HEDGE_SELECTOR] = true;
+        _allowedFunctions[REPAIR_HF_SELECTOR] = true;
         // Les appels de solveur hedge (borrow/repay/withdraw/sweeps) ne sont plus des actions bot recurrentes.
         // Ils restent appelables par le Vault/Safe quand le code du Vault en a besoin, pas via ce module.
         // closeAll (0xf6b32008) RETIRÉE (audit V1) : fonction d'URGENCE rare qui envoie TOUT
         // le hedge à un recipient → réservée à la Safe directe (jamais via le bot).
 
         // Fonctions Treasury (bridge Stargate v2 vers staking contract Phase 2)
-        allowedFunctions[0xa5599124] = true; // bridgeToStakers(uint256)
-        allowedFunctions[0x56a12aca] = true; // distributeToStakers(uint256) - bridge treasury same-chain
+        _allowedFunctions[0xa5599124] = true; // bridgeToStakers(uint256)
+        _allowedFunctions[0x56a12aca] = true; // distributeToStakers(uint256) - bridge treasury same-chain
     }
 
     receive() external payable {}
@@ -219,7 +219,7 @@ contract SecureBotModule {
     modifier onlyAllowedFunction(bytes calldata data) {
         require(data.length >= 4, "Invalid data");
         bytes4 selector = bytes4(data[:4]);
-        require(allowedFunctions[selector], "Function not allowed");
+        require(_allowedFunctions[selector], "Function not allowed");
         _;
     }
 
@@ -295,7 +295,7 @@ contract SecureBotModule {
         bytes4 selector = bytes4(data[:4]);
         require(selector == ADJUST_HEDGE_SELECTOR || selector == REPAIR_HF_SELECTOR, "Wrong target");
         require(data.length == 4, "Invalid data");
-        require(allowedFunctions[selector], "Function not allowed");
+        require(_allowedFunctions[selector], "Function not allowed");
         if (selector == ADJUST_HEDGE_SELECTOR) require(!paused, "Module paused");
         _execute(hedgeManager, 0, data);
 
@@ -342,7 +342,7 @@ contract SecureBotModule {
     function allowFunction(bytes4 selector, bool allowed) external onlyOwner {
         require(_isCoreSelector(selector), "Selector not core");
         require(selector != REPAIR_HF_SELECTOR || allowed, "HF repair required");
-        allowedFunctions[selector] = allowed;
+        _allowedFunctions[selector] = allowed;
         emit FunctionAllowed(selector, allowed);
     }
 
@@ -460,7 +460,7 @@ contract SecureBotModule {
     }
 
     function isFunctionAllowed(bytes4 selector) external view returns (bool) {
-        return allowedFunctions[selector];
+        return _allowedFunctions[selector];
     }
 
     function _requireInflowsForSelector(bytes4 selector) private view {
@@ -484,8 +484,7 @@ contract SecureBotModule {
         return selector == 0x0be1c372 // refreshPriceCache()
             || selector == CHECKPOINT_SELECTOR || selector == REBALANCE_SELECTOR || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
             || selector == 0x0040718e // endRebalance()
-            || selector == ADJUST_HEDGE_SELECTOR || selector == REPAIR_HF_SELECTOR
-            || selector == 0xa5599124 // bridgeToStakers(uint256)
+            || selector == ADJUST_HEDGE_SELECTOR || selector == REPAIR_HF_SELECTOR || selector == 0xa5599124 // bridgeToStakers(uint256)
             || selector == 0x56a12aca; // distributeToStakers(uint256)
     }
 }

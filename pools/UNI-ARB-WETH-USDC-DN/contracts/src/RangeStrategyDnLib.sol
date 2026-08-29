@@ -266,7 +266,7 @@ library RangeStrategyDnLib {
         int24 tickSpacing;
     }
 
-    function observedFeeRateBps(FeeRateInput memory input) external view returns (uint16) {
+    function observedFeeRateBps(FeeRateInput memory input) external pure returns (uint16) {
         if (input.elapsed == 0) return 0;
         uint256 delta0;
         uint256 delta1;
@@ -304,7 +304,7 @@ library RangeStrategyDnLib {
         Position memory position,
         RiskConfig memory risk,
         SearchConfig memory config
-    ) external view returns (SearchResult memory result) {
+    ) external pure returns (SearchResult memory result) {
         result.current = position.exists
             ? _evaluateCandidate(context, position, risk, config, position.lower, position.upper, false)
             : Candidate(0, 0, 0, 0, 0, 0, 0, true);
@@ -357,7 +357,7 @@ library RangeStrategyDnLib {
         int24 lower,
         int24 upper,
         bool enforceMovementBounds
-    ) private view returns (Candidate memory candidate) {
+    ) private pure returns (Candidate memory candidate) {
         candidate.lower = lower;
         candidate.upper = upper;
         bool isCurrentRange = position.exists && lower == position.lower && upper == position.upper;
@@ -424,7 +424,7 @@ library RangeStrategyDnLib {
         int24 lower,
         int24 upper,
         int24 liveTick
-    ) private view returns (bool admissible, uint256 penaltyBps, uint256 hedgeDriftBps) {
+    ) private pure returns (bool admissible, uint256 penaltyBps, uint256 hedgeDriftBps) {
         if (!context.configured || context.effectiveShortToken0 < 0) return (false, 0, 0);
         if (!position.exists) return (true, 0, 0);
 
@@ -455,7 +455,7 @@ library RangeStrategyDnLib {
         Position memory position,
         uint16 width,
         SearchConfig memory config
-    ) private view returns (int24 bestLower, int24 bestUpper, bool found) {
+    ) private pure returns (int24 bestLower, int24 bestUpper, bool found) {
         if (!position.exists || !context.configured || context.effectiveShortToken0 < 0) return (0, 0, false);
         int256 spacing = int256(config.tickSpacing);
         int256 low = int256(config.liveTick) - int256(uint256(width)) + spacing;
@@ -561,7 +561,7 @@ library RangeStrategyDnLib {
 
     function hedgeOnlyStatus(Context memory context, Position memory position, RiskConfig memory risk, int24 liveTick)
         external
-        view
+        pure
         returns (uint256 driftBps, uint256 exposureBps, bool adjustmentFeasible)
     {
         (driftBps, exposureBps, adjustmentFeasible,) = _hedgeOnlyStatus(context, position, risk, liveTick);
@@ -569,7 +569,7 @@ library RangeStrategyDnLib {
 
     function currentHedgeState(Context memory context, Position memory position, int24 liveTick)
         external
-        view
+        pure
         returns (uint256 token0InLp, uint256 targetShort, uint256 driftBps)
     {
         if (!position.exists || position.liquidity == 0) return (0, 0, 0);
@@ -642,7 +642,7 @@ library RangeStrategyDnLib {
 
     function _hedgeOnlyStatus(Context memory context, Position memory position, RiskConfig memory risk, int24 liveTick)
         private
-        view
+        pure
         returns (uint256 driftBps, uint256 exposureBps, bool adjustmentFeasible, uint8 direction)
     {
         if (!context.configured || context.effectiveShortToken0 < 0 || context.debtBase == 0) return (0, 0, false, 0);
@@ -835,7 +835,7 @@ library RangeStrategyDnLib {
         int24 lower,
         int24 upper,
         int24 liveTick
-    ) private view returns (uint256) {
+    ) private pure returns (uint256) {
         uint256 candidateToken0 = RangeOperations.strategyCandidateToken0ForCurrentValue(
             position.lower, position.upper, lower, upper, liveTick, position.liquidity
         );

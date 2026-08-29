@@ -34,6 +34,26 @@ All contracts from the standard pool are included, plus the hedge manager:
 | **Treasury.sol** | Protocol fee collection contract. Pays keeper, deposit, strategy-checkpoint and hedge bounties (and the Phase 2 bridge bounty), and handles admin withdrawals with an enforced monthly cap. |
 | **SequencerCheckedAggregator.sol** | L2 sequencer-checked Chainlink oracle wrapper. Implements `AggregatorV3Interface` as a transparent pass-through of the real Chainlink feed (same `decimals()`, same round tuple), but **reverts** when the Arbitrum sequencer is down or within the grace period after a restart (per the [Chainlink L2 Sequencer Feeds](https://docs.chain.link/data-feeds/l2-sequencer-feeds) recommendation). A production deployment points its oracle addresses to these wrappers, protecting every configured price consumer (RangeManager, Treasury, AaveHedgeManager). Immutable, stateless, view-only, holds no funds. |
 
+## Emergency controls
+
+Emergency recovery is callable directly by the dedicated Safe and is not exposed through the bot module.
+
+- `EmergencyBurnPositions()` removes all liquidity from each tracked NFT and burns it without depending on
+  Chainlink or tactical-TWAP availability. It performs no swap; principal and collected net fees remain in the
+  `RangeManager` for recovery and hedge settlement.
+- `EmergencyRecoverUser(user)` returns the user's exact pro-rata LP share and coordinates proportional AAVE
+  settlement. Other users' queued deposits are excluded and remain reserved. Any reserve deficit or payment
+  shortfall reverts atomically. A pending-only deposit can be recovered without burning a position first.
+- The AAVE settlement deliberately retains its oracle, slippage and post-settlement health checks. An unavailable
+  oracle therefore delays the DN settlement instead of bypassing protections around debt and collateral.
+- For monitoring, `EmergencyUserRecovered` reports the exact Vault leg. Reconcile it with the HedgeManager
+  `SettleProportional` event and ERC-20 `Transfer` logs for the user's complete DN recovery trace.
+- `MultiUserVault.rescueToken()` can recover an unrelated token, or only the local token0/token1 excess above
+  queued-deposit reserves. `RangeManager.rescueToken()` categorically rejects token0 and token1.
+
+For users with active shares, the operational order is `EmergencyBurnPositions()` followed by one or more exact
+`EmergencyRecoverUser(user)` calls.
+
 ## Build & verification
 
 - **Compiler**: Solidity 0.8.36 — **Framework**: Foundry — **Settings**: `via_ir = true`, `optimizer_runs = 1`, `evm_version = "paris"` (the linked DN libraries and RangeManager remain close to the EIP-170 size limit, so the optimizer is tuned for deployment size over runtime -- appropriate for these low-frequency L2 operations).

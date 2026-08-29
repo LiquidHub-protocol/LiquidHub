@@ -6,7 +6,6 @@ import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
-import "v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "./RangeOperations.sol";
 import "./DnDepositLib.sol"; // EIP-170 : orchestration hedge au dépôt déportée (delegatecall)
 
@@ -14,8 +13,6 @@ import "./DnDepositLib.sol"; // EIP-170 : orchestration hedge au dépôt déport
 interface IRangeManagerExtended {
     function setSafeAddress(address _safe) external;
     function setAuthorizedExecutor(address _executor, bool _authorized) external;
-    function safeAddress() external view returns (address);
-    function authorizedExecutors(address) external view returns (bool);
     function strategyEngine() external view returns (address);
 }
 
@@ -33,20 +30,6 @@ interface IAaveHedgeSettlement {
         external
         view
         returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase);
-    /// @dev Token0 libre detenu par le HedgeManager (en unites natives). Ce token0 est l'actif emprunte
-    ///      sur AAVE, garde idle comme BUFFER DE REPAY zero-slippage (eviter un swap token1->token0 au
-    ///      moment de rembourser). Le hedge delta-neutral lui-meme est la DETTE token0 sur AAVE (jambe
-    ///      short), pas ce token0 idle. Mais cet actif est bien detenu par le protocole : il doit etre
-    ///      compte dans le NAV, sinon (en ne comptant que collat-dette) le denominateur de mint de
-    ///      shares sous-estime la valeur reelle.
-    function getWethDebt() external view returns (uint256);
-    // REFONTE DN : ouverture/réduction du hedge déclenchée par le Vault au dépôt permissionless hedgé
-    // (montants EXACTS, destination figée RM). onlySafeOrVault côté HedgeManager.
-    function supplyAndBorrow(uint256 collateralAmountUsdc, uint256 borrowAmountWeth) external;
-    function sweepWethAmount(uint256 amount, address to) external;
-    function hedgeTargetBps() external view returns (uint16);
-    function reserveHfTargetBps() external view returns (uint16);
-    function liqThresholdBps() external view returns (uint16);
 }
 
 interface IRangeManager {
@@ -54,32 +37,22 @@ interface IRangeManager {
     function priceCache() external view returns (uint128, uint128, uint160, int24, uint64, bool);
     function getCurrentBalances() external view returns (uint256, uint256);
     function positionManager() external view returns (INonfungiblePositionManager);
-    function pool() external view returns (IUniswapV3Pool);
     function removeLiquidityForWithdraw(uint256 tokenId, uint128 liquidityToRemove) external;
     function transferTokensForWithdraw(uint256 amount0, uint256 amount1, address recipient)
         external
         returns (uint256, uint256);
     function burnPosition(uint256 tokenId) external;
+    function emergencyBurnPosition(uint256 tokenId) external;
     function emergencyWithdrawForUser(uint256 amount0Requested, uint256 amount1Requested, address recipient)
         external
         returns (uint256 amount0Sent, uint256 amount1Sent);
     function config() external view returns (RangeOperations.RangeConfig memory);
-    // protectionConfig getter (audit V1) : struct étendu V3 → (sandwichDet, mev, failure, sandwichBps,
-    // maxOracleDeviationBps, maxAge0, maxAge1). Doit matcher l'ABI du struct public sinon decode faux.
-    function protectionConfig() external view returns (bool, bool, bool, uint16, uint16, uint32, uint32);
     // audit V1 (V3-H1) : le vault rafraîchit le cache (slot0+oracle LIVE) avant chaque mint/withdraw de shares.
     function refreshPriceCache() external;
     function addLiquidityToPosition() external;
     function mintInitialPosition() external returns (uint256 tokenId, uint128 liquidity);
     function collectFeesForVault() external returns (uint256 fees0, uint256 fees1);
-    // --- depot permissionless ---
-    function executeSwap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut)
-        external
-        returns (uint256);
-    function getOptimalSwapParams() external view returns (RangeOperations.OptimalSwapParams memory);
     function initMultiSwapTvl() external view returns (uint256);
-    // REFONTE DN : le Vault transfère l'USDC collatéral RM -> HedgeManager (destination figée on-chain).
-    function sendTokenForHedge(address token, uint256 amount, address to) external;
 }
 
 interface ITreasuryDeposit {
@@ -117,7 +90,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     error E40();
     error E43();
     error E44();
-    error E45();
     error E46();
     error E70(); // DN pools: token0 deposits not allowed, use token1 only
     error E72(); // processDepositPermissionless: oracle cache stale / invalid / swap pair-cap-floor
@@ -154,13 +126,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 timestamp;
     }
 
-    struct FeeSnapshot {
-        uint256 token0Collected;
-        uint256 token1Collected;
-        uint256 timestamp;
-        uint256 blockNumber;
-    }
-
     // ===== VARIABLES D'ETAT =====
 
     IRangeManager public rangeManager;
@@ -169,11 +134,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     address private immutable pauseController;
 
     mapping(address => UserInfo) public userInfo;
-    address[] private users; // Liste des utilisateurs actuellement actifs (shares > 0)
-    // audit V1 (M3-B) : index 1-based de chaque user dans `users` (0 = absent). Permet le swap-and-pop O(1)
-    // au retrait total (pruning) — `users` ne grandit plus indefiniment, eliminant le DoS gas historique.
-    // Remplace l'ancien mapping isUser (bool) : un index != 0 vaut "present".
-    mapping(address => uint256) private userIndexPlusOne;
 
     // Commission et treasury
     uint256 public commissionRate;
@@ -187,8 +147,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     address public botModule;
 
     // Tracking comptable des commissions envoyees au Treasury (auto-compound)
-    uint256 public totalCommissionCollectedToken0;
-    uint256 public totalCommissionCollectedToken1;
+    uint256 private _totalCommissionCollectedToken0;
+    uint256 private _totalCommissionCollectedToken1;
 
     mapping(address => bool) public hasPendingDeposit;
 
@@ -240,11 +200,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     mapping(address => uint256) public userFeeDebtToken0;
     mapping(address => uint256) public userFeeDebtToken1;
 
-    FeeSnapshot[] public feeHistory;
-
-    uint256 public lastCollectedFees0;
-    uint256 public lastCollectedFees1;
-
     bool private _processingRebalance;
     uint64 private _rebalanceStartedAt;
 
@@ -287,13 +242,14 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     event FeesDistributed(uint256 fees0, uint256 fees1);
     event CommissionRateUpdated(uint256 oldRate, uint256 newRate);
     event RangeManagerSet(address indexed rangeManager);
+    // The AAVE leg transfers directly to the user and emits its own settlement event. These two amounts are the
+    // exact Vault leg only; together, both events provide the complete DN recovery trace without extra bytecode.
     event EmergencyUserRecovered(
-        address indexed user, uint256 amount0Recovered, uint256 amount1Recovered, uint256 sharesRemoved
+        address indexed user, uint256 vaultAmount0Sent, uint256 vaultAmount1Sent, uint256 sharesRemoved
     );
     event PositionBurned(uint256 indexed tokenId, address indexed executor);
     event AllPositionsBurned(uint256 positionCount, address indexed executor);
     event MinDepositUpdated(uint256 oldMinimum, uint256 newMinimum);
-    event BotModuleSet(address indexed module);
     event TreasuryAddressUpdated(address indexed oldTreasury, address indexed newTreasury);
     event ExecutorAuthorizedOnRangeManager(address indexed executor, bool authorized);
     event BotModuleUpdated(address indexed oldModule, address indexed newModule);
@@ -398,7 +354,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         return selector == bytes4(keccak256("setStrategyEngine(address,address)"))
             || selector == bytes4(keccak256("configureSlippage(uint24)"))
             || selector == bytes4(keccak256("configureTolerance(uint16)"))
-            || selector == bytes4(keccak256("configureProtections(bool,bool,bool,uint16)"))
+            || selector == bytes4(keccak256("configureProtections(bool,bool,uint16)"))
             || selector == bytes4(keccak256("setOracleParams(uint16,uint32,uint32)"))
             || selector == bytes4(keccak256("configurePriceFeeds(address,address,address)"))
             || selector == bytes4(keccak256("setInitMultiSwapTvl(uint256)"))
@@ -624,8 +580,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         user.depositedValueUSD += creditedValue;
         user.lastDepositTime = block.timestamp;
         user.lastDepositBlock = block.number;
-
-        _registerUser(pd.user);
 
         userFeeDebtToken0[pd.user] = user.shares * accFeePerShare0;
         userFeeDebtToken1[pd.user] = user.shares * accFeePerShare1;
@@ -934,18 +888,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         onlyRangeManager
     {
         if (fees0 > 0 || fees1 > 0) {
-            feeHistory.push(
-                FeeSnapshot({
-                    token0Collected: fees0,
-                    token1Collected: fees1,
-                    timestamp: block.timestamp,
-                    blockNumber: block.number
-                })
-            );
-            lastCollectedFees0 = fees0;
-            lastCollectedFees1 = fees1;
-            totalCommissionCollectedToken0 += commission0;
-            totalCommissionCollectedToken1 += commission1;
+            _totalCommissionCollectedToken0 += commission0;
+            _totalCommissionCollectedToken1 += commission1;
         }
         // Distribuer les fees NETTES aux users (brutes - commission deja envoyee au Treasury)
         uint256 netFees0 = fees0 > commission0 ? fees0 - commission0 : 0;
@@ -953,9 +897,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         _distributeFees(netFees0, netFees1);
     }
 
-    // audit V1 (M3-B) : _creditAllPendingFees() SUPPRIMEE. Sa double boucle O(n) sur users[] etait la source
-    // du DoS gas et n'existait que pour remettre a zero les accumulateurs apres distribution. Le modele lazy
-    // (accumulateurs monotones + reglement a la demande dans _updateUserFees) la rend inutile.
+    // La distribution reste O(1) : le modele lazy regle chaque utilisateur lors de sa prochaine interaction.
 
     /// @dev audit V1 (M3-B-fix) — REGLE les fees du user (lazy). pending = shares*acc - debt, credite dans
     ///      totalFeesEarned, puis dette = shares*acc. Doit etre appele AVANT toute modification de user.shares
@@ -977,33 +919,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         user.totalFeesEarnedToken1 += (accrued1 - userFeeDebtToken1[userAddress]) / 1e36;
         userFeeDebtToken0[userAddress] = accrued0;
         userFeeDebtToken1[userAddress] = accrued1;
-    }
-
-    // ===== REGISTRE DES USERS ACTIFS (audit V1 — M3-B, pruning anti-DoS) =====
-
-    /// @dev Ajoute le user au registre s'il n'y est pas deja (index 1-based). O(1).
-    function _registerUser(address u) private {
-        if (userIndexPlusOne[u] == 0) {
-            users.push(u);
-            userIndexPlusOne[u] = users.length; // = index + 1
-        }
-    }
-
-    /// @dev Retire le user du registre en swap-and-pop O(1). Appele au retrait TOTAL (shares==0) — apres que
-    ///      _updateUserStateAfterWithdrawal a remis a zero ses fees/TW (donc plus rien a regler). `users` ne
-    ///      grandit plus de facon monotone : la boucle de distribution disparue + ce pruning suppriment le DoS.
-    function _unregisterUser(address u) private {
-        uint256 idx1 = userIndexPlusOne[u];
-        if (idx1 == 0) return; // pas dans le registre
-        uint256 i = idx1 - 1;
-        uint256 lastI = users.length - 1;
-        if (i != lastI) {
-            address last = users[lastI];
-            users[i] = last;
-            userIndexPlusOne[last] = i + 1;
-        }
-        users.pop();
-        userIndexPlusOne[u] = 0;
     }
 
     // ===== WITHDRAW PROTOCOL FEES =====
@@ -1137,7 +1052,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice Retourne le total des commissions envoyees au Treasury (comptable)
      */
     function getTotalCommissions() external view returns (uint256 total0, uint256 total1) {
-        return (totalCommissionCollectedToken0, totalCommissionCollectedToken1);
+        return (_totalCommissionCollectedToken0, _totalCommissionCollectedToken1);
     }
 
     /**
@@ -1281,10 +1196,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             user.totalFeesEarnedToken0 = 0;
             user.totalFeesEarnedToken1 = 0;
             user.firstDepositTime = 0;
-            // audit V1 (M3-B) — dette a zero (shares==0) pour un re-depot propre + pruning O(1) du registre.
+            // Dette a zero (shares==0) pour un re-depot propre.
             userFeeDebtToken0[msg.sender] = 0;
             userFeeDebtToken1[msg.sender] = 0;
-            _unregisterUser(msg.sender);
         } else {
             // Retrait partiel : reduire proportionnellement les compteurs comptables.
             uint256 percentWithdrawn = (shareAmount * 1e18) / (user.shares + shareAmount);
@@ -1409,10 +1323,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         if (userShares == 0 && !hasPendingDeposit[userAddress]) revert E44();
 
-        uint256 userAmount0;
-        uint256 userAmount1;
-        uint256 n0;
-        uint256 n1;
+        uint256 userAmount0 = 0;
+        uint256 userAmount1 = 0;
+        uint256 n0 = 0;
+        uint256 n1 = 0;
 
         // 1. Shares actives (cas normal)
         //    EmergencyBurnPositions doit etre appele avant pour ramener les tokens sur vault/RM
@@ -1424,8 +1338,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             // sont ajoutés séparément à l'étape 2.
             uint256 raw0 = token0.balanceOf(address(this));
             uint256 raw1 = token1.balanceOf(address(this));
-            uint256 vBal0 = raw0 > _pendingTotal0 ? raw0 - _pendingTotal0 : 0;
-            uint256 vBal1 = raw1 > _pendingTotal1 ? raw1 - _pendingTotal1 : 0;
+            if (raw0 < _pendingTotal0 || raw1 < _pendingTotal1) revert E46();
+            uint256 vBal0 = raw0 - _pendingTotal0;
+            uint256 vBal1 = raw1 - _pendingTotal1;
             uint256 rBal0 = token0.balanceOf(address(rangeManager));
             uint256 rBal1 = token1.balanceOf(address(rangeManager));
             uint256 share0 = ((vBal0 + rBal0) * userShares) / totalSharesBefore;
@@ -1468,9 +1383,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             delete userInfo[userAddress];
             delete userFeeDebtToken0[userAddress];
             delete userFeeDebtToken1[userAddress];
-            // audit V1 (M3-B-fix2, retour Codex — Low) : retirer aussi du registre actif (pruning O(1)), sinon
-            // getUserCount/getUserAtIndex restent pollues (incoherence dashboards/indexeurs). Miroir du std.
-            _unregisterUser(userAddress);
         }
 
         uint256 bal0BeforeWithdraw = token0.balanceOf(address(this));
@@ -1482,9 +1394,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         // Emergency DN : le settlement AAVE envoie directement la part hedge au user. Cela evite de sous-compter
         // le token0 eventuellement renvoye par le HedgeManager et garde le Vault plafonne au reliquat LP/pending.
+        uint256 wethForRepay = 0;
         if (hedgeManager != address(0) && userShares > 0) {
             uint256 bal0AfterWithdraw = token0.balanceOf(address(this));
-            uint256 wethForRepay = bal0AfterWithdraw > bal0BeforeWithdraw ? bal0AfterWithdraw - bal0BeforeWithdraw : 0;
+            wethForRepay = bal0AfterWithdraw > bal0BeforeWithdraw ? bal0AfterWithdraw - bal0BeforeWithdraw : 0;
             if (wethForRepay > 0) {
                 token0.safeTransfer(hedgeManager, wethForRepay);
             }
@@ -1500,13 +1413,16 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // disponible à (balanceOf − pending des autres) puis on plafonne par le dû du user.
         uint256 rawBal0 = token0.balanceOf(address(this));
         uint256 rawBal1 = token1.balanceOf(address(this));
-        uint256 bal0 = rawBal0 > _pendingTotal0 ? rawBal0 - _pendingTotal0 : 0;
-        uint256 bal1 = rawBal1 > _pendingTotal1 ? rawBal1 - _pendingTotal1 : 0;
-        // AUDIT MED-1 : un SEUL chemin de plafonnement pour DN et std — toSend = min(dû user, solde dispo).
-        // En DN, emergencySettleForVault envoie directement au user la part hedge récupérée; ce bloc ne paie
-        // que la quote-part vault/RangeManager restante. Plus d'envoi de tout le solde disponible.
-        uint256 toSend0 = userAmount0 > bal0 ? bal0 : userAmount0;
-        uint256 toSend1 = userAmount1 > bal1 ? bal1 : userAmount1;
+        if (rawBal0 < _pendingTotal0 || rawBal1 < _pendingTotal1) revert E46();
+        uint256 bal0 = rawBal0 - _pendingTotal0;
+        uint256 bal1 = rawBal1 - _pendingTotal1;
+        // La part token0 envoyee au HedgeManager sert au settlement AAVE de cet utilisateur. Le reliquat LP
+        // et la totalite du token1 doivent rester disponibles avant d'effacer definitivement ses shares.
+        // Toute incoherence revert atomiquement au lieu de convertir une recuperation en perte silencieuse.
+        if (wethForRepay > userAmount0) revert E46();
+        uint256 toSend0 = userAmount0 - wethForRepay;
+        uint256 toSend1 = userAmount1;
+        if (bal0 < toSend0 || bal1 < toSend1) revert E46();
         if (toSend0 > 0) token0.safeTransfer(userAddress, toSend0);
         if (toSend1 > 0) token1.safeTransfer(userAddress, toSend1);
 
@@ -1528,7 +1444,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             uint256 tokenId = positions[i];
 
             // Appeler burnPosition directement (pas de try/catch pour voir les erreurs)
-            IRangeManager(address(rangeManager)).burnPosition(tokenId);
+            IRangeManager(address(rangeManager)).emergencyBurnPosition(tokenId);
             emit PositionBurned(tokenId, msg.sender);
         }
 
@@ -1536,20 +1452,5 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // 4. Les userInfo restent intacts
 
         emit AllPositionsBurned(positions.length, msg.sender);
-    }
-
-    /**
-     * @notice Retourne le nombre total d'utilisateurs avec des shares
-     */
-    function getUserCount() external view returns (uint256) {
-        return users.length;
-    }
-
-    /**
-     * @notice Retourne l'adresse d'un utilisateur par son index
-     */
-    function getUserAtIndex(uint256 index) external view returns (address) {
-        if (index >= users.length) revert E45();
-        return users[index];
     }
 }

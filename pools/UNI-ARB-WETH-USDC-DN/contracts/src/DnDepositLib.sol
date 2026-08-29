@@ -42,7 +42,7 @@ interface IRmDep {
         external
         view
         returns (uint128 price0, uint128 price1, uint160 sqrtP, int24 tick, uint64 ts, bool valid);
-    function protectionConfig() external view returns (bool, bool, bool, uint16, uint16, uint32, uint32);
+    function protectionConfig() external view returns (bool, bool, uint16, uint16, uint32, uint32);
     function config()
         external
         view
@@ -66,20 +66,11 @@ interface IVaultDep {
 
 interface IHedgeRepairContext {
     function pool() external view returns (address);
-    function usdc() external view returns (address);
     function weth() external view returns (address);
-    function aTokenUsdc() external view returns (address);
     function variableDebtWeth() external view returns (address);
-    function swapRouter() external view returns (address);
-    function rangeManager() external view returns (address);
-    function swapPoolFee() external view returns (uint24);
-    function liqThresholdBps() external view returns (uint16);
-    function reserveHfTargetBps() external view returns (uint16);
     function operationalHfTargetBps() external view returns (uint16);
     function hfRepairTriggerBps() external view returns (uint16);
     function swapSlippageBps() external view returns (uint16);
-    function volatileDecimals() external view returns (uint8);
-    function stableDecimals() external view returns (uint8);
 }
 
 interface IAavePoolDep {
@@ -355,7 +346,7 @@ library DnDepositLib {
 
     function _pc(IRmDep rm) private view returns (RangeOperations.PriceCache memory pc) {
         (uint128 p0, uint128 p1, uint160 sp, int24 tk, uint64 ts, bool v) = rm.priceCache();
-        (bool twapEnabled,,,,,,) = rm.protectionConfig();
+        (bool twapEnabled,,,,,) = rm.protectionConfig();
         if (twapEnabled) {
             tk = RangeOperations.trustedTwapTick(rm.pool());
             sp = RangeOperations.sqrtRatioAtTickExt(tk);
@@ -800,7 +791,7 @@ library DnDepositLib {
         uint256 diff = poolPrice > oraclePrice ? poolPrice - oraclePrice : oraclePrice - poolPrice;
         if ((diff * 10000) / oraclePrice > maxHedgeDeviationBps) revert LpPriceDeviation();
 
-        (bool twapEnabled,,, uint16 twapBps,,,) = IRmDep(rangeManager).protectionConfig();
+        (bool twapEnabled,,, uint16 twapBps,,) = IRmDep(rangeManager).protectionConfig();
         if (twapEnabled) {
             int24 twapTick = RangeOperations.trustedTwapTick(lpPool);
             int24 tickDiff = currentTick > twapTick ? currentTick - twapTick : twapTick - currentTick;

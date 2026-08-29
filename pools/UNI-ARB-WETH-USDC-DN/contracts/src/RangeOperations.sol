@@ -78,11 +78,10 @@ library RangeOperations {
     }
 
     struct ProtectionConfig {
-        // Legacy field names kept for ABI/storage compatibility:
+        // Legacy field names kept for ABI compatibility:
         // sandwichDetectionEnabled = spot/TWAP guard enabled.
         bool sandwichDetectionEnabled;
         bool mevProtectionEnabled;
-        bool failureProtectionEnabled;
         // sandwichThresholdBps = max spot/TWAP tick drift in bps-like ticks.
         uint16 sandwichThresholdBps;
         uint16 maxOracleDeviationBps;
@@ -90,18 +89,6 @@ library RangeOperations {
         // ont des heartbeats distincts). 0 => fallback sur la valeur par défaut historique (90000s/25h).
         uint32 maxAge0;
         uint32 maxAge1;
-    }
-
-    struct SystemStats {
-        uint128 totalRebalances;
-        uint128 totalVolume;
-        uint64 lastRebalanceBlock;
-        // Deprecated: failed tx state is reverted by the EVM, so these counters are intentionally kept at zero.
-        uint32 failedOperations;
-        uint32 successfulOperations;
-        // Deprecated: kept only for systemStats() ABI compatibility with bot/frontend readers.
-        uint32 consecutiveFailures;
-        bool initialized;
     }
 
     struct OptimalSwapParams {
