@@ -74,7 +74,7 @@ The Treasury rewards community keepers who execute the protocol's permissionless
 | Keeper (rebalance) | `rebalance()` on the RangeManager | `setKeeperBounty(enabled, amount)` |
 | Deposit (process) | `processDepositPermissionless()` on the Vault | `setDepositBounty(enabled, amount)` |
 | Strategy checkpoint | `checkpointMarketState()` on the RangeStrategyEngine | `setStrategyCheckpointBounty(enabled, amount)` |
-| Hedge (DN) | `adjustHedge()` on the AaveHedgeManager | `setHedgeBounty(enabled, amount)` |
+| Hedge (DN) | `adjustHedge()` or urgent `repairHealthFactor()` on the AaveHedgeManager | `setHedgeBounty(enabled, amount)` |
 | Bridge _(Phase 2)_ | `bridgeToStakers()` | `setBridgeBounty(enabled, amount)` |
 
 > **Amounts** are not listed here. The current bounty amounts are published on the protocol's Protocol Design page (https://liquidhub.app/docs#protocol) and are the source of truth on-chain. Read the live value on the Treasury contract (`keeperBountyAmount()`, `depositBountyAmount()`, `strategyCheckpointBountyAmount()`, etc.) before relying on it.

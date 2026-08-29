@@ -27,7 +27,7 @@ Each reference keeper follows the same sequence:
    `processDepositPermissionless()` for the head deposit.
 6. For `RANGE_REBALANCE` or `RANGE_AND_HEDGE`, build the oracle-bounded swap plan and call
    `rebalance(decisionHash, ...)`.
-7. On Delta Neutral pools, call `adjustHedge()` for `HEDGE_ONLY` or `HF_REPAIR`.
+7. On Delta Neutral pools, call `adjustHedge()` for `HEDGE_ONLY` or the dedicated `repairHealthFactor()` entrypoint for `HF_REPAIR`.
 8. Explicitly abstain for every action that does not apply to that pool and repeat after the configured interval.
 
 The one-time initial position mint remains reserved to the protocol bot. Strategy checkpoints, later deposits,
