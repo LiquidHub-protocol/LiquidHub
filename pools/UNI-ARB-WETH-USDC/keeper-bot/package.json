@@ -1,7 +1,7 @@
 {
   "name": "liquid-hub-keeper-standard",
   "version": "1.0.0",
-  "description": "Keeper bot for Liquid Hub Standard Pool (UNI-ARB-WETH-USDC)",
+  "description": "Keeper bot for Liquid Hub Exposed Pool (UNI-ARB-WETH-USDC)",
   "main": "src/keeper.js",
   "scripts": {
     "start": "node src/keeper.js",

@@ -6,7 +6,7 @@ Liquid Hub manages concentrated-liquidity DEX positions for multiple users via a
 
 ## Core Flow
 
-1. **Deposit** — Standard pools accept token0, token1, or both according to the deployed pair; DN pools accept token1 collateral only. Funds are queued permissionlessly, and shares representing proportional ownership are minted when the deposit is processed.
+1. **Deposit** — Exposed pools accept token0, token1, or both according to the deployed pair; DN pools accept token1 collateral only. Funds are queued permissionlessly, and shares representing proportional ownership are minted when the deposit is processed.
 2. **Deposit processing (permissionless)** — Anyone can call `processDepositPermissionless()` to convert a queued deposit into LP liquidity in one atomic transaction (see Deposit Processing). Earns the deposit bounty.
 3. **Decision** — The pool's immutable-profile `RangeStrategyEngine` updates canonical market epochs and publishes a bounded on-chain action, reason code and exact target ticks.
 4. **Execution** — The vault delegates LP execution to `RangeManager`, which creates or rebuilds the concentrated-liquidity position only after validating the current engine decision.
@@ -44,7 +44,10 @@ price, forecast, score or target ticks. The engine reads the configured DEX and 
 2. a **Multi-scenario optimizer**, which compares a fixed set of admissible tick-aligned candidates against the
    current position after potential fees, transition costs, inactivity and tail risk;
 3. **Bounded online adaptation**, which gradually adjusts fixed estimator families from realized observations.
-   Influence, losses and update speed are capped, and learning freezes on stale or incoherent data.
+   Influence, losses and update speed are capped, and learning freezes on stale or incoherent data;
+4. **False-start protection**, which prevents a shallow spot-only range exit from authorizing a rebalance until
+   tactical-TWAP, elapsed-epoch or material-depth confirmation is present. Deep or persistent exits and critical
+   Delta Neutral safety actions retain their independent paths.
 
 Every new asymmetric candidate must keep its center displacement from the live execution tick inside the governed
 `maxSkewBps` budget. This constraint also applies to Delta Neutral hedge-recovery candidates, so a wide total range
@@ -80,7 +83,7 @@ can choose a different range. Governance may change only bounded parameters or t
 
 ### Delta Neutral (DN) Pool
 
-- Same LP mechanism as a standard pool — positions are minted on the DEX and earn swap fees.
+- Same LP mechanism as an Exposed pool — positions are minted on the DEX and earn swap fees.
 - Additionally uses an **AAVE V3 hedge** to neutralize directional price exposure:
   - USDC is supplied as AAVE collateral and WETH is borrowed against it.
   - The borrowed WETH offsets the LP's long WETH exposure. The hedge is piloted on the **net effective short** (`effectiveShort = debt − idle WETH`, idle on the HedgeManager and RangeManager) versus a target of `hedgeTargetBps × wethInLP` (100% = strict delta-neutral by default). The borrowed WETH is integrated into the LP (never left idle), so the AAVE debt is a real short covering the LP's WETH.

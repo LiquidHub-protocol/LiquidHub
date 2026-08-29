@@ -143,7 +143,7 @@ async function reconcileSignerState(rpcPool, actionAlerts) {
 }
 
 async function main() {
-  console.log('=== Liquid Hub Keeper Bot (Standard Pool) ===');
+  console.log('=== Liquid Hub Keeper Bot (Exposed or Stable Pool) ===');
   console.log(`RangeManager: ${process.env.RANGEMANAGER_ADDRESS}`);
   console.log(`RangeStrategyEngine: ${process.env.RANGE_STRATEGY_ENGINE_ADDRESS}`);
   console.log(`Vault: ${process.env.VAULT_ADDRESS}`);

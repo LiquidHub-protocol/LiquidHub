@@ -16,12 +16,15 @@ Liquid Hub automates range management through **adaptive decisions computed 100%
 | Contract | Description |
 |---|---|
 | **MultiUserVault** | Multi-user vault managing deposits, withdrawals, share accounting, and LP position lifecycle |
-| **RangeStrategyEngine** | Per-pool analytical controller, fixed multi-scenario optimizer and bounded online adaptation; publishes deterministic on-chain actions and exact target ticks |
+| **RangeStrategyEngine** | Per-pool decision contract combining an analytical controller, fixed multi-scenario optimizer, bounded online adaptation and false-start protection; holds no funds and publishes deterministic on-chain actions, reason codes, validity and exact target ticks |
 | **RangeManager** | DEX position execution, bounded on-chain swaps and permissionless execution of fresh engine-approved rebalances |
 | **RangeOperations** | Library for tick alignment, liquidity calculations, swaps, valuation and fee accounting |
+| **PauseController** | Per-pool bounded circuit breaker for inflows, withdrawals and the deposit cooldown; holds no funds and leaves documented position-maintenance paths available |
 | **SecureBotModule** | Gnosis Safe module whitelisting specific function selectors for automated operations |
 | **Treasury** | Protocol fee collection, keeper / strategy-checkpoint / hedge bounties (+ Phase 2 bridge bounty), admin withdrawals with monthly cap |
 | **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: governed hedge target, permissionless over- and under-hedge correction when on-chain safety checks pass, atomic-rebalance fallback, proportional flash-loan settlement, health-factor monitoring |
+| **DnDepositLib / RangeStrategyDnLib** | *(DN only)* Stateless linked libraries for atomic deposit/hedge coordination and bounded Delta-Neutral strategy projection; hold no funds or mutable state |
+| **SequencerCheckedAggregator** | L2 oracle wrapper that rejects price reads while the sequencer is unavailable or inside its configured recovery grace period |
 | **LiquidHubVaultRegistry** | Chain-local, read-only vault discovery directory for wallet and portfolio integrations |
 
 ## Directory Structure

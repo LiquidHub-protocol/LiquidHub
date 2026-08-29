@@ -41,15 +41,15 @@ The `SecureBotModule` is a Gnosis Safe module that whitelists specific function 
 
 | Selector | Function | Target / pools |
 |---|---|---|
-| `0x0be1c372` | `refreshPriceCache()` | RangeManager / standard + DN |
-| `0x3af05dea` | `checkpointMarketState()` | RangeStrategyEngine / standard + DN |
-| `0x71b3853f` | `rebalance(bytes32,uint256[],uint256[],address,address)` | RangeManager / standard + DN |
-| `0x76919a59` | `processDepositPermissionless(uint256[],uint256[],address,address)` | Vault / standard + DN |
-| `0x0040718e` | `endRebalance()` | Vault unlock / standard + DN |
+| `0x0be1c372` | `refreshPriceCache()` | RangeManager / Exposed + DN |
+| `0x3af05dea` | `checkpointMarketState()` | RangeStrategyEngine / Exposed + DN |
+| `0x71b3853f` | `rebalance(bytes32,uint256[],uint256[],address,address)` | RangeManager / Exposed + DN |
+| `0x76919a59` | `processDepositPermissionless(uint256[],uint256[],address,address)` | Vault / Exposed + DN |
+| `0x0040718e` | `endRebalance()` | Vault unlock / Exposed + DN |
 | `0x1e694f32` | `adjustHedge()` | AaveHedgeManager / DN only |
 | `0x30cbb735` | `repairHealthFactor()` | AaveHedgeManager / DN urgent repair only |
-| `0xa5599124` | `bridgeToStakers(uint256)` | Treasury / standard + DN, Phase 2 |
-| `0x56a12aca` | `distributeToStakers(uint256)` | Treasury / standard + DN, Phase 2 |
+| `0xa5599124` | `bridgeToStakers(uint256)` | Treasury / Exposed + DN, Phase 2 |
+| `0x56a12aca` | `distributeToStakers(uint256)` | Treasury / Exposed + DN, Phase 2 |
 
 The execution entrypoint also restricts which target contract each selector can reach. In particular,
 `checkpointMarketState()` can target only the immutable strategy engine, and `rebalance(...)` only the linked

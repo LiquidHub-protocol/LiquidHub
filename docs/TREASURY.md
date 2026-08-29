@@ -19,7 +19,7 @@ The protocol is currently in **Phase 1 of its decentralization roadmap**. What t
 |--------|-------------------|-------------------|
 | Governance | Gnosis Safe multisig controls configuration | Timelock governance controls configuration; the Safe keeps only the separately documented emergency/recovery powers |
 | Admin withdrawals | Enabled, capped by a configurable monthly limit | `disableAdminWithdraw()` called irreversibly — Treasury locked against any admin withdrawal |
-| Keeper / deposit / metrics / hedge bounties | **Enabled** — configured by the Safe | Permissionless triggers, configuration controlled by the Timelock |
+| Rebalance / deposit / strategy checkpoint / hedge bounties | **Enabled** — configured by the Safe | Permissionless triggers, configuration controlled by the Timelock |
 | Bridge to stakers | Mechanism deployed, **bounty disabled** (no staking contract yet) | `bridgeToStakers()` live, fees routed to the governed destination |
 
 The table states what is enabled in Phase 1 versus planned for Phase 2. For any deployment, verify the live address and bytecode through the official Contracts page rather than assuming a source file is already deployed.
@@ -31,7 +31,7 @@ The table states what is enabled in Phase 1 versus planned for Phase 2. For any 
 | Source | Tokens | Mechanism |
 |--------|--------|-----------|
 | LP commissions | token0 + token1 (e.g. WETH + USDC) | Crystallized before value-sensitive share operations and during position maintenance; the protocol share is sent to the pool Treasury |
-| Bounty fund | USDC | Pre-funded by the protocol to pay keeper / deposit / metrics / hedge bounties (see below) |
+| Bounty fund | USDC | Pre-funded by the protocol to pay rebalance / deposit / strategy checkpoint / hedge bounties (see below) |
 
 Frontend swap commissions are documented separately in [`swap/treasury/README.md`](../swap/treasury/README.md).
 

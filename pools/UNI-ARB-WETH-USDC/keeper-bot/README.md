@@ -33,11 +33,13 @@ Everything happens atomically: if any step fails, the whole transaction reverts 
 ### Adaptive range intelligence (100% on-chain)
 
 The keeper never computes or proposes a range. One immutable-profile `RangeStrategyEngine` per Liquid Hub pool
-combines three bounded components:
+combines four bounded components:
 
 - an **Analytical controller** builds a conservative range anchor from canonical on-chain observations;
 - a **Multi-scenario optimizer** compares a fixed set of admissible ranges after transition costs and risk;
-- **Bounded online adaptation** updates fixed expert families at canonical epochs without giving a caller discretion.
+- **Bounded online adaptation** updates fixed expert families at canonical epochs without giving a caller discretion;
+- **False-start protection** requires tactical-TWAP, elapsed-epoch or material-depth confirmation before a shallow
+  spot-only range exit can authorize a rebalance.
 
 The engine returns an enum action, reason code, target ticks, epoch and `decisionHash`. `RangeManager.rebalance()`
 recalculates and validates that decision before touching funds. An out-of-range position may therefore remain in
@@ -92,7 +94,7 @@ Edit `.env` with the following variables:
 | `RPC_BACKUP_1` | No | Backup RPC endpoint |
 | `RPC_BACKUP_2` | No | Second backup RPC endpoint |
 | `KEEPER_PRIVATE_KEY` | Yes* | Private key for the keeper wallet (*not needed for check-only mode) |
-| `KEEPER_MAX_GAS_PRICE_GWEI` | Yes | Local maximum for standard-pool actions. A shared, signed DN `repairHealthFactor()` journal retains its exact-call exemption during reconciliation. |
+| `KEEPER_MAX_GAS_PRICE_GWEI` | Yes | Local maximum for Exposed/Stable pool actions. A shared, signed DN `repairHealthFactor()` journal retains its exact-call exemption during reconciliation. |
 | `KEEPER_STATE_DIR` | No | Shared local signer-state directory. Defaults to `~/.liquidhub-keeper-state`. |
 | `KEEPER_PENDING_TX_FILE` | No | Deprecated migration source for an older custom journal. New transactions always use the canonical `chainId + signer` journal under `KEEPER_STATE_DIR`. |
 | `RANGEMANAGER_ADDRESS` | Yes | RangeManager contract address |
@@ -119,7 +121,7 @@ Using one key for several local test keepers is supported when they use the same
 `KEEPER_STATE_DIR`; public keepers using their own keys remain independent. This
 community code never reads protocol Telegram or AWS Secrets Manager credentials.
 
-Signed transactions are populated and signed once, then the exact raw payload is persisted before RPC failover. If that payload remains pending or underpriced, the journal may replace it at the same nonce with a 12.5% fee bump. Standard-pool actions never exceed `KEEPER_MAX_GAS_PRICE_GWEI`; a shared journal originally signed by the DN keeper for exact `HF_REPAIR/repairHealthFactor()` retains its payload-bound exemption during reconciliation. A nonce is considered consumed only after RPC agreement, so one faulty endpoint cannot discard the journal. Local processes derive one shared lock and journal from `chainId + signer address`, so the same test key can safely run several pool keepers without nonce collisions. Do not delete signer state while a transaction is unresolved. If `PAUSE_CONTROLLER_ADDRESS` is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Strategy checkpoints and eligible rebalances remain active.
+Signed transactions are populated and signed once, then the exact raw payload is persisted before RPC failover. If that payload remains pending or underpriced, the journal may replace it at the same nonce with a 12.5% fee bump. Exposed/Stable pool actions never exceed `KEEPER_MAX_GAS_PRICE_GWEI`; a shared journal originally signed by the DN keeper for exact `HF_REPAIR/repairHealthFactor()` retains its payload-bound exemption during reconciliation. A nonce is considered consumed only after RPC agreement, so one faulty endpoint cannot discard the journal. Local processes derive one shared lock and journal from `chainId + signer address`, so the same test key can safely run several pool keepers without nonce collisions. Do not delete signer state while a transaction is unresolved. If `PAUSE_CONTROLLER_ADDRESS` is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Strategy checkpoints and eligible rebalances remain active.
 
 ### 3. Run the bot
 

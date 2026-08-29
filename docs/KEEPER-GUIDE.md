@@ -35,11 +35,13 @@ eligible rebalances and supported hedge actions are permissionless.
 
 ## Adaptive range intelligence
 
-One immutable-profile `RangeStrategyEngine` is attached to each Liquid Hub pool. It combines:
+One immutable-profile `RangeStrategyEngine` is attached to each Liquid Hub pool. It holds no user funds and combines:
 
 - an **Analytical controller** that builds a bounded range anchor from canonical on-chain observations;
 - a **Multi-scenario optimizer** that compares a fixed set of admissible ranges after transition costs and risk;
-- **Bounded online adaptation** that updates fixed estimator families at canonical epochs without caller discretion.
+- **Bounded online adaptation** that updates fixed estimator families at canonical epochs without caller discretion;
+- **False-start protection** that requires tactical-TWAP, elapsed-epoch or material-depth confirmation before a
+  shallow spot-only range exit can authorize a rebalance.
 
 The engine returns `NO_ACTION`, `CHECKPOINT_ONLY`, `RANGE_REBALANCE`, `HEDGE_ONLY`, `RANGE_AND_HEDGE` or
 `HF_REPAIR`, together with an exact target, reason code and `decisionHash`. A simple range exit does not authorize a
