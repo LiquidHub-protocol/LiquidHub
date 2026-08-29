@@ -12,6 +12,20 @@ const { Rebalancer, calculateChunkPlan, divideIntoChunks } = require('../src/reb
 const { PersistentActionAlerts } = require('../src/utils/action-alerts');
 const { RPCPool } = require('../src/utils/rpc');
 
+test('HF safety lane runs before ordinary topology and derives the Aave pool on-chain', () => {
+  const source = fsSync.readFileSync(path.join(__dirname, '../src/keeper.js'), 'utf8');
+  const main = source.slice(source.indexOf('async function main()'));
+  assert.ok(main.indexOf('await runHfSafetyLane(') >= 0);
+  assert.ok(main.indexOf('await runHfSafetyLane(') < main.indexOf('await assertKeeperTopology('));
+  assert.match(source, /async function readLiveHfSafetyState[\s\S]{0,500}hm\.pool\(\)/);
+  assert.match(source, /async function assertHfRepairTopology[\s\S]{0,700}hm\.hfRepairTriggerBps\(\)/);
+  const safetyTopology = source.slice(
+    source.indexOf('async function assertHfRepairTopology'),
+    source.indexOf('/**', source.indexOf('async function assertHfRepairTopology'))
+  );
+  assert.doesNotMatch(safetyTopology, /VAULT_ADDRESS|RANGEMANAGER_ADDRESS|strategyEngine/);
+});
+
 test('RPC timeout releases a silent provider call', async () => {
   const pool = Object.create(RPCPool.prototype);
   await assert.rejects(
@@ -135,6 +149,29 @@ test('keeper rejects RPC fee suggestions above its env-defined ceiling', () => {
   );
 });
 
+test('fee-cap bypass is restricted to the configured HF repair calldata', () => {
+  const pool = Object.create(RPCPool.prototype);
+  const target = '0x00000000000000000000000000000000000000a1';
+  pool.hfRepairTargetAddress = target.toLowerCase();
+  pool.maxGasPriceWei = ethers.parseUnits('0.1', 'gwei');
+  const expensiveRepair = {
+    to: target,
+    data: '0x30cbb735',
+    value: 0n,
+    maxFeePerGas: ethers.parseUnits('1', 'gwei'),
+  };
+
+  assert.equal(pool._applyFeeCapPolicy(expensiveRepair, 'hfRepair', true), true);
+  assert.throws(
+    () => pool._applyFeeCapPolicy({ ...expensiveRepair, data: '0x12345678' }, 'hfRepair', true),
+    /restricted to configured repairHealthFactor/
+  );
+  assert.throws(
+    () => pool._applyFeeCapPolicy(expensiveRepair, 'adjustHedge', false),
+    /above KEEPER_MAX_GAS_PRICE_GWEI/
+  );
+});
+
 test('pending transaction can be replaced with the same nonce and a bounded fee bump', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-fee-replacement-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
@@ -167,6 +204,113 @@ test('pending transaction can be replaced with the same nonce and a bounded fee 
   assert.equal(replacement.nonce, 4);
   assert.ok(replacement.gasPrice > 1n);
   assert.ok(replacement.gasPrice <= pool.maxGasPriceWei);
+  assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
+});
+
+test('persisted HF repair can be replaced above the normal fee cap', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-hf-replacement-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const wallet = ethers.Wallet.createRandom();
+  const pool = Object.create(RPCPool.prototype);
+  configureSignerState(pool, { dir, wallet, poolName: 'DN' });
+  pool.maxGasPriceWei = 10n;
+  const target = '0x00000000000000000000000000000000000000a1';
+  const provider = { send: async () => '0xa4b1', getFeeData: async () => ({ gasPrice: 20n }) };
+  pool.providers = [{ provider, healthy: true, chainVerified: true, chainMismatch: false }];
+  pool.withTimeout = async (fn) => await fn();
+  await pool._ensureSignerState(provider);
+
+  const rawTx = await wallet.signTransaction({
+    chainId: 42161,
+    nonce: 5,
+    gasLimit: 100_000n,
+    gasPrice: 1n,
+    to: target,
+    data: '0x30cbb735',
+  });
+  const txHash = ethers.keccak256(rawTx);
+  pool._persistSignedTx(rawTx, txHash, 'hfRepair', 5, {
+    feeCapExempt: true,
+    feeCapExemptTarget: target,
+  });
+  let replacementRaw;
+  pool._broadcastSignedTransaction = async (raw) => {
+    replacementRaw = raw;
+    return { status: 1 };
+  };
+
+  const persisted = pool._readPendingSignedTx();
+  assert.equal(persisted.feeCapExempt, true);
+  const result = await pool._replacePendingSignedTx(persisted, 1);
+  const replacement = ethers.Transaction.from(replacementRaw);
+  assert.equal(result.status, 'confirmed');
+  assert.equal(replacement.nonce, 5);
+  assert.equal(replacement.to, ethers.getAddress(target));
+  assert.equal(replacement.data, '0x30cbb735');
+  assert.ok(replacement.gasPrice > pool.maxGasPriceWei);
+  assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
+});
+
+test('critical HF repair preempts an ordinary pending nonce above the normal fee cap', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-hf-preemption-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const signingWallet = ethers.Wallet.createRandom();
+  const pool = Object.create(RPCPool.prototype);
+  configureSignerState(pool, { dir, wallet: signingWallet, poolName: 'DN' });
+  pool.maxGasPriceWei = 10n;
+  const repairTarget = '0x00000000000000000000000000000000000000a1';
+  pool.hfRepairTargetAddress = repairTarget.toLowerCase();
+  const provider = { getTransactionReceipt: async () => null };
+  pool.providers = [{ provider, healthy: true, chainVerified: true, chainMismatch: false }];
+  pool.pendingTxFile = path.join(dir, 'pending.json');
+  pool.getProvider = () => provider;
+  pool._ensureSignerState = async () => {};
+  pool._withSignerLock = async (_provider, fn) => await fn();
+  pool._authenticatedProviderEntries = async () => [{ provider }];
+  pool._latestSignerNonce = async () => 6;
+  pool.withTimeout = async (fn) => await fn();
+  pool.executeWithRetry = async (fn) => await fn(provider);
+
+  const ordinaryRaw = await signingWallet.signTransaction({
+    chainId: 42161,
+    nonce: 6,
+    gasLimit: 100_000n,
+    gasPrice: 1n,
+    to: '0x0000000000000000000000000000000000000002',
+    data: '0x12345678',
+  });
+  const ordinaryHash = ethers.keccak256(ordinaryRaw);
+  pool._persistSignedTx(ordinaryRaw, ordinaryHash, 'rebalance', 6);
+
+  let replacementRaw;
+  pool._broadcastSignedTransaction = async (raw) => {
+    replacementRaw = raw;
+    return { status: 1, hash: ethers.keccak256(raw) };
+  };
+  const preparedWallet = {
+    address: signingWallet.address,
+    populateTransaction: async (request) => ({
+      ...request,
+      chainId: 42161,
+      nonce: 7,
+      gasLimit: 500_000n,
+      gasPrice: 100n,
+      value: 0n,
+    }),
+    signTransaction: async (request) => await signingWallet.signTransaction(request),
+  };
+
+  const receipt = await pool.executeSignedTxWithRetry(async () => ({
+    wallet: preparedWallet,
+    request: { to: repairTarget, data: '0x30cbb735', value: 0n },
+  }), 'hfRepair', 1, { bypassFeeCap: true });
+
+  const replacement = ethers.Transaction.from(replacementRaw);
+  assert.equal(receipt.status, 1);
+  assert.equal(replacement.nonce, 6);
+  assert.equal(replacement.to, ethers.getAddress(repairTarget));
+  assert.equal(replacement.data, '0x30cbb735');
+  assert.ok(replacement.gasPrice > pool.maxGasPriceWei);
   assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
 });
 

@@ -10,6 +10,7 @@ const RPC_READ_TIMEOUT_MS = 20_000;
 const RPC_TX_TIMEOUT_MS = 90_000;
 const SIGNER_LOCK_TIMEOUT_MS = 5 * 60_000;
 const SIGNER_LOCK_POLL_MS = 250;
+const HF_REPAIR_DATA = '0x30cbb735'; // repairHealthFactor()
 
 function readPositiveGweiEnv(name) {
   const raw = String(process.env[name] || '').trim();
@@ -93,6 +94,13 @@ class RPCPool {
       : null;
     this.signerAddress = this.signerWallet?.address.toLowerCase() || null;
     this.maxGasPriceWei = readPositiveGweiEnv('KEEPER_MAX_GAS_PRICE_GWEI');
+    const configuredHfRepairTarget = String(process.env.AAVE_HEDGE_MANAGER_ADDRESS || '').trim();
+    if (configuredHfRepairTarget && !ethers.isAddress(configuredHfRepairTarget)) {
+      throw new Error('AAVE_HEDGE_MANAGER_ADDRESS must be a valid address');
+    }
+    this.hfRepairTargetAddress = configuredHfRepairTarget
+      ? configuredHfRepairTarget.toLowerCase()
+      : null;
     const configuredChainId = process.env.CHAINID || process.env.CHAIN_ID;
     if (!configuredChainId || !/^\d+$/.test(configuredChainId) || BigInt(configuredChainId) === 0n) {
       throw new Error('CHAINID/CHAIN_ID must be a positive integer');
@@ -330,17 +338,35 @@ class RPCPool {
     ) {
       throw new Error('Persisted keeper transaction identity/hash/raw payload mismatch');
     }
+    if (parsed.feeCapExempt !== undefined && typeof parsed.feeCapExempt !== 'boolean') {
+      throw new Error('Persisted keeper fee-cap exemption marker is invalid');
+    }
+    if (parsed.feeCapExempt === true) {
+      const exemptTarget = String(parsed.feeCapExemptTarget || '').toLowerCase();
+      if (
+        !ethers.isAddress(exemptTarget) ||
+        (this.hfRepairTargetAddress && exemptTarget !== this.hfRepairTargetAddress) ||
+        rawTransaction.to?.toLowerCase() !== exemptTarget ||
+        String(rawTransaction.data || '0x').toLowerCase() !== HF_REPAIR_DATA ||
+        rawTransaction.value !== 0n
+      ) {
+        throw new Error('Persisted keeper fee-cap exemption is not bound to repairHealthFactor()');
+      }
+    }
     return parsed;
   }
 
-  _persistSignedTx(rawTx, txHash, label, nonce) {
+  _persistSignedTx(rawTx, txHash, label, nonce, {
+    feeCapExempt = false,
+    feeCapExemptTarget = null,
+  } = {}) {
     if (!this.pendingTxFile) return;
     if (!Number.isSafeInteger(nonce) || nonce < 0) {
       throw new Error(`${label}: signed transaction nonce is missing or invalid`);
     }
     fs.mkdirSync(path.dirname(this.pendingTxFile), { recursive: true, mode: 0o700 });
     const temp = `${this.pendingTxFile}.${process.pid}.tmp`;
-    fs.writeFileSync(temp, `${JSON.stringify({
+    const journal = {
       schemaVersion: 2,
       rawTx,
       txHash,
@@ -350,7 +376,12 @@ class RPCPool {
       chainId: this.chainId,
       nonce,
       createdAt: new Date().toISOString(),
-    }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    };
+    if (feeCapExempt) {
+      journal.feeCapExempt = true;
+      journal.feeCapExemptTarget = String(feeCapExemptTarget || '').toLowerCase();
+    }
+    fs.writeFileSync(temp, `${JSON.stringify(journal, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(temp, this.pendingTxFile);
   }
 
@@ -507,6 +538,25 @@ class RPCPool {
     }
   }
 
+  _isConfiguredHfRepairTransaction(transaction) {
+    return !!this.hfRepairTargetAddress &&
+      String(transaction?.to || '').toLowerCase() === this.hfRepairTargetAddress &&
+      String(transaction?.data || '0x').toLowerCase() === HF_REPAIR_DATA &&
+      BigInt(transaction?.value || 0n) === 0n;
+  }
+
+  _applyFeeCapPolicy(transaction, label, bypassFeeCap) {
+    if (!bypassFeeCap) {
+      this._assertFeeCap(transaction, label);
+      return false;
+    }
+    if (!this._isConfiguredHfRepairTransaction(transaction)) {
+      throw new Error(`${label}: fee-cap exemption is restricted to configured repairHealthFactor()`);
+    }
+    console.warn(`${label}: critical HF_REPAIR bypasses KEEPER_MAX_GAS_PRICE_GWEI`);
+    return true;
+  }
+
   _isReplacementCandidate(error) {
     const message = `${error?.shortMessage || ''} ${error?.message || ''}`.toLowerCase();
     return message.includes('replacement transaction underpriced') ||
@@ -556,11 +606,28 @@ class RPCPool {
         feeData.gasPrice || 0n,
       ].reduce((highest, value) => value > highest ? value : highest, 0n);
     }
-    this._assertFeeCap(request, `${pending.label} replacement`);
+    const feeCapExempt = pending.feeCapExempt === true;
+    if (feeCapExempt) {
+      if (
+        previous.to?.toLowerCase() !== String(pending.feeCapExemptTarget || '').toLowerCase() ||
+        (this.hfRepairTargetAddress
+          && previous.to?.toLowerCase() !== this.hfRepairTargetAddress) ||
+        String(previous.data || '0x').toLowerCase() !== HF_REPAIR_DATA ||
+        previous.value !== 0n
+      ) {
+        throw new Error(`${pending.label}: invalid persisted HF_REPAIR fee-cap exemption`);
+      }
+      console.warn(`${pending.label} replacement: critical HF_REPAIR bypasses the fee cap`);
+    } else {
+      this._assertFeeCap(request, `${pending.label} replacement`);
+    }
 
     const replacementRaw = await this.signerWallet.signTransaction(request);
     const replacementHash = ethers.keccak256(replacementRaw);
-    this._persistSignedTx(replacementRaw, replacementHash, pending.label, pending.nonce);
+    this._persistSignedTx(replacementRaw, replacementHash, pending.label, pending.nonce, {
+      feeCapExempt,
+      feeCapExemptTarget: pending.feeCapExemptTarget,
+    });
     console.warn(`Replacing pending ${pending.label}: ${pending.txHash} -> ${replacementHash}`);
     const receipt = await this._broadcastSignedTransaction(
       replacementRaw, replacementHash, `${pending.label} replacement`, 0, maxRetries
@@ -630,6 +697,73 @@ class RPCPool {
     }
   }
 
+  async _replacePendingWithCriticalRepair(pending, preparedBundle, label, maxRetries) {
+    const { provider, prepared, populated, feeCapExempt } = preparedBundle;
+    if (!feeCapExempt || !this._isConfiguredHfRepairTransaction(populated)) {
+      throw new Error(`${label}: critical preemption requires exact configured repairHealthFactor()`);
+    }
+
+    const previous = ethers.Transaction.from(pending.rawTx);
+    const bump = (value) => value > 0n ? (value * 1125n) / 1000n + 1n : 0n;
+    const type = previous.type === 2 || populated.type === 2 ? 2 : (previous.type || 0);
+    const request = {
+      type,
+      chainId: previous.chainId,
+      nonce: previous.nonce,
+      gasLimit: populated.gasLimit || previous.gasLimit,
+      to: populated.to,
+      value: populated.value || 0n,
+      data: populated.data,
+      accessList: populated.accessList || [],
+    };
+    if (type === 2) {
+      request.maxPriorityFeePerGas = [
+        bump(previous.maxPriorityFeePerGas || 0n),
+        BigInt(populated.maxPriorityFeePerGas || 0n),
+      ].reduce((highest, value) => value > highest ? value : highest, 0n);
+      request.maxFeePerGas = [
+        bump(previous.maxFeePerGas || previous.gasPrice || 0n),
+        BigInt(populated.maxFeePerGas || populated.gasPrice || 0n),
+        request.maxPriorityFeePerGas,
+      ].reduce((highest, value) => value > highest ? value : highest, 0n);
+    } else {
+      request.gasPrice = [
+        bump(previous.gasPrice || previous.maxFeePerGas || 0n),
+        BigInt(populated.gasPrice || populated.maxFeePerGas || 0n),
+      ].reduce((highest, value) => value > highest ? value : highest, 0n);
+    }
+
+    const replacementRaw = await this.withTimeout(
+      () => prepared.wallet.signTransaction(request), RPC_TX_TIMEOUT_MS, `${label} critical preemption signing`
+    );
+    const replacementHash = ethers.keccak256(replacementRaw);
+    if (prepared.log) prepared.log(replacementHash);
+    this._persistSignedTx(replacementRaw, replacementHash, label, previous.nonce, {
+      feeCapExempt: true,
+      feeCapExemptTarget: populated.to,
+    });
+    console.warn(
+      `${label} preempts pending ${pending.label} at nonce ${previous.nonce}: ` +
+      `${pending.txHash} -> ${replacementHash}`
+    );
+    const startIndex = Math.max(
+      0,
+      this.providers.findIndex((entry) => entry.provider === provider)
+    );
+    try {
+      const receipt = await this._broadcastSignedTransaction(
+        replacementRaw, replacementHash, `${label} critical preemption`, startIndex, maxRetries
+      );
+      this._clearPersistedSignedTx(replacementHash);
+      return receipt;
+    } catch (error) {
+      if (String(error.message || '').includes('failed on-chain')) {
+        this._clearPersistedSignedTx(replacementHash);
+      }
+      throw error;
+    }
+  }
+
   async reconcilePendingSignedTx(maxRetries = 3) {
     if (!this.signerAddress) return null;
     const provider = this.getProvider();
@@ -639,10 +773,57 @@ class RPCPool {
     });
   }
 
-  async executeSignedTxWithRetry(prepareFn, label = 'transaction', maxRetries = 3) {
+  async executeSignedTxWithRetry(
+    prepareFn,
+    label = 'transaction',
+    maxRetries = 3,
+    { bypassFeeCap = false } = {}
+  ) {
     const provider = this.getProvider();
     await this._ensureSignerState(provider);
     return await this._withSignerLock(provider, async () => {
+      const prepareBundle = async () => await this.executeWithRetry(async (currentProvider) => {
+        const prepared = await prepareFn(currentProvider);
+        if (!prepared?.wallet || !prepared?.request) {
+          throw new Error(`${label}: prepareFn must return { wallet, request }`);
+        }
+        const populated = await prepared.wallet.populateTransaction(prepared.request);
+        const feeCapExempt = this._applyFeeCapPolicy(populated, label, bypassFeeCap === true);
+        return { provider: currentProvider, prepared, populated, feeCapExempt };
+      }, maxRetries, RPC_TX_TIMEOUT_MS);
+
+      let preparedBundle = null;
+      if (bypassFeeCap === true) {
+        const pending = this._readPendingSignedTx();
+        if (pending) {
+          const entries = await this._authenticatedProviderEntries();
+          let settled = false;
+          for (const entry of entries) {
+            const receipt = await this.withTimeout(
+              () => entry.provider.getTransactionReceipt(pending.txHash),
+              RPC_READ_TIMEOUT_MS,
+              'critical preemption receipt lookup'
+            ).catch(() => null);
+            if (receipt) {
+              settled = true;
+              break;
+            }
+          }
+          if (!settled) {
+            const latestNonce = await this._latestSignerNonce();
+            settled = latestNonce !== null && latestNonce > pending.nonce;
+          }
+          if (settled) {
+            this._clearPersistedSignedTx(pending.txHash);
+          } else {
+            preparedBundle = await prepareBundle();
+            return await this._replacePendingWithCriticalRepair(
+              pending, preparedBundle, label, maxRetries
+            );
+          }
+        }
+      }
+
       const recovered = await this._reconcilePendingSignedTxLocked(maxRetries);
       if (recovered) {
         const error = new Error(
@@ -654,16 +835,8 @@ class RPCPool {
         throw sanitizeRpcError(error);
       }
 
-      const preparedBundle = await this.executeWithRetry(async (currentProvider) => {
-        const prepared = await prepareFn(currentProvider);
-        if (!prepared?.wallet || !prepared?.request) {
-          throw new Error(`${label}: prepareFn must return { wallet, request }`);
-        }
-        const populated = await prepared.wallet.populateTransaction(prepared.request);
-        this._assertFeeCap(populated, label);
-        return { provider: currentProvider, prepared, populated };
-      }, maxRetries, RPC_TX_TIMEOUT_MS);
-      const { provider: preparationProvider, prepared, populated } = preparedBundle;
+      preparedBundle = preparedBundle || await prepareBundle();
+      const { provider: preparationProvider, prepared, populated, feeCapExempt } = preparedBundle;
 
       // Sign exactly once. Every provider only sees this immutable raw transaction.
       const signedTx = await this.withTimeout(
@@ -672,7 +845,10 @@ class RPCPool {
       const parsedSignedTx = ethers.Transaction.from(signedTx);
       const txHash = ethers.keccak256(signedTx);
       if (prepared.log) prepared.log(txHash);
-      this._persistSignedTx(signedTx, txHash, label, parsedSignedTx.nonce);
+      this._persistSignedTx(signedTx, txHash, label, parsedSignedTx.nonce, {
+        feeCapExempt,
+        feeCapExemptTarget: populated.to,
+      });
 
       const startIndex = Math.max(
         0,

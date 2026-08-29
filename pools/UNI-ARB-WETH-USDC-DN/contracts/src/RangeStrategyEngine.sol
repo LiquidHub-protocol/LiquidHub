@@ -3,7 +3,6 @@ pragma solidity 0.8.36;
 
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
 import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
-import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "./interfaces/IRangeStrategyEngine.sol";
@@ -42,34 +41,12 @@ interface IStrategyCheckpointTreasury {
     function payStrategyCheckpointBounty(address keeper, uint64 epoch) external;
 }
 
-interface IAaveStrategyState {
-    function getHedgeData()
-        external
-        view
-        returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase);
-    function getWethDebt() external view returns (uint256);
-    function getStrategyReserveData()
-        external
-        view
-        returns (uint256 idleStable, uint16 operationalTargetBps, uint16 liveLtvBps);
-    function hedgeTargetBps() external view returns (uint16);
-    function donationDustToken0() external view returns (uint256);
-    function adjustHedgeBps() external view returns (uint16);
-    function hedgeAdjustCooldown() external view returns (uint32);
-    function lastHedgeAdjustAt() external view returns (uint64);
-    function hfRepairTriggerBps() external view returns (uint16);
-    function liqThresholdBps() external view returns (uint16);
-    function reserveHfTargetBps() external view returns (uint16);
-    function swapSlippageBps() external view returns (uint16);
-    function criticalHedgeBps() external view returns (uint16);
-}
-
 /// @title RangeStrategyEngine
 /// @notice Deterministic, permissionless range intelligence for one Liquid Hub pool.
 /// @dev The contract never holds funds. It combines bounded online estimators, an analytical anchor and a
 ///      fixed multi-scenario optimizer. Keepers submit no market data, score, debt target or ticks.
 contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
-    uint16 public constant override strategyVersion = 2;
+    uint16 public constant override strategyVersion = 3;
     uint256 private constant BPS = 10_000;
     uint24 private constant MAX_VOLATILITY_TICKS = 20_000;
     uint256 private constant MAIN_BOT_KEEPER_DELAY = 60;
@@ -177,7 +154,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     DecisionMode public override decisionMode;
     uint16 public learningInfluenceBps;
     uint64 private _lastCheckpointEpoch;
-    uint64 private _outOfRangeSince;
+    uint64 internal _outOfRangeSince;
     uint64 private _hedgeRecoverySince;
     uint64 private _hedgeSignalSince;
     uint8 private _hedgeSignalDirection;
@@ -395,10 +372,10 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         });
         _lastCheckpointEpoch = epoch;
         _telemetry.spotTick = liveTick;
-        _updateOutOfRangeState(liveTick);
+        bool rangeExitConfirmed = _updateOutOfRangeState(liveTick, tacticalTick);
 
         EvaluationSummary memory summary;
-        (decision, summary) = _buildDecision();
+        (decision, summary) = _buildDecision(rangeExitConfirmed);
         _canonicalDecision = decision;
         _telemetry = Telemetry({
             epoch: epoch,
@@ -554,7 +531,10 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         return decision;
     }
 
-    function _buildDecision() private returns (Decision memory decision, EvaluationSummary memory summary) {
+    function _buildDecision(bool rangeExitConfirmed)
+        private
+        returns (Decision memory decision, EvaluationSummary memory summary)
+    {
         IRangeManagerStrategy rm = IRangeManagerStrategy(rangeManager);
         (,,, int24 liveTick,, bool oracleValid) = rm.priceCache();
         int24 referenceTick = marketState.checkpointTimestamp == 0 ? liveTick : _telemetry.spotTick;
@@ -695,6 +675,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             hedgeControl,
             forceHedgeRecovery,
             decision.edgeBps > decision.thresholdBps,
+            rangeExitConfirmed,
             liveTick
         );
         return _finishDecision(decision, summary);
@@ -706,6 +687,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         RangeStrategyDnLib.HedgeControl memory hedgeControl,
         bool forceHedgeRecovery,
         bool edgeEnough,
+        bool rangeExitConfirmed,
         int24 liveTick
     ) private view returns (Action action, ReasonCode reason) {
         bool sameRange = best.lower == position.lower && best.upper == position.upper;
@@ -717,6 +699,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
                     inRange: position.inRange,
                     edgeEnough: edgeEnough,
                     criticalHedge: hedgeControl.critical,
+                    exitConfirmed: rangeExitConfirmed,
                     lower: position.lower,
                     upper: position.upper,
                     liveTick: liveTick,
@@ -729,8 +712,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
                 sameRange: sameRange,
                 forceHedgeRecovery: forceHedgeRecovery,
                 hedgeEligible: hedgeControl.eligible,
-                hedgePending: hedgeControl.signalSince > 0 && !hedgeControl.normalConfirmed
-                    && !hedgeControl.critical
+                hedgePending: hedgeControl.signalSince > 0 && !hedgeControl.normalConfirmed && !hedgeControl.critical
             })
         );
     }
@@ -747,52 +729,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     }
 
     function _dnContext() private view returns (RangeStrategyDnLib.Context memory dn) {
-        IAaveStrategyState hm = IAaveStrategyState(hedgeManager);
-        try hm.getHedgeData() returns (uint256 collateral, uint256 debtBase, uint256 hf, uint256 available) {
-            dn.collateralBase = collateral;
-            dn.debtBase = debtBase;
-            dn.healthFactorBps = hf / 1e14;
-            dn.availableBorrowsBase = available;
-        } catch {
-            return dn;
-        }
-        dn.hfRepairTriggerBps = hm.hfRepairTriggerBps();
-        if (dn.debtBase > 0 && dn.hfRepairTriggerBps > 0 && dn.healthFactorBps < dn.hfRepairTriggerBps) return dn;
-        dn.debtToken0 = hm.getWethDebt();
-        uint256 dust = hm.donationDustToken0();
-        uint256 idle = IERC20(_strategyToken0).balanceOf(hedgeManager) + IERC20(_strategyToken0).balanceOf(rangeManager);
-        uint256 countedIdle = idle > dust ? idle - dust : 0;
-        dn.effectiveShortToken0 = int256(dn.debtToken0) - int256(countedIdle);
-        (, dn.token0Decimals, dn.token1Decimals,,,,,) = IRangeManagerStrategy(rangeManager).config();
-        (uint128 price0, uint128 price1,,,,) = IRangeManagerStrategy(rangeManager).priceCache();
-        dn.price0 = price0;
-        dn.price1 = price1;
-        dn.hedgeTargetBps = hm.hedgeTargetBps();
-        dn.adjustThresholdBps = hm.adjustHedgeBps();
-        dn.liquidationThresholdBps = hm.liqThresholdBps();
-        dn.reserveHfTargetBps = hm.reserveHfTargetBps();
-        uint256 idleStable;
-        uint16 liveLtvBps;
-        try hm.getStrategyReserveData() returns (uint256 reserve, uint16 operationalTarget, uint16 liveLtv) {
-            idleStable = reserve;
-            dn.operationalHfTargetBps = operationalTarget;
-            liveLtvBps = liveLtv;
-        } catch {
-            return dn;
-        }
-        dn.idleStableBase = idleStable * uint256(price1) / (10 ** dn.token1Decimals);
-        dn.borrowLtvBps = liveLtvBps;
-        dn.swapSlippageBps = hm.swapSlippageBps();
-        dn.criticalHedgeBps = hm.criticalHedgeBps();
-        dn.cooldownSeconds = hm.hedgeAdjustCooldown();
-        dn.lastAdjustmentAt = hm.lastHedgeAdjustAt();
         (bool rateAvailable, uint256 rateRay) = DnDepositLib.strategyAaveBorrowRateRay(hedgeManager);
-        if (!rateAvailable) return dn;
-        dn.variableBorrowRateRay = rateRay;
-        dn.configured = dn.price0 > 0 && dn.price1 > 0 && dn.variableBorrowRateRay > 0 && dn.hedgeTargetBps == BPS
-            && dn.liquidationThresholdBps > 0 && dn.reserveHfTargetBps > dn.hfRepairTriggerBps
-            && dn.operationalHfTargetBps >= dn.reserveHfTargetBps && dn.borrowLtvBps > 0 && dn.swapSlippageBps < BPS
-            && dn.criticalHedgeBps > dn.adjustThresholdBps;
+        dn = RangeStrategyDnLib.loadContext(hedgeManager, rangeManager, _strategyToken0, rateAvailable, rateRay);
     }
 
     function _dnPosition(PositionState memory position)
@@ -841,13 +779,16 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         position.inRange = liveTick > position.lower && liveTick < position.upper;
     }
 
-    function _updateOutOfRangeState(int24 liveTick) private {
+    function _updateOutOfRangeState(int24 liveTick, int24 tacticalTwapTick) private returns (bool confirmed) {
         PositionState memory position = _positionState(liveTick);
-        if (!position.exists || position.inRange) {
-            _outOfRangeSince = 0;
-        } else if (_outOfRangeSince == 0) {
-            _outOfRangeSince = uint64(block.timestamp);
-        }
+        (_outOfRangeSince, confirmed) = RangeStrategyDnLib.nextRangeExitState(
+            _dnPosition(position),
+            liveTick,
+            tacticalTwapTick,
+            _strategyTickSpacing,
+            _outOfRangeSince,
+            strategyConfig.epochSeconds
+        );
     }
 
     function currentTelemetry() external view override returns (Telemetry memory) {
@@ -878,8 +819,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         if (!position.exists) return (false, 0, 0, debtToken0, effectiveShort, 0, healthFactor);
 
         positionExists = true;
-        (token0InLp, targetShort, driftBps) =
-            RangeStrategyDnLib.currentHedgeState(dn, _dnPosition(position), liveTick);
+        (token0InLp, targetShort, driftBps) = RangeStrategyDnLib.currentHedgeState(dn, _dnPosition(position), liveTick);
     }
 
     function getExpertWeights()
@@ -901,6 +841,10 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             revert DecisionMismatch();
         }
         _lastExecutedDecisionHash = action == Action.HF_REPAIR ? bytes32(0) : decisionHash;
+        if (action == Action.RANGE_AND_HEDGE) {
+            // The signal belongs to the range that was just replaced.
+            _outOfRangeSince = 0;
+        }
         _hedgeRecoverySince = 0;
         _hedgeSignalSince = 0;
         _hedgeSignalDirection = 0;

@@ -164,7 +164,7 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
     const v = vault.connect(provider);
     const engine = strategyEngine.connect(provider);
     const [rmCode, vaultCode, engineCode, rmVault, rmToken0, rmToken1, rmEngine, vaultRm, vaultToken0, vaultToken1,
-      engineRm, enginePool, rmPool, engineProfile] = await Promise.all([
+      engineRm, enginePool, rmPool, engineProfile, engineMode, engineVersion] = await Promise.all([
       provider.getCode(expected.rangeManager),
       provider.getCode(expected.vault),
       provider.getCode(expected.strategyEngine),
@@ -179,10 +179,12 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
       engine.pool(),
       rm.pool(),
       engine.profile(),
+      engine.decisionMode(),
+      engine.strategyVersion(),
     ]);
     return {
       rmCode, vaultCode, engineCode, rmVault, rmToken0, rmToken1, rmEngine, vaultRm, vaultToken0,
-      vaultToken1, engineRm, enginePool, rmPool, engineProfile,
+      vaultToken1, engineRm, enginePool, rmPool, engineProfile, engineMode, engineVersion,
     };
   });
 
@@ -196,6 +198,12 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
   if (!sameAddress(topology.enginePool, topology.rmPool)) throw new Error('Keeper topology: engine.pool mismatch');
   if (Number(topology.engineProfile) !== expectedProfile) {
     throw new Error(`Keeper topology: engine profile does not match STRATEGY_PROFILE=${configuredProfile}`);
+  }
+  if (Number(topology.engineMode) !== 1) {
+    throw new Error('Keeper topology: RangeStrategyEngine must use HYBRID mode');
+  }
+  if (Number(topology.engineVersion) !== 2) {
+    throw new Error(`Keeper topology: ${configuredProfile} requires RangeStrategyEngine version 2`);
   }
   if (!sameAddress(topology.rmToken0, expected.token0) || !sameAddress(topology.vaultToken0, expected.token0)) {
     throw new Error('Keeper topology: token0 mismatch');

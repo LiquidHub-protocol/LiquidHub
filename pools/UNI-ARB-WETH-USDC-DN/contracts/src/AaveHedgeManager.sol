@@ -584,8 +584,21 @@ contract AaveHedgeManager is ReentrancyGuard {
     }
 
     /// @notice Executes the exact HEDGE_ONLY or HF_REPAIR action currently authorized by RangeStrategyEngine.
-    /// @dev Permissionless; keepers submit no target debt, price, score or range.
+    /// @dev Permissionless; keepers submit no target debt, price, score or range. Gas-capped ordinary callers
+    ///      use this mixed entry point; emergency fee exemptions use repairHealthFactor() below.
     function adjustHedge() external nonReentrant {
+        _executeCanonicalHedge();
+    }
+
+    /// @notice Executes only a currently authorized HF_REPAIR action.
+    /// @dev Dedicated permissionless selector for pause/gas exemptions. It derives eligibility directly from
+    ///      live Aave account data, so a strategy-engine failure cannot block safety repair and a late transaction
+    ///      can never fall through to HEDGE_ONLY after another keeper has already restored the HF.
+    function repairHealthFactor() external nonReentrant {
+        _repairHealthFactor(msg.sender);
+    }
+
+    function _executeCanonicalHedge() private {
         if (rangeManager == address(0) || adjustHedgeBps == 0) revert HedgeCheck(40);
         _refreshRangePriceCache();
         (uint8 rawAction, bytes32 decisionHash, uint64 checkpointTimestamp, bool protocolBotCaller) =
@@ -615,7 +628,6 @@ contract AaveHedgeManager is ReentrancyGuard {
     }
 
     function _repairHealthFactor(address keeper) private {
-        uint256 debtBefore = variableDebtWeth.balanceOf(address(this));
         (, uint256 debtBaseBefore,,,, uint256 hfBefore) = pool.getUserAccountData(address(this));
         (uint256 directRepair, uint256 flashRepair) = DnDepositLib.aaveHfRepairAmounts();
         if (directRepair == 0 && flashRepair == 0) revert HedgeCheck(44);
@@ -635,7 +647,6 @@ contract AaveHedgeManager is ReentrancyGuard {
             try IHedgeTreasury(treasuryAddress).payHedgeBounty(keeper) {} catch {}
         }
         emit HealthFactorRepaired(hfBefore, hfAfter, debtRepaidBase, bountyEligible, keeper);
-        emit HedgeAdjusted(debtBefore, variableDebtWeth.balanceOf(address(this)), false, keeper);
     }
 
     /// @dev Shared settlement entry point. It is externally dispatched to prevent the large Aave path from being

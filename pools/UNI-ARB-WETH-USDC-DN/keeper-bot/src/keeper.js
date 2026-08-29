@@ -12,6 +12,7 @@ const {
   STRATEGY_ACTION,
   STRATEGY_ACTION_LABELS,
   STRATEGY_REASON_LABELS,
+  AAVE_HEDGE_ABI,
 } = require('./utils/contracts');
 const { PersistentActionAlerts } = require('./utils/action-alerts');
 const { Rebalancer } = require('./rebalancer');
@@ -28,6 +29,9 @@ const PRICE_CACHE_MAX_AGE_SEC = parseInt(
 );
 const HEDGE_ERROR_IFACE = new ethers.Interface(['error HedgeCheck(uint8 code)']);
 const HEDGE_NO_ACTION_CODES = new Set([41, 42, 44]);
+const AAVE_POOL_ABI = [
+  'function getUserAccountData(address user) view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)',
+];
 
 function hedgeCheckCode(error) {
   if (error?.revert?.name === 'HedgeCheck' && error.revert.args?.length) {
@@ -71,6 +75,46 @@ async function readContract(rpcPool, contract, method, ...args) {
   });
 }
 
+async function readLiveHfSafetyState(rpcPool, hedgeManager) {
+  return await rpcPool.executeWithRetry(async (provider) => {
+    const hm = hedgeManager.connect(provider);
+    const [poolAddress, triggerBps] = await Promise.all([hm.pool(), hm.hfRepairTriggerBps()]);
+    const aavePool = new ethers.Contract(poolAddress, AAVE_POOL_ABI, provider);
+    const account = await aavePool.getUserAccountData(hedgeManager.target);
+    const debtBase = BigInt(account.totalDebtBase ?? account[1]);
+    const healthFactor = BigInt(account.healthFactor ?? account[5]);
+    const trigger = BigInt(triggerBps);
+    return {
+      debtBase,
+      healthFactor,
+      triggerBps: trigger,
+      repairRequired: debtBase > 0n && healthFactor < trigger * 100_000_000_000_000n,
+    };
+  });
+}
+
+async function assertHfRepairTopology(rpcPool, hedgeManager) {
+  const expectedHedgeManager = process.env.AAVE_HEDGE_MANAGER_ADDRESS;
+  const topology = await rpcPool.executeWithRetry(async (provider) => {
+    const hm = hedgeManager.connect(provider);
+    const [hedgeCode, poolAddress, triggerBps] = await Promise.all([
+      provider.getCode(expectedHedgeManager),
+      hm.pool(),
+      hm.hfRepairTriggerBps(),
+    ]);
+    const poolCode = await provider.getCode(poolAddress);
+    return { hedgeCode, poolCode, poolAddress, triggerBps };
+  });
+  if (topology.hedgeCode === '0x') throw new Error('HF safety topology: AaveHedgeManager has no runtime code');
+  if (!ethers.isAddress(topology.poolAddress) || topology.poolCode === '0x') {
+    throw new Error('HF safety topology: on-chain Aave pool has no runtime code');
+  }
+  const trigger = Number(topology.triggerBps);
+  if (!Number.isInteger(trigger) || trigger <= 10_000 || trigger > 30_000) {
+    throw new Error('HF safety topology: invalid on-chain repair trigger');
+  }
+}
+
 /**
  * Resolves the Treasury contract. Prefers TREASURY_ADDRESS from .env (lets the keeper read
  * the USDC balance and warn when underfunded); falls back to vault.treasuryAddress() on-chain.
@@ -111,11 +155,42 @@ async function checkBountyFunding(label, enabled, amount, treasuryAddr, usdc, rp
 }
 
 async function trackAction(alerts, method, ...args) {
+  if (!alerts || typeof alerts[method] !== 'function') return;
   try {
     await alerts[method](...args);
   } catch (error) {
     console.log(`  Keeper incident state error: ${(error.message || '').slice(0, 100)}`);
   }
+}
+
+async function runHfSafetyLane({ rpcPool, hedgeManager, wallet, actionAlerts = null }) {
+  const hfSafety = await readLiveHfSafetyState(rpcPool, hedgeManager);
+  if (!hfSafety.repairRequired) return { required: false, repaired: false };
+
+  const hf = Number(hfSafety.healthFactor) / 1e18;
+  console.log(
+    `  🚨 HF ${hf.toFixed(4)} below ${(Number(hfSafety.triggerBps) / 10_000).toFixed(4)}; ` +
+    'repairHealthFactor() takes priority over every ordinary action'
+  );
+  if (CHECK_ONLY) {
+    console.log('  -> Safety repair required (check-only mode, skipping transaction)');
+    return { required: true, repaired: false };
+  }
+
+  const repaired = await executeHedgeIfReady({
+    hedgeManager,
+    wallet,
+    rpcPool,
+    actionAlerts,
+    label: 'hfRepair',
+    bypassFeeCap: true,
+    hfRepairOnly: true,
+  });
+  const afterRepair = await readLiveHfSafetyState(rpcPool, hedgeManager);
+  if (afterRepair.repairRequired) {
+    throw new Error('HF remains below the on-chain repair trigger; ordinary actions are deferred');
+  }
+  return { required: true, repaired };
 }
 
 function persistedActionName(label) {
@@ -165,10 +240,20 @@ async function reconcileSignerState(rpcPool, actionAlerts) {
   // rereads every decision on-chain instead of attributing an unknown tx to this action.
 }
 
-async function executeHedgeIfReady({ hedgeManager, wallet, rpcPool, actionAlerts, label, beforeSend }) {
+async function executeHedgeIfReady({
+  hedgeManager,
+  wallet,
+  rpcPool,
+  actionAlerts,
+  label,
+  beforeSend,
+  bypassFeeCap = false,
+  hfRepairOnly = false,
+}) {
+  const method = hfRepairOnly ? 'repairHealthFactor' : 'adjustHedge';
   try {
     await rpcPool.executeWithRetry(async (provider) => {
-      await hedgeManager.connect(provider).adjustHedge.staticCall();
+      await hedgeManager.connect(provider)[method].staticCall();
     });
   } catch (error) {
     const classification = classifyHedgeSimulationError(error, rpcPool);
@@ -189,21 +274,14 @@ async function executeHedgeIfReady({ hedgeManager, wallet, rpcPool, actionAlerts
       const signer = wallet.connect(provider);
       return {
         wallet: signer,
-        request: await hedgeManager.connect(signer).adjustHedge.populateTransaction(),
+        request: await hedgeManager.connect(signer)[method].populateTransaction(),
       };
-    }, label);
+    }, label, 3, { bypassFeeCap });
     console.log(`  -> ${label} executed: ${receipt.hash}`);
     let postRepair;
     try {
-      postRepair = await rpcPool.executeWithRetry(async (provider) => {
-        const hm = hedgeManager.connect(provider);
-        const [hedgeData, triggerBps] = await Promise.all([hm.getHedgeData(), hm.hfRepairTriggerBps()]);
-        return {
-          debtBase: BigInt(hedgeData.totalDebtBase ?? hedgeData[1]),
-          hf: BigInt(hedgeData.healthFactor ?? hedgeData[2]),
-          triggerBps: BigInt(triggerBps),
-        };
-      });
+      const live = await readLiveHfSafetyState(rpcPool, hedgeManager);
+      postRepair = { debtBase: live.debtBase, hf: live.healthFactor, triggerBps: live.triggerBps };
     } catch (postCheckError) {
       await trackAction(
         actionAlerts,
@@ -261,17 +339,12 @@ async function main() {
   console.log(`Check interval: ${CHECK_INTERVAL_MS / 60000} minutes`);
   console.log(`Mode: ${CHECK_ONLY ? 'CHECK ONLY' : 'ACTIVE'}\n`);
 
-  const required = [
+  const safetyRequired = [
     'RPC_URL',
-    'RANGEMANAGER_ADDRESS',
-    'RANGE_STRATEGY_ENGINE_ADDRESS',
-    'VAULT_ADDRESS',
     'AAVE_HEDGE_MANAGER_ADDRESS',
-    'TOKEN0_ADDRESS',
-    'TOKEN1_ADDRESS',
   ];
-  if (!CHECK_ONLY) required.push('KEEPER_PRIVATE_KEY');
-  for (const key of required) {
+  if (!CHECK_ONLY) safetyRequired.push('KEEPER_PRIVATE_KEY');
+  for (const key of safetyRequired) {
     if (!process.env[key]) {
       console.error(`Missing required env var: ${key}`);
       process.exit(1);
@@ -281,6 +354,31 @@ async function main() {
   const rpcPool = new RPCPool();
   await rpcPool.verifyProviderChains();
   const provider = rpcPool.getProvider();
+  const safetyHedgeManager = new ethers.Contract(
+    process.env.AAVE_HEDGE_MANAGER_ADDRESS,
+    AAVE_HEDGE_ABI,
+    provider
+  );
+  await assertHfRepairTopology(rpcPool, safetyHedgeManager);
+  const wallet = CHECK_ONLY ? null : new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY, provider);
+
+  // Startup safety lane comes before the RangeStrategyEngine and ordinary topology. It can also
+  // replace an ordinary pending transaction at the keeper nonce through executeSignedTxWithRetry().
+  await runHfSafetyLane({ rpcPool, hedgeManager: safetyHedgeManager, wallet });
+
+  const required = [
+    'RANGEMANAGER_ADDRESS',
+    'RANGE_STRATEGY_ENGINE_ADDRESS',
+    'VAULT_ADDRESS',
+    'TOKEN0_ADDRESS',
+    'TOKEN1_ADDRESS',
+  ];
+  for (const key of required) {
+    if (!process.env[key]) {
+      console.error(`Missing required env var: ${key}`);
+      process.exit(1);
+    }
+  }
   const { rangeManager, vault, strategyEngine, hedgeManager, pauseController } = createContracts(provider);
   await assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine, hedgeManager });
   console.log('Keeper topology: RangeManager/Vault/RangeStrategyEngine/AaveHedgeManager/tokens verified\n');
@@ -320,17 +418,21 @@ async function main() {
     console.log('Treasury info unavailable\n');
   }
 
-  let wallet, rebalancer;
+  let rebalancer;
   if (!CHECK_ONLY) {
-    wallet = new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY, provider);
     rebalancer = new Rebalancer(rangeManager, vault, strategyEngine, hedgeManager, wallet, rpcPool);
     console.log(`Keeper wallet: ${wallet.address}\n`);
   }
 
   while (true) {
     try {
-      await reconcileSignerState(rpcPool, actionAlerts);
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
+
+      // First-priority safety lane: this reads Aave directly and does not depend on the strategy engine,
+      // PauseController or an ordinary pending pool action. The contract rechecks the live HF atomically.
+      await runHfSafetyLane({ rpcPool, hedgeManager, wallet, actionAlerts });
+
+      await reconcileSignerState(rpcPool, actionAlerts);
 
       await logPriceCacheBeforeDecision(rangeManager, rpcPool);
 
@@ -412,6 +514,8 @@ async function main() {
             rpcPool,
             actionAlerts,
             label: 'hfRepair',
+            bypassFeeCap: true,
+            hfRepairOnly: true,
           });
           strategyState = await readStrategyState(rpcPool, rangeManager, strategyEngine);
           ({ positions, decision, checkpointDue } = strategyState);

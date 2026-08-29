@@ -115,8 +115,10 @@ const PAUSE_CONTROLLER_ABI = [
 const AAVE_HEDGE_ABI = [
   "function vault() external view returns (address)",
   "function rangeManager() external view returns (address)",
+  "function pool() external view returns (address)",
   "function getHedgeData() external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase)",
   "function adjustHedge() external",
+  "function repairHealthFactor() external",
   "function adjustHedgeBps() external view returns (uint16)",
   "function criticalHedgeBps() external view returns (uint16)",
   "function hfRepairTriggerBps() external view returns (uint16)", // urgent HF repair threshold
@@ -204,6 +206,8 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
       enginePool,
       rmPool,
       engineProfile,
+      engineMode,
+      engineVersion,
     ] = await Promise.all([
       provider.getCode(expected.rangeManager),
       provider.getCode(expected.vault),
@@ -224,10 +228,13 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
       engine.pool(),
       rm.pool(),
       engine.profile(),
+      engine.decisionMode(),
+      engine.strategyVersion(),
     ]);
     return {
       rmCode, vaultCode, hmCode, engineCode, rmVault, rmToken0, rmToken1, rmEngine, vaultRm, vaultToken0,
       vaultToken1, vaultHm, hmVault, hmRm, engineRm, engineHm, enginePool, rmPool, engineProfile,
+      engineMode, engineVersion,
     };
   });
 
@@ -245,6 +252,12 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
   if (!sameAddress(topology.engineHm, expected.hedgeManager)) throw new Error('Keeper topology: engine.hedgeManager mismatch');
   if (!sameAddress(topology.enginePool, topology.rmPool)) throw new Error('Keeper topology: engine.pool mismatch');
   if (Number(topology.engineProfile) !== 1) throw new Error('Keeper topology: DN keeper requires DELTA_NEUTRAL profile');
+  if (Number(topology.engineMode) !== 1) {
+    throw new Error('Keeper topology: RangeStrategyEngine must use HYBRID mode');
+  }
+  if (Number(topology.engineVersion) !== 3) {
+    throw new Error('Keeper topology: DELTA_NEUTRAL requires RangeStrategyEngine version 3');
+  }
   if (!sameAddress(topology.rmToken0, expected.token0) || !sameAddress(topology.vaultToken0, expected.token0)) {
     throw new Error('Keeper topology: token0 mismatch');
   }

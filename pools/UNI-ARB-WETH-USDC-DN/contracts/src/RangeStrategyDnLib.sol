@@ -1,14 +1,59 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
 
+import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "./RangeOperations.sol";
 import "./interfaces/IRangeStrategyEngine.sol";
+
+interface IDnRangeManagerState {
+    function priceCache()
+        external
+        view
+        returns (uint128 price0, uint128 price1, uint160 sqrtP, int24 tick, uint64 timestamp, bool valid);
+    function config()
+        external
+        view
+        returns (
+            uint24 fee,
+            uint8 token0Decimals,
+            uint8 token1Decimals,
+            uint16 toleranceBps,
+            uint24 maxSlippageBps,
+            uint64 lastRebalanceTime,
+            bool oraclesConfigured,
+            uint32 maxPositions
+        );
+}
+
+interface IDnAaveStrategyState {
+    function getHedgeData()
+        external
+        view
+        returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase);
+    function getWethDebt() external view returns (uint256);
+    function getStrategyReserveData()
+        external
+        view
+        returns (uint256 idleStable, uint16 operationalTargetBps, uint16 liveLtvBps);
+    function hedgeTargetBps() external view returns (uint16);
+    function donationDustToken0() external view returns (uint256);
+    function adjustHedgeBps() external view returns (uint16);
+    function hedgeAdjustCooldown() external view returns (uint32);
+    function lastHedgeAdjustAt() external view returns (uint64);
+    function hfRepairTriggerBps() external view returns (uint16);
+    function liqThresholdBps() external view returns (uint16);
+    function reserveHfTargetBps() external view returns (uint16);
+    function swapSlippageBps() external view returns (uint16);
+    function criticalHedgeBps() external view returns (uint16);
+}
 
 /// @title RangeStrategyDnLib
 /// @notice Stateless Delta Neutral projection math used by RangeStrategyEngine.
 /// @dev The library has no storage, owner, funds or upgrade path. Its linked bytecode is fixed at deployment.
 library RangeStrategyDnLib {
     uint256 private constant BPS = 10_000;
+    uint256 private constant EXIT_CONFIRMATION_DEPTH_BPS = 1_000;
+    uint256 private constant EXIT_CONFIRMATION_MIN_SPACINGS = 2;
     uint256 private constant HEDGE_RESET_RATIO_BPS = 7_500;
     uint16 private constant MAX_FEE_RATE_BPS = 2_000;
     uint128 private constant SAMPLE_LIQUIDITY = 1e12;
@@ -116,6 +161,7 @@ library RangeStrategyDnLib {
         bool inRange;
         bool edgeEnough;
         bool criticalHedge;
+        bool exitConfirmed;
         int24 lower;
         int24 upper;
         int24 liveTick;
@@ -129,9 +175,70 @@ library RangeStrategyDnLib {
     struct RangeTiming {
         bool forcePersistent;
         bool forceDeep;
+        bool exitConfirmed;
         bool urgent;
         bool cooldownActive;
         bool coalesceHedge;
+    }
+
+    function loadContext(
+        address hedgeManager,
+        address rangeManager,
+        address token0,
+        bool rateAvailable,
+        uint256 rateRay
+    ) external view returns (Context memory context) {
+        IDnAaveStrategyState hedge = IDnAaveStrategyState(hedgeManager);
+        try hedge.getHedgeData() returns (uint256 collateral, uint256 debtBase, uint256 hf, uint256 available) {
+            context.collateralBase = collateral;
+            context.debtBase = debtBase;
+            context.healthFactorBps = hf / 1e14;
+            context.availableBorrowsBase = available;
+        } catch {
+            return context;
+        }
+        context.hfRepairTriggerBps = hedge.hfRepairTriggerBps();
+        if (
+            context.debtBase > 0 && context.hfRepairTriggerBps > 0
+                && context.healthFactorBps < context.hfRepairTriggerBps
+        ) return context;
+
+        context.debtToken0 = hedge.getWethDebt();
+        uint256 dust = hedge.donationDustToken0();
+        uint256 idle = IERC20(token0).balanceOf(hedgeManager) + IERC20(token0).balanceOf(rangeManager);
+        uint256 countedIdle = idle > dust ? idle - dust : 0;
+        context.effectiveShortToken0 = int256(context.debtToken0) - int256(countedIdle);
+        (, context.token0Decimals, context.token1Decimals,,,,,) = IDnRangeManagerState(rangeManager).config();
+        (uint128 price0, uint128 price1,,,,) = IDnRangeManagerState(rangeManager).priceCache();
+        context.price0 = price0;
+        context.price1 = price1;
+        context.hedgeTargetBps = hedge.hedgeTargetBps();
+        context.adjustThresholdBps = hedge.adjustHedgeBps();
+        context.liquidationThresholdBps = hedge.liqThresholdBps();
+        context.reserveHfTargetBps = hedge.reserveHfTargetBps();
+
+        uint256 idleStable;
+        uint16 liveLtvBps;
+        try hedge.getStrategyReserveData() returns (uint256 reserve, uint16 operationalTarget, uint16 liveLtv) {
+            idleStable = reserve;
+            context.operationalHfTargetBps = operationalTarget;
+            liveLtvBps = liveLtv;
+        } catch {
+            return context;
+        }
+        context.idleStableBase = idleStable * uint256(price1) / (10 ** context.token1Decimals);
+        context.borrowLtvBps = liveLtvBps;
+        context.swapSlippageBps = hedge.swapSlippageBps();
+        context.criticalHedgeBps = hedge.criticalHedgeBps();
+        context.cooldownSeconds = hedge.hedgeAdjustCooldown();
+        context.lastAdjustmentAt = hedge.lastHedgeAdjustAt();
+        if (!rateAvailable) return context;
+        context.variableBorrowRateRay = rateRay;
+        context.configured = context.price0 > 0 && context.price1 > 0 && context.variableBorrowRateRay > 0
+            && context.hedgeTargetBps == BPS && context.liquidationThresholdBps > 0
+            && context.reserveHfTargetBps > context.hfRepairTriggerBps
+            && context.operationalHfTargetBps >= context.reserveHfTargetBps && context.borrowLtvBps > 0
+            && context.swapSlippageBps < BPS && context.criticalHedgeBps > context.adjustThresholdBps;
     }
 
     struct ActionInput {
@@ -498,8 +605,8 @@ library RangeStrategyDnLib {
             context.adjustThresholdBps,
             confirmationSeconds
         );
-        control.critical = control.adjustmentFeasible && exposureLargeEnough
-            && control.driftBps >= context.criticalHedgeBps;
+        control.critical =
+            control.adjustmentFeasible && exposureLargeEnough && control.driftBps >= context.criticalHedgeBps;
         bool cooldownElapsed = block.timestamp >= uint256(context.lastAdjustmentAt) + context.cooldownSeconds;
         bool normalEligible = control.adjustmentFeasible && exposureLargeEnough && control.normalConfirmed
             && control.driftBps >= context.adjustThresholdBps && cooldownElapsed
@@ -518,9 +625,9 @@ library RangeStrategyDnLib {
         uint32 confirmationSeconds
     ) private view returns (uint64 signalSince, uint8 direction, bool confirmed) {
         uint256 resetThreshold = uint256(adjustThresholdBps) * HEDGE_RESET_RATIO_BPS / BPS;
-        if (
-            !adjustmentFeasible || !exposureLargeEnough || currentDirection == 0 || driftBps < resetThreshold
-        ) return (0, 0, false);
+        if (!adjustmentFeasible || !exposureLargeEnough || currentDirection == 0 || driftBps < resetThreshold) {
+            return (0, 0, false);
+        }
 
         if (previousSignalSince == 0 || previousDirection != currentDirection) {
             if (driftBps < adjustThresholdBps) return (0, 0, false);
@@ -529,8 +636,8 @@ library RangeStrategyDnLib {
 
         signalSince = previousSignalSince;
         direction = previousDirection;
-        confirmed = driftBps >= adjustThresholdBps
-            && block.timestamp >= uint256(previousSignalSince) + confirmationSeconds;
+        confirmed =
+            driftBps >= adjustThresholdBps && block.timestamp >= uint256(previousSignalSince) + confirmationSeconds;
     }
 
     function _hedgeOnlyStatus(Context memory context, Position memory position, RiskConfig memory risk, int24 liveTick)
@@ -576,6 +683,7 @@ library RangeStrategyDnLib {
         }
 
         RangeTiming memory timing = _rangeTiming(input.range, input.hedgeEligible);
+        bool actionableEdge = input.range.edgeEnough && timing.exitConfirmed;
         if (!input.forceHedgeRecovery && !timing.urgent && timing.cooldownActive) {
             if (input.hedgeEligible && !timing.coalesceHedge) {
                 return (IRangeStrategyEngine.Action.HEDGE_ONLY, IRangeStrategyEngine.ReasonCode.HEDGE_DRIFT);
@@ -590,7 +698,7 @@ library RangeStrategyDnLib {
             );
         }
 
-        if (input.range.edgeEnough || timing.urgent || input.forceHedgeRecovery) {
+        if (actionableEdge || timing.urgent || input.forceHedgeRecovery) {
             reason = input.forceHedgeRecovery
                 ? IRangeStrategyEngine.ReasonCode.HEDGE_DRIFT
                 : timing.forcePersistent
@@ -620,25 +728,85 @@ library RangeStrategyDnLib {
         view
         returns (RangeTiming memory timing)
     {
-        timing.forcePersistent = input.outOfRangeSince > 0
-            && block.timestamp >= uint256(input.outOfRangeSince) + input.maxOutOfRangeSeconds;
+        timing.forcePersistent =
+            input.outOfRangeSince > 0 && block.timestamp >= uint256(input.outOfRangeSince) + input.maxOutOfRangeSeconds;
         uint256 outsideDepth = input.liveTick < input.lower
             ? uint256(uint24(input.lower - input.liveTick))
             : input.liveTick > input.upper ? uint256(uint24(input.liveTick - input.upper)) : 0;
-        uint256 currentHalfWidth =
-            input.upper > input.lower ? uint256(uint24(input.upper - input.lower)) / 2 : 0;
+        uint256 currentHalfWidth = input.upper > input.lower ? uint256(uint24(input.upper - input.lower)) / 2 : 0;
         timing.forceDeep = !input.inRange && currentHalfWidth > 0 && outsideDepth >= currentHalfWidth;
+        timing.exitConfirmed = input.inRange || input.exitConfirmed;
         timing.urgent = timing.forcePersistent || timing.forceDeep;
         uint256 rangeAvailableAt = uint256(input.lastRebalanceTime) + input.rebalanceCooldownSeconds;
         timing.cooldownActive = block.timestamp < rangeAvailableAt;
-        bool cooldownEndsSoon = timing.cooldownActive
-            && rangeAvailableAt <= block.timestamp + input.coalesceHorizonSeconds;
+        bool cooldownEndsSoon =
+            timing.cooldownActive && rangeAvailableAt <= block.timestamp + input.coalesceHorizonSeconds;
         bool persistenceDueSoon = input.outOfRangeSince > 0
-            && uint256(input.outOfRangeSince) + input.maxOutOfRangeSeconds
-                <= block.timestamp + input.coalesceHorizonSeconds;
-        bool rangeSignal = input.edgeEnough || !input.inRange;
-        timing.coalesceHedge = hedgeEligible && !input.criticalHedge && rangeSignal
-            && (cooldownEndsSoon || persistenceDueSoon);
+            && uint256(input.outOfRangeSince) + input.maxOutOfRangeSeconds <= block.timestamp + input.coalesceHorizonSeconds;
+        bool rangeSignal = (input.edgeEnough && timing.exitConfirmed) || !input.inRange;
+        timing.coalesceHedge =
+            hedgeEligible && !input.criticalHedge && rangeSignal && (cooldownEndsSoon || persistenceDueSoon);
+    }
+
+    function nextRangeExitState(
+        Position memory position,
+        int24 liveTick,
+        int24 tacticalTwapTick,
+        int24 tickSpacing,
+        uint64 currentSignalSince,
+        uint32 epochSeconds
+    ) external view returns (uint64 nextSignalSince, bool confirmed) {
+        if (!position.exists) return (0, false);
+        if (position.inRange) {
+            if (currentSignalSince == 0) return (0, true);
+            nextSignalSince =
+                _deepInsideRange(position, liveTick, tacticalTwapTick, tickSpacing) ? 0 : currentSignalSince;
+            return (nextSignalSince, true);
+        }
+
+        nextSignalSince = currentSignalSince == 0 ? uint64(block.timestamp) : currentSignalSince;
+        uint256 outsideDepth = liveTick < position.lower
+            ? uint256(uint24(position.lower - liveTick))
+            : liveTick > position.upper ? uint256(uint24(liveTick - position.upper)) : 0;
+        uint256 halfWidth = uint256(uint24(position.upper - position.lower)) / 2;
+        confirmed = _exitConfirmed(
+            position, liveTick, tacticalTwapTick, tickSpacing, nextSignalSince, epochSeconds, outsideDepth, halfWidth
+        );
+    }
+
+    function _exitConfirmed(
+        Position memory position,
+        int24 liveTick,
+        int24 tacticalTwapTick,
+        int24 tickSpacing,
+        uint64 signalSince,
+        uint32 epochSeconds,
+        uint256 outsideDepth,
+        uint256 currentHalfWidth
+    ) private view returns (bool) {
+        bool twapOutsideSameSide = (liveTick <= position.lower && tacticalTwapTick <= position.lower)
+            || (liveTick >= position.upper && tacticalTwapTick >= position.upper);
+        bool persistedOneEpoch = signalSince > 0 && block.timestamp >= uint256(signalSince) + epochSeconds;
+        return twapOutsideSameSide || persistedOneEpoch
+            || outsideDepth >= _exitConfirmationDepth(currentHalfWidth, tickSpacing);
+    }
+
+    function _deepInsideRange(Position memory position, int24 liveTick, int24 tacticalTwapTick, int24 tickSpacing)
+        private
+        pure
+        returns (bool)
+    {
+        uint256 depth = uint256(uint24(tickSpacing));
+        int256 resetLower = int256(position.lower) + int256(depth);
+        int256 resetUpper = int256(position.upper) - int256(depth);
+        return resetLower < resetUpper && int256(liveTick) > resetLower && int256(liveTick) < resetUpper
+            && int256(tacticalTwapTick) > resetLower && int256(tacticalTwapTick) < resetUpper;
+    }
+
+    function _exitConfirmationDepth(uint256 halfWidth, int24 tickSpacing) private pure returns (uint256) {
+        uint256 minimumDepth = uint256(uint24(tickSpacing)) * EXIT_CONFIRMATION_MIN_SPACINGS;
+        uint256 proportionalDepth = halfWidth * EXIT_CONFIRMATION_DEPTH_BPS / BPS;
+        return minimumDepth > proportionalDepth ? minimumDepth : proportionalDepth;
     }
 
     function hedgeOnlyRangeStable(Position memory position, int24 liveTick, uint16 minimumEdgeBps)
@@ -719,13 +887,11 @@ library RangeStrategyDnLib {
         if (projected.debtBase == 0) {
             projected.collateralBase = stableAssetsBase;
         } else {
-            uint256 minimumCollateral = _ceilDiv(
-                projected.debtBase * context.reserveHfTargetBps, context.liquidationThresholdBps
-            );
+            uint256 minimumCollateral =
+                _ceilDiv(projected.debtBase * context.reserveHfTargetBps, context.liquidationThresholdBps);
             if (stableAssetsBase < minimumCollateral) return projected;
-            uint256 operatingTarget = _ceilDiv(
-                projected.debtBase * context.operationalHfTargetBps, context.liquidationThresholdBps
-            );
+            uint256 operatingTarget =
+                _ceilDiv(projected.debtBase * context.operationalHfTargetBps, context.liquidationThresholdBps);
             projected.collateralBase = _min(stableAssetsBase, operatingTarget);
         }
         if (

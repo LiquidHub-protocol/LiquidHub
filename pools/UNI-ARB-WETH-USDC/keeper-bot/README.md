@@ -42,7 +42,8 @@ combines three bounded components:
 The engine returns an enum action, reason code, target ticks, epoch and `decisionHash`. `RangeManager.rebalance()`
 recalculates and validates that decision before touching funds. An out-of-range position may therefore remain in
 evaluation when the expected benefit does not yet exceed costs and safeguards; deep or persistent exits remain
-covered by bounded liveness rules.
+covered by bounded liveness rules. A shallow spot-only exit also waits for tactical-TWAP, elapsed-epoch or
+material-depth confirmation. The rule is enforced by the engine and cannot be bypassed by a keeper.
 
 #### Canonical checkpoints (`checkpointMarketState`)
 
@@ -91,7 +92,7 @@ Edit `.env` with the following variables:
 | `RPC_BACKUP_1` | No | Backup RPC endpoint |
 | `RPC_BACKUP_2` | No | Second backup RPC endpoint |
 | `KEEPER_PRIVATE_KEY` | Yes* | Private key for the keeper wallet (*not needed for check-only mode) |
-| `KEEPER_MAX_GAS_PRICE_GWEI` | Yes | Local maximum accepted for `gasPrice`, `maxFeePerGas` and same-nonce replacements. |
+| `KEEPER_MAX_GAS_PRICE_GWEI` | Yes | Local maximum for standard-pool actions. A shared, signed DN `repairHealthFactor()` journal retains its exact-call exemption during reconciliation. |
 | `KEEPER_STATE_DIR` | No | Shared local signer-state directory. Defaults to `~/.liquidhub-keeper-state`. |
 | `KEEPER_PENDING_TX_FILE` | No | Deprecated migration source for an older custom journal. New transactions always use the canonical `chainId + signer` journal under `KEEPER_STATE_DIR`. |
 | `RANGEMANAGER_ADDRESS` | Yes | RangeManager contract address |
@@ -118,7 +119,7 @@ Using one key for several local test keepers is supported when they use the same
 `KEEPER_STATE_DIR`; public keepers using their own keys remain independent. This
 community code never reads protocol Telegram or AWS Secrets Manager credentials.
 
-Signed transactions are populated and signed once, then the exact raw payload is persisted before RPC failover. If that payload remains pending or underpriced, the journal may replace it at the same nonce with a 12.5% fee bump, never above `KEEPER_MAX_GAS_PRICE_GWEI`. A nonce is considered consumed only after RPC agreement, so one faulty endpoint cannot discard the journal. Local processes derive one shared lock and journal from `chainId + signer address`, so the same test key can safely run several pool keepers without nonce collisions. Do not delete signer state while a transaction is unresolved. If `PAUSE_CONTROLLER_ADDRESS` is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Strategy checkpoints and eligible rebalances remain active.
+Signed transactions are populated and signed once, then the exact raw payload is persisted before RPC failover. If that payload remains pending or underpriced, the journal may replace it at the same nonce with a 12.5% fee bump. Standard-pool actions never exceed `KEEPER_MAX_GAS_PRICE_GWEI`; a shared journal originally signed by the DN keeper for exact `HF_REPAIR/repairHealthFactor()` retains its payload-bound exemption during reconciliation. A nonce is considered consumed only after RPC agreement, so one faulty endpoint cannot discard the journal. Local processes derive one shared lock and journal from `chainId + signer address`, so the same test key can safely run several pool keepers without nonce collisions. Do not delete signer state while a transaction is unresolved. If `PAUSE_CONTROLLER_ADDRESS` is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Strategy checkpoints and eligible rebalances remain active.
 
 ### 3. Run the bot
 

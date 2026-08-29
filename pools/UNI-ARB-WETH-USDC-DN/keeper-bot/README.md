@@ -7,12 +7,14 @@ Reference keeper for a Liquid Hub Delta Neutral pool. It reads the pool's immuta
 
 The DN keeper uses the same canonical checkpoint, deposit-processing and atomic rebalance paths as the Exposed
 keeper. The `RangeStrategyEngine` also evaluates Aave capacity, borrowing cost, delta drift and stressed health
-factor before authorizing a range. The keeper supplies none of those values.
+factor before authorizing a range. A shallow spot-only range exit requires tactical-TWAP, elapsed-epoch or
+material-depth confirmation, while critical hedge and health-factor safety paths remain independent. The keeper
+supplies none of those values.
 
 At each polling cycle the bot:
 
-1. Reads `previewDecision()`, `checkpointDue()`, PauseController state and Aave health information.
-2. Executes `HF_REPAIR` immediately when authorized; this safety path is never delayed for the protocol bot.
+1. Reads the live HF directly from the Aave pool wired into `AaveHedgeManager` and executes the dedicated `repairHealthFactor()` entry point immediately when required. This startup/cycle safety lane runs before the strategy engine, PauseController, ordinary pending actions and fee cap.
+2. Reads `previewDecision()`, `checkpointDue()` and PauseController state only after the HF is safe.
 3. Calls `checkpointMarketState()` when a canonical epoch is due, then rereads the decision.
 4. Executes `HEDGE_ONLY` through `adjustHedge()` or `RANGE_AND_HEDGE` through atomic `rebalance()` as authorized.
 5. Processes one queued deposit when inflows are available, a position exists and no maintenance action takes priority.
@@ -25,7 +27,7 @@ All steps are independent. Note: processing a deposit **opens the AAVE hedge ato
 
 **USDC reserve management** is integrated into the same call: when the health factor is above the governance target (`HF_REPAIR_TARGET_BPS`), `adjustHedge()` releases the surplus AAVE collateral and keeps it as USDC **on the HedgeManager itself** (never sent off-contract), so the reserve used for future adjustments is replenished on-chain without any separate keeper action.
 
-Each cycle the keeper simulates `adjustHedge()` before sending. The contract enforces sizing and all safety checks atomically. After a confirmed transaction, the keeper rereads the live HF: remaining below 1.40 raises an immediate local critical incident, reinforced below 1.25 for Safe intervention. Community keeper alerts remain local-only; protocol Telegram credentials are never distributed.
+Each cycle the keeper simulates the exact canonical call before sending: `repairHealthFactor()` for `HF_REPAIR`, otherwise `adjustHedge()`. The dedicated repair selector reverts instead of falling through to a normal hedge if the HF was repaired by another keeper first. The contract enforces sizing and all safety checks atomically. After a confirmed transaction, the keeper rereads the live HF: remaining below 1.40 raises an immediate local critical incident, reinforced below 1.25 for Safe intervention. Community keeper alerts remain local-only; protocol Telegram credentials are never distributed.
 
 `checkpointMarketState()`, `rebalance()` and `adjustHedge()` are permissionless. Any address can call them when the
 contracts agree; no keeper allowlist or role is required.
@@ -63,7 +65,7 @@ Community keepers are permissionless and may use any RPC provider they choose. L
 
 A poor RPC can hurt the keeper's own liveness or bounty capture rate, but it does not grant extra permissions and cannot bypass contract validation. Configure backup RPCs for reliability.
 
-`CHECK_INTERVAL_MIN` defaults to `1` and must be greater than zero. Signed transactions are persisted before RPC failover. A pending or underpriced payload may be replaced at the same nonce with a 12.5% fee bump, bounded by the required `KEEPER_MAX_GAS_PRICE_GWEI`; nonce consumption requires RPC agreement. Pool and bridge processes derive one shared lock and journal from `chainId + signer address`; using the same local test key for Exposed, DN and bridge keepers is supported without nonce collisions when they share `KEEPER_STATE_DIR`. Public keepers with their own keys remain independent. `KEEPER_PENDING_TX_FILE` is accepted only as a deprecated one-time migration source; new journals always use the canonical filename. This community code never reads protocol Telegram or AWS Secrets Manager credentials. If the PauseController is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Strategy checkpoints, hedge maintenance and eligible rebalances remain active.
+`CHECK_INTERVAL_MIN` defaults to `1` and must be greater than zero. Signed transactions are persisted before RPC failover. A pending or underpriced payload may be replaced at the same nonce with a 12.5% fee bump. Ordinary actions remain bounded by the required `KEEPER_MAX_GAS_PRICE_GWEI`; only an on-chain `HF_REPAIR` sent to the configured `AaveHedgeManager.repairHealthFactor()` target and exact selector bypasses that ceiling, including same-nonce replacement. The exemption is bound to the immutable signed payload. Nonce consumption requires RPC agreement. Pool and bridge processes derive one shared lock and journal from `chainId + signer address`; using the same local test key for Exposed, DN and bridge keepers is supported without nonce collisions when they share `KEEPER_STATE_DIR`. Public keepers with their own keys remain independent. `KEEPER_PENDING_TX_FILE` is accepted only as a deprecated one-time migration source; new journals always use the canonical filename. This community code never reads protocol Telegram or AWS Secrets Manager credentials. If the PauseController is missing or temporarily unreadable, only queued-deposit processing is skipped fail-closed. Strategy checkpoints, hedge maintenance and eligible rebalances remain active.
 
 ## Keeper Bounties
 
@@ -74,7 +76,7 @@ Paid in **USDC** by the Treasury to whoever sends the transaction. The DN pool h
 | `rebalance()` | Keeper bounty | `keeperBountyEnabled` / `keeperBountyAmount()` |
 | `processDepositPermissionless()` | Deposit bounty | `depositBountyEnabled` / `depositBountyAmount()` |
 | `checkpointMarketState()` | Strategy checkpoint bounty | `strategyCheckpointBountyEnabled` / `strategyCheckpointBountyAmount()` |
-| `adjustHedge()` | Hedge bounty | `hedgeBountyEnabled` / `hedgeBountyAmount()` |
+| `adjustHedge()` / `repairHealthFactor()` | Hedge / HF-repair bounty | `hedgeBountyEnabled` / `hedgeBountyAmount()` |
 
 A bounty is only paid if the Treasury holds enough USDC; otherwise the action still succeeds on-chain but no bounty is paid. The bot logs a warning and shows the Treasury balance on startup. Verify it on-chain (Contracts page) before relying on bounty income.
 

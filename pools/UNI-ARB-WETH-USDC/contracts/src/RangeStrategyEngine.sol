@@ -44,8 +44,10 @@ interface IStrategyCheckpointTreasury {
 /// @dev The contract never holds funds. It combines bounded online estimators, an analytical anchor and a
 ///      fixed multi-scenario optimizer. Keepers submit no market data, score, debt target or ticks.
 contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
-    uint16 public constant override strategyVersion = 1;
+    uint16 public constant override strategyVersion = 2;
     uint256 private constant BPS = 10_000;
+    uint256 private constant EXIT_CONFIRMATION_DEPTH_BPS = 1_000;
+    uint256 private constant EXIT_CONFIRMATION_MIN_SPACINGS = 2;
     uint128 private constant SAMPLE_LIQUIDITY = 1e12;
     uint16 private constant MAX_FEE_RATE_BPS = 2_000;
     uint24 private constant MAX_VOLATILITY_TICKS = 20_000;
@@ -358,7 +360,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         });
         _lastCheckpointEpoch = epoch;
         _telemetry.spotTick = liveTick;
-        _updateOutOfRangeState(liveTick);
+        _updateOutOfRangeState(liveTick, tacticalTick);
 
         EvaluationSummary memory summary;
         (decision, summary) = _buildDecision();
@@ -674,8 +676,10 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             position.upper > position.lower ? uint256(uint24(position.upper - position.lower)) / 2 : 0;
         bool forceDeep = !position.inRange && currentHalfWidth > 0 && outsideDepth >= currentHalfWidth;
         bool edgeEnough = decision.edgeBps > decision.thresholdBps;
+        bool confirmedEdge =
+            edgeEnough && (position.inRange || _exitConfirmed(position, liveTick, outsideDepth, currentHalfWidth));
 
-        if (edgeEnough || forcePersistent || forceDeep) {
+        if (confirmedEdge || forcePersistent || forceDeep) {
             decision.action = Action.RANGE_REBALANCE;
             decision.reason = forcePersistent
                 ? ReasonCode.OUT_OF_RANGE_PERSISTENT
@@ -828,13 +832,49 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         position.inRange = liveTick > position.lower && liveTick < position.upper;
     }
 
-    function _updateOutOfRangeState(int24 liveTick) private {
+    function _updateOutOfRangeState(int24 liveTick, int24 tacticalTwapTick) private {
         PositionState memory position = _positionState(liveTick);
-        if (!position.exists || position.inRange) {
+        if (!position.exists) {
             _outOfRangeSince = 0;
-        } else if (_outOfRangeSince == 0) {
+        } else if (!position.inRange && _outOfRangeSince == 0) {
             _outOfRangeSince = uint64(block.timestamp);
+        } else if (position.inRange && _outOfRangeSince != 0 && _deepInsideRange(position, liveTick, tacticalTwapTick))
+        {
+            _outOfRangeSince = 0;
         }
+    }
+
+    function _exitConfirmed(
+        PositionState memory position,
+        int24 liveTick,
+        uint256 outsideDepth,
+        uint256 currentHalfWidth
+    ) internal view returns (bool) {
+        if (position.inRange) return true;
+        bool twapOutsideSameSide = (liveTick <= position.lower && marketState.tacticalTwapTick <= position.lower)
+            || (liveTick >= position.upper && marketState.tacticalTwapTick >= position.upper);
+        bool persistedOneEpoch =
+            _outOfRangeSince != 0 && block.timestamp >= uint256(_outOfRangeSince) + strategyConfig.epochSeconds;
+        return twapOutsideSameSide || persistedOneEpoch || outsideDepth >= _exitConfirmationDepth(currentHalfWidth);
+    }
+
+    function _deepInsideRange(PositionState memory position, int24 liveTick, int24 tacticalTwapTick)
+        private
+        view
+        returns (bool)
+    {
+        uint256 depth = uint256(uint24(_strategyTickSpacing));
+        int256 resetLower = int256(position.lower) + int256(depth);
+        int256 resetUpper = int256(position.upper) - int256(depth);
+        return resetLower < resetUpper && int256(liveTick) > resetLower && int256(liveTick) < resetUpper
+            && int256(tacticalTwapTick) > resetLower && int256(tacticalTwapTick) < resetUpper;
+    }
+
+    function _exitConfirmationDepth(uint256 halfWidth) private view returns (uint256) {
+        return _max(
+            uint256(uint24(_strategyTickSpacing)) * EXIT_CONFIRMATION_MIN_SPACINGS,
+            halfWidth * EXIT_CONFIRMATION_DEPTH_BPS / BPS
+        );
     }
 
     function currentTelemetry() external view override returns (Telemetry memory) {
@@ -860,6 +900,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             revert DecisionMismatch();
         }
         _lastExecutedDecisionHash = decisionHash;
+        // The signal belongs to the range that was just replaced.
+        _outOfRangeSince = 0;
         emit StrategyExecutionRecorded(current.epoch, decisionHash, action, keeper, msg.sender);
     }
 

@@ -54,6 +54,7 @@ contract SecureBotModule {
     bytes4 private constant REBALANCE_SELECTOR =
         bytes4(keccak256("rebalance(bytes32,uint256[],uint256[],address,address)"));
     bytes4 private constant ADJUST_HEDGE_SELECTOR = bytes4(keccak256("adjustHedge()"));
+    bytes4 private constant REPAIR_HF_SELECTOR = bytes4(keccak256("repairHealthFactor()"));
 
     // Events
     event FunctionExecuted(bytes4 indexed selector, uint256 dailyCount);
@@ -128,6 +129,7 @@ contract SecureBotModule {
         // Les règles on-chain sont identiques pour tous : confirmation et cooldown sur le drift ordinaire,
         // contournement uniquement pour le drift critique ou la réparation HF urgente.
         allowedFunctions[ADJUST_HEDGE_SELECTOR] = true;
+        allowedFunctions[REPAIR_HF_SELECTOR] = true;
         // Les appels de solveur hedge (borrow/repay/withdraw/sweeps) ne sont plus des actions bot recurrentes.
         // Ils restent appelables par le Vault/Safe quand le code du Vault en a besoin, pas via ce module.
         // closeAll (0xf6b32008) RETIRÉE (audit V1) : fonction d'URGENCE rare qui envoie TOUT
@@ -201,6 +203,11 @@ contract SecureBotModule {
     modifier onlyBot() {
         require(msg.sender == botAddress, "Only bot allowed");
         require(!paused, "Module paused");
+        _;
+    }
+
+    modifier onlyBotAddress() {
+        require(msg.sender == botAddress, "Only bot allowed");
         _;
     }
 
@@ -279,14 +286,17 @@ contract SecureBotModule {
         emit FunctionExecuted(selector, dailySpent);
     }
 
-    // Fonctions pour AaveHedgeManager (Delta Neutral). Le seul selector autorise est adjustHedge(), qui est
-    // deja permissionless et strictement borne dans AaveHedgeManager (drift/cooldown/HF/oracle/TWAP). Ne pas le
-    // faire consommer par la limite du hot bot: une reparation HF doit rester disponible meme apres une journee
-    // chargee. Le compteur est tout de meme remis au jour pour conserver une vue coherente.
-    function executeHedgeFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
+    // Fonctions pour AaveHedgeManager (Delta Neutral). adjustHedge() est le chemin ordinaire, pausible.
+    // repairHealthFactor() est un selecteur permissionless dedie qui derive l'urgence du HF Aave live:
+    // lui seul contourne la pause. Aucun des deux ne consomme la limite du hot bot.
+    function executeHedgeFunction(bytes calldata data) external onlyBotAddress {
         _resetDailyCounterIfNeeded();
+        require(data.length >= 4, "Invalid data");
         bytes4 selector = bytes4(data[:4]);
-        require(selector == ADJUST_HEDGE_SELECTOR, "Wrong target");
+        require(selector == ADJUST_HEDGE_SELECTOR || selector == REPAIR_HF_SELECTOR, "Wrong target");
+        require(data.length == 4, "Invalid data");
+        require(allowedFunctions[selector], "Function not allowed");
+        if (selector == ADJUST_HEDGE_SELECTOR) require(!paused, "Module paused");
         _execute(hedgeManager, 0, data);
 
         emit FunctionExecuted(selector, dailySpent);
@@ -331,6 +341,7 @@ contract SecureBotModule {
     // Fonctions d'administration (appelées par la Safe)
     function allowFunction(bytes4 selector, bool allowed) external onlyOwner {
         require(_isCoreSelector(selector), "Selector not core");
+        require(selector != REPAIR_HF_SELECTOR || allowed, "HF repair required");
         allowedFunctions[selector] = allowed;
         emit FunctionAllowed(selector, allowed);
     }
@@ -473,7 +484,8 @@ contract SecureBotModule {
         return selector == 0x0be1c372 // refreshPriceCache()
             || selector == CHECKPOINT_SELECTOR || selector == REBALANCE_SELECTOR || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
             || selector == 0x0040718e // endRebalance()
-            || selector == ADJUST_HEDGE_SELECTOR || selector == 0xa5599124 // bridgeToStakers(uint256)
+            || selector == ADJUST_HEDGE_SELECTOR || selector == REPAIR_HF_SELECTOR
+            || selector == 0xa5599124 // bridgeToStakers(uint256)
             || selector == 0x56a12aca; // distributeToStakers(uint256)
     }
 }
