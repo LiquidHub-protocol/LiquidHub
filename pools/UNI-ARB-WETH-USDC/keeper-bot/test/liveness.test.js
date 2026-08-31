@@ -391,6 +391,91 @@ test('chunk count and splitting stay in BigInt arithmetic', () => {
   assert.ok(chunks.every((value) => typeof value === 'bigint'));
 });
 
+test('a high-TVL plan is simulated through the resumable module, never atomic rebalance', async () => {
+  let atomicCalls = 0;
+  let progressiveCalls = 0;
+  const wallet = { connect: () => wallet };
+  const rangeManager = {
+    connect: () => ({
+      rebalance: { staticCall: async () => { atomicCalls += 1; } },
+    }),
+  };
+  const secureBotModule = {
+    connect: () => ({
+      beginProgressiveRebalance: {
+        staticCall: async (decisionHash) => {
+          progressiveCalls += 1;
+          assert.equal(decisionHash, '0x' + '11'.repeat(32));
+        },
+      },
+    }),
+  };
+  const rpcPool = { executeWithRetry: async (fn) => await fn({}) };
+  const rebalancer = new Rebalancer(rangeManager, {}, {}, wallet, rpcPool, secureBotModule);
+
+  await rebalancer._simulateRebalance({
+    chunkCount: 2n,
+    decisionHash: '0x' + '11'.repeat(32),
+  });
+
+  assert.equal(progressiveCalls, 1);
+  assert.equal(atomicCalls, 0);
+});
+
+test('a high-TVL plan does not allocate a stale off-chain chunk array', async () => {
+  const rangeManager = {
+    connect: () => ({
+      initMultiSwapTvl: async () => 10n,
+      config: async () => ({ token0Decimals: 0, token1Decimals: 0, maxSlippageBps: 100 }),
+    }),
+  };
+  const rpcPool = { executeWithRetry: async (fn) => await fn({}) };
+  const rebalancer = new Rebalancer(rangeManager, {}, {}, {}, rpcPool, {});
+  const plan = await rebalancer._buildPlan(
+    true,
+    1_000n,
+    { price0: 100_000_000n, price1: 100_000_000n },
+    false
+  );
+
+  assert.equal(plan.chunkCount, 100n);
+  assert.deepEqual(plan.swapAmounts, []);
+  assert.deepEqual(plan.minOuts, []);
+});
+
+test('progressive rebalance recomputes the remaining plan after every confirmed chunk', async () => {
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {}, {});
+  const methods = [];
+  const remaining = [25n, 15n, 5n];
+  let statusReads = 0;
+  rebalancer.getProgressiveRebalanceStatus = async () => (++statusReads === 1 ? 0 : 2);
+  rebalancer._sendProgressiveTransaction = async (method, args) => {
+    methods.push({ method, amount: BigInt(args[0] || 0n) });
+    return { hash: `0x${methods.length}` };
+  };
+  rebalancer._readProgressivePlan = async () => ({
+    status: 2,
+    plan: { swapNeeded: true, zeroForOne: true, amountIn: remaining.shift() },
+    priceCache: { price0: 100_000_000n, price1: 100_000_000n },
+    cfg: { token0Decimals: 0, token1Decimals: 0, maxSlippageBps: 100 },
+    capUsd: 10n,
+  });
+  rebalancer._progressiveAmountCap = () => 10n;
+  rebalancer._oracleMinOut = (_direction, amount) => amount;
+
+  const result = await rebalancer._runProgressiveRebalance('0x' + '22'.repeat(32));
+
+  assert.deepEqual(methods, [
+    { method: 'beginProgressiveRebalance', amount: BigInt('0x' + '22'.repeat(32)) },
+    { method: 'continueProgressiveRebalance', amount: 10n },
+    { method: 'continueProgressiveRebalance', amount: 10n },
+    { method: 'finalizeProgressiveRebalance', amount: 5n },
+  ]);
+  assert.equal(remaining.length, 0);
+  assert.equal(result.success, true);
+  assert.equal(result.txHashes.length, 4);
+});
+
 test('atomic action gas is buffered but never allowed to reach the block limit', async () => {
   const rebalancer = new Rebalancer({}, {}, {}, {}, {});
   const signer = { address: '0x0000000000000000000000000000000000000011' };

@@ -7,6 +7,7 @@ import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "./RangeOperations.sol";
+import "./interfaces/IRangeStrategyEngine.sol";
 
 // Interface etendue pour RangeManager
 interface IRangeManagerExtended {
@@ -593,6 +594,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // 5. Transfert des fonds au RangeManager. Shares finalisees APRES swaps/addLiquidity (H-01).
         (PendingDeposit memory pd, uint256 depositValue, uint256 valueBefore, uint256 sharesBefore) =
             _processOneDeposit();
+        if (hasPosition) {
+            IRangeStrategyEngine.Decision memory decision =
+                IRangeStrategyEngine(IRangeManagerExtended(address(rangeManager)).strategyEngine()).previewDecision();
+            require(!(decision.dataFresh && decision.action == IRangeStrategyEngine.Action.RANGE_REBALANCE), "E48");
+        }
         rangeManager.validateDepositSwapPlan(pd.amount0, pd.amount1, swapAmountsIn, minAmountsOut, tokenIn, tokenOut);
 
         // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk

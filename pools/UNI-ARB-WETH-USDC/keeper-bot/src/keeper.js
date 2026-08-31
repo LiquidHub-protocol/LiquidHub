@@ -155,6 +155,7 @@ async function main() {
     'RPC_URL',
     'RANGEMANAGER_ADDRESS',
     'RANGE_STRATEGY_ENGINE_ADDRESS',
+    'SAFE_MODULE_ADDRESS',
     'VAULT_ADDRESS',
     'TOKEN0_ADDRESS',
     'TOKEN1_ADDRESS',
@@ -170,9 +171,9 @@ async function main() {
   const rpcPool = new RPCPool();
   await rpcPool.verifyProviderChains();
   const provider = rpcPool.getProvider();
-  const { rangeManager, vault, strategyEngine, pauseController } = createContracts(provider);
-  await assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine });
-  console.log('Keeper topology: RangeManager/Vault/RangeStrategyEngine/tokens verified\n');
+  const { rangeManager, vault, strategyEngine, secureBotModule, pauseController } = createContracts(provider);
+  await assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine, secureBotModule });
+  console.log('Keeper topology: RangeManager/Vault/RangeStrategyEngine/SecureBotModule/tokens verified\n');
 
   const actionAlerts = new PersistentActionAlerts({
     poolName: process.env.POOL_NAME || 'UNI-ARB-WETH-USDC',
@@ -209,7 +210,7 @@ async function main() {
   let wallet, rebalancer;
   if (!CHECK_ONLY) {
     wallet = new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY, provider);
-    rebalancer = new Rebalancer(rangeManager, vault, strategyEngine, wallet, rpcPool);
+    rebalancer = new Rebalancer(rangeManager, vault, strategyEngine, wallet, rpcPool, secureBotModule);
     console.log(`Keeper wallet: ${wallet.address}\n`);
   }
 
@@ -218,6 +219,27 @@ async function main() {
     try {
       await reconcileSignerState(rpcPool, actionAlerts);
       console.log(`[${new Date().toISOString()}] Checking bot instructions...`);
+
+      const progressiveStatus = Number(await readContract(
+        rpcPool, secureBotModule, 'progressiveRebalanceStatus'
+      ));
+      if (progressiveStatus !== 0) {
+        if (CHECK_ONLY) {
+          console.log(`  Progressive rebalance active (state ${progressiveStatus}); an active keeper must resume it.`);
+        } else {
+          const result = await rebalancer.resumeProgressiveRebalanceIfActive();
+          await trackAction(
+            actionAlerts,
+            'success',
+            'rebalance',
+            `Progressive rebalance resumed (${result?.txHashes?.length || 0} transaction(s))`
+          );
+        }
+        await trackAction(actionAlerts, 'success', 'cycle', 'Progressive rebalance handled before ordinary actions');
+        if (CHECK_ONLY) break;
+        await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL_MS));
+        continue;
+      }
 
       await logPriceCacheBeforeDecision(rangeManager, rpcPool);
 

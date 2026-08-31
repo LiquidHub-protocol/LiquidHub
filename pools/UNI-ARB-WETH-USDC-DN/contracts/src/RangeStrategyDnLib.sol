@@ -432,15 +432,7 @@ library RangeStrategyDnLib {
         if (targetShort == 0) return (false, 0, 0);
         uint256 effectiveShort = uint256(context.effectiveShortToken0);
         Projection memory projected = _projectHedgeState(context, risk, targetShort);
-        if (!projected.admissible) {
-            if (
-                projected.hedgeDriftBps >= context.adjustThresholdBps
-                    || !_currentStateSafeWithoutAdjustment(context, risk)
-            ) {
-                return (false, 0, projected.hedgeDriftBps);
-            }
-            projected.debtBase = context.debtBase;
-        }
+        if (!projected.admissible) return (false, 0, projected.hedgeDriftBps);
 
         uint256 turnoverPenalty = _min(_absDiff(targetShort, effectiveShort) * BPS / targetShort / 4, 2000);
         uint256 horizonRateBps =
@@ -840,20 +832,6 @@ library RangeStrategyDnLib {
             position.lower, position.upper, lower, upper, liveTick, position.liquidity
         );
         return candidateToken0 * context.hedgeTargetBps / BPS;
-    }
-
-    function _currentStateSafeWithoutAdjustment(Context memory context, RiskConfig memory risk)
-        private
-        pure
-        returns (bool)
-    {
-        if (context.debtBase == 0) return true;
-        if (context.collateralBase * context.liquidationThresholdBps / context.debtBase < context.reserveHfTargetBps) {
-            return false;
-        }
-        uint256 stressedDebt = context.debtBase * (BPS + risk.tailRiskBps) / BPS;
-        return stressedDebt == 0
-            || context.collateralBase * context.liquidationThresholdBps / stressedDebt >= risk.minStressHfBps;
     }
 
     function _projectHedgeState(Context memory context, RiskConfig memory risk, uint256 targetShort)

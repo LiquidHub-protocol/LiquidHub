@@ -5,7 +5,7 @@ Reference keeper for a Liquid Hub Delta Neutral pool. It reads the pool's immuta
 
 ## Overview
 
-The DN keeper uses the same canonical checkpoint, deposit-processing and atomic rebalance paths as the Exposed
+The DN keeper uses the same canonical checkpoint, deposit-processing and adaptive rebalance paths as the Exposed
 keeper. The `RangeStrategyEngine` also evaluates Aave capacity, borrowing cost, delta drift and stressed health
 factor before authorizing a range. A shallow spot-only range exit requires tactical-TWAP, elapsed-epoch or
 material-depth confirmation, while critical hedge and health-factor safety paths remain independent. The keeper
@@ -16,7 +16,8 @@ At each polling cycle the bot:
 1. Reads the live HF directly from the Aave pool wired into `AaveHedgeManager` and executes the dedicated `repairHealthFactor()` entry point immediately when required. This startup/cycle safety lane runs before the strategy engine, PauseController, ordinary pending actions and fee cap.
 2. Reads `previewDecision()`, `checkpointDue()` and PauseController state only after the HF is safe.
 3. Calls `checkpointMarketState()` when a canonical epoch is due, then rereads the decision.
-4. Executes `HEDGE_ONLY` through `adjustHedge()` or `RANGE_AND_HEDGE` through atomic `rebalance()` as authorized.
+4. Executes `HEDGE_ONLY` through `adjustHedge()`. For `RANGE_AND_HEDGE`, it uses atomic `rebalance()` when one
+   bounded swap is sufficient or resumes the permissionless progressive state for a larger swap.
 5. Processes one queued deposit when inflows are available, a position exists and no maintenance action takes priority.
 
 All steps are independent. Note: processing a deposit **opens the AAVE hedge atomically** in the same transaction (`processDepositPermissionless` → `DnDepositLib.openDepositHedge` + a strict post-check) — the keeper does not touch AAVE directly, and the transaction reverts if the resulting hedge drifts beyond tolerance.
@@ -31,6 +32,16 @@ Each cycle the keeper simulates the exact canonical call before sending: `repair
 
 `checkpointMarketState()`, `rebalance()` and `adjustHedge()` are permissionless. Any address can call them when the
 contracts agree; no keeper allowlist or role is required.
+
+For a high-TVL range action, the existing `SecureBotModule` stores a resumable on-chain cycle. Each continuation
+recomputes the current direction and useful amount, applies the oracle floor, `initMultiSwapTvl` cap and sqrt-price
+impact bound, and rejects partial fills. The final call mints the engine-approved range, synchronizes the Aave hedge,
+checks the resulting hedge, unlocks the vault and pays the finalizer bounty. Any keeper can resume the cycle after a
+restart. The module checks the live Aave HF before begin, every chunk and finalization; while debt exists below
+`hfRepairTriggerBps`, only the permissionless `repairHealthFactor()` safety lane can restore eligibility. The same
+cycle then resumes. Its cumulative oracle-USD swap budget is the initial RangeManager NAV and is decremented after
+every swap, preventing unlimited turnover without imposing a chunk-count ceiling. The Safe can cancel a stuck
+progressive cycle without swapping or transferring principal.
 
 Community keepers may checkpoint from the epoch boundary. Identities configured as protocol-bot callers are
 rejected on-chain during the first 60 seconds for canonical checkpoints and normal eligible rebalances, then act
@@ -47,8 +58,8 @@ chmod 600 .env
 
 ## Environment Variables
 
-All Exposed keeper variables apply, with `STRATEGY_PROFILE=DELTA_NEUTRAL`, including the optional
-`TREASURY_ADDRESS`. The DN keeper adds:
+All Exposed keeper variables apply, with `STRATEGY_PROFILE=DELTA_NEUTRAL`, including the required
+`SAFE_MODULE_ADDRESS` and optional `TREASURY_ADDRESS`. The DN keeper adds:
 
 | Variable | Description | Default |
 |---|---|---|
@@ -73,7 +84,7 @@ Paid in **USDC** by the Treasury to whoever sends the transaction. The DN pool h
 
 | Action | Bounty | Treasury flag / amount |
 |--------|--------|------------------------|
-| `rebalance()` | Keeper bounty | `keeperBountyEnabled` / `keeperBountyAmount()` |
+| `rebalance()` or progressive finalization | Keeper bounty | `keeperBountyEnabled` / `keeperBountyAmount()` |
 | `processDepositPermissionless()` | Deposit bounty | `depositBountyEnabled` / `depositBountyAmount()` |
 | `checkpointMarketState()` | Strategy checkpoint bounty | `strategyCheckpointBountyEnabled` / `strategyCheckpointBountyAmount()` |
 | `adjustHedge()` / `repairHealthFactor()` | Hedge / HF-repair bounty | `hedgeBountyEnabled` / `hedgeBountyAmount()` |

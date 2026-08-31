@@ -11,7 +11,8 @@ The keeper follows this loop:
 2. If an epoch checkpoint is due, calls `checkpointMarketState()` without supplying prices, ticks or forecasts.
 3. Reads the fresh canonical action and reason code.
 4. If a deposit is queued and a position NFT already exists, calls `processDepositPermissionless()`.
-5. Calls `rebalance(decisionHash, ...)` only for `RANGE_REBALANCE`; every other action is an explicit abstention.
+5. Executes the authorized range action atomically when it fits one bounded swap, or resumes the shared progressive
+   rebalance state when the required swap is larger.
 6. Waits for the configured interval and repeats.
 
 The one-time initial mint remains reserved to the protocol bot. Checkpoints, later deposits and accepted rebalances
@@ -19,16 +20,20 @@ are permissionless. A transaction is built only after the contract has returned 
 
 ### Rebalance Flow
 
-When a rebalance is needed, the bot submits a single atomic transaction to `rebalance()` on the RangeManager. The contract performs all steps in one call:
+The execution path is selected from current on-chain values:
 
-1. **Lock vault** — prevents deposits/withdrawals during rebalance
-2. **Burn old position** — removes liquidity and collects accrued fees
-3. **Execute swaps** — rebalances token ratio for the new range. Large swaps are automatically split into N chunks ≤ `initMultiSwapTvl` (read from the contract).
-4. **Mint new position** — creates the exact tick-aligned range validated by the strategy engine
-5. **Unlock vault** — re-enables deposits/withdrawals
-6. **Pay keeper bounty** — if bounty is enabled, USDC is sent to the keeper
+- If the canonical swap is at most `initMultiSwapTvl`, `RangeManager.rebalance()` locks the vault, burns, performs
+  at most one bounded swap, mints and unlocks atomically.
+- Above that cap, `SecureBotModule.beginProgressiveRebalance()` locks the vault and burns once. Permissionless
+  continuation calls then recompute the live canonical plan before every bounded swap. The final call recomputes
+  the exact remainder, mints the engine-approved range, unlocks the vault and pays the finalizer bounty.
 
-Everything happens atomically: if any step fails, the whole transaction reverts and no partial state is left on-chain.
+The progressive state is stored on-chain, so any keeper can resume it after a restart or RPC failure. A keeper cannot
+reuse a stale multi-transaction plan: direction, useful amount, oracle floor, USD cap and sqrt-price impact are checked
+again for every chunk, and partial fills revert. The module also values the initial RangeManager NAV through its
+oracles and decrements that cumulative USD budget after every swap, so an unrestricted chunk count cannot rotate
+more than the initial LP capital. The Safe can cancel a stuck progressive cycle without swapping or transferring
+principal; the assets remain idle in the RangeManager and withdrawals can use those idle balances.
 
 ### Adaptive range intelligence (100% on-chain)
 
@@ -65,8 +70,9 @@ A user's `deposit()` is permissionless and queues the funds. Converting a queued
 
 ### Permissionless
 
-`checkpointMarketState()`, `rebalance()` and post-mint `processDepositPermissionless()` are permissionless. Any
-address can call them when the contracts agree; no keeper allowlist or role is required.
+`checkpointMarketState()`, `rebalance()`, the progressive rebalance functions and post-mint
+`processDepositPermissionless()` are permissionless. Any address can call them when the contracts agree; no keeper
+allowlist or role is required.
 
 ## Setup
 
@@ -98,6 +104,7 @@ Edit `.env` with the following variables:
 | `KEEPER_STATE_DIR` | No | Shared local signer-state directory. Defaults to `~/.liquidhub-keeper-state`. |
 | `KEEPER_PENDING_TX_FILE` | No | Deprecated migration source for an older custom journal. New transactions always use the canonical `chainId + signer` journal under `KEEPER_STATE_DIR`. |
 | `RANGEMANAGER_ADDRESS` | Yes | RangeManager contract address |
+| `SAFE_MODULE_ADDRESS` | Yes | Pool SecureBotModule address used as the permissionless shared state for high-TVL rebalances |
 | `RANGE_STRATEGY_ENGINE_ADDRESS` | Yes | RangeStrategyEngine address for this Liquid Hub pool |
 | `VAULT_ADDRESS` | Yes | MultiUserVault contract address |
 | `STRATEGY_PROFILE` | Yes | `EXPOSED` or `STABLE`; checked against the engine's immutable profile |
@@ -108,7 +115,9 @@ Edit `.env` with the following variables:
 | `TOKEN1_DECIMALS` | No | Token1 decimals (default: 6) |
 | `CHECK_INTERVAL_MIN` | No | Check interval in minutes (default: 1; must be greater than 0) |
 
-The swap-chunk ceiling is not a keeper setting: the keeper reads `initMultiSwapTvl()` directly from the deployed RangeManager before building each atomic plan.
+The per-swap ceiling is not a keeper setting: the keeper reads `initMultiSwapTvl()` directly from the deployed
+RangeManager. Above it, the keeper switches to the resumable progressive path and rereads the on-chain plan after
+every confirmed transaction.
 
 ### RPC Trust Model
 
@@ -143,7 +152,7 @@ Bounties are paid in **USDC** by the Treasury to whoever sends the transaction (
 
 | Action | Bounty | Treasury flag / amount |
 |--------|--------|------------------------|
-| `rebalance()` | Keeper bounty | `keeperBountyEnabled` / `keeperBountyAmount()` |
+| `rebalance()` or progressive finalization | Keeper bounty | `keeperBountyEnabled` / `keeperBountyAmount()` |
 | `processDepositPermissionless()` | Deposit bounty | `depositBountyEnabled` / `depositBountyAmount()` |
 | `checkpointMarketState()` | Strategy checkpoint bounty | `strategyCheckpointBountyEnabled` / `strategyCheckpointBountyAmount()` |
 
@@ -154,14 +163,15 @@ The bot displays the bounty amounts and the Treasury USDC balance on startup.
 ## Requirements
 
 - **Node.js 18+**
-- **Funded wallet** — The keeper wallet needs ETH on Arbitrum for gas fees. Each rebalance is a single atomic transaction (the contract performs burn + swaps + mint internally).
-- **No permission required** — `rebalance()` is public; any address can call it when a rebalance is needed.
+- **Funded wallet** — The keeper wallet needs ETH on Arbitrum for gas fees. A high-TVL rebalance may require several
+  bounded transactions, and another keeper may resume or finalize the same on-chain cycle.
+- **No permission required** — Atomic and progressive rebalance paths are public and execute only when the contracts authorize them.
 
 ## Security
 
 The keeper bot is fully permissionless and operates with no special privileges:
 
-- `rebalance()` and `checkpointMarketState()` are public functions, but both revert unless the canonical strategy state authorizes the transition.
+- Atomic/progressive rebalance and checkpoint functions revert unless the canonical strategy state authorizes the transition.
 - The keeper **cannot** access, transfer, or withdraw user funds
 - The keeper **cannot** provide ticks, scores, forecasts, prices or strategy weights.
 - Governance can only modify bounded strategy settings; it cannot submit an arbitrary range through the keeper path.
@@ -174,7 +184,7 @@ The keeper bot is fully permissionless and operates with no special privileges:
 keeper-bot/
   src/
     keeper.js          # Main entry point and check loop
-    rebalancer.js      # Atomic rebalance and queued-deposit execution logic
+    rebalancer.js      # Atomic/progressive rebalance and queued-deposit execution logic
     utils/
       contracts.js     # Contract ABIs and factory
       rpc.js           # RPC provider pool with failover

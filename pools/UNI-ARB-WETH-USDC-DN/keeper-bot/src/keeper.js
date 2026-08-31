@@ -369,6 +369,7 @@ async function main() {
   const required = [
     'RANGEMANAGER_ADDRESS',
     'RANGE_STRATEGY_ENGINE_ADDRESS',
+    'SAFE_MODULE_ADDRESS',
     'VAULT_ADDRESS',
     'TOKEN0_ADDRESS',
     'TOKEN1_ADDRESS',
@@ -379,9 +380,9 @@ async function main() {
       process.exit(1);
     }
   }
-  const { rangeManager, vault, strategyEngine, hedgeManager, pauseController } = createContracts(provider);
-  await assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine, hedgeManager });
-  console.log('Keeper topology: RangeManager/Vault/RangeStrategyEngine/AaveHedgeManager/tokens verified\n');
+  const { rangeManager, vault, strategyEngine, secureBotModule, hedgeManager, pauseController } = createContracts(provider);
+  await assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine, secureBotModule, hedgeManager });
+  console.log('Keeper topology: RangeManager/Vault/RangeStrategyEngine/SecureBotModule/AaveHedgeManager/tokens verified\n');
 
   const actionAlerts = new PersistentActionAlerts({
     poolName: process.env.POOL_NAME || 'UNI-ARB-WETH-USDC-DN',
@@ -420,7 +421,16 @@ async function main() {
 
   let rebalancer;
   if (!CHECK_ONLY) {
-    rebalancer = new Rebalancer(rangeManager, vault, strategyEngine, hedgeManager, wallet, rpcPool);
+    rebalancer = new Rebalancer(
+      rangeManager,
+      vault,
+      strategyEngine,
+      hedgeManager,
+      wallet,
+      rpcPool,
+      secureBotModule,
+      async () => runHfSafetyLane({ rpcPool, hedgeManager, wallet, actionAlerts })
+    );
     console.log(`Keeper wallet: ${wallet.address}\n`);
   }
 
@@ -433,6 +443,27 @@ async function main() {
       await runHfSafetyLane({ rpcPool, hedgeManager, wallet, actionAlerts });
 
       await reconcileSignerState(rpcPool, actionAlerts);
+
+      const progressiveStatus = Number(await readContract(
+        rpcPool, secureBotModule, 'progressiveRebalanceStatus'
+      ));
+      if (progressiveStatus !== 0) {
+        if (CHECK_ONLY) {
+          console.log(`  Progressive DN rebalance active (state ${progressiveStatus}); an active keeper must resume it.`);
+        } else {
+          const result = await rebalancer.resumeProgressiveRebalanceIfActive();
+          await trackAction(
+            actionAlerts,
+            'success',
+            'rebalance',
+            `Progressive DN rebalance resumed (${result?.txHashes?.length || 0} transaction(s))`
+          );
+        }
+        await trackAction(actionAlerts, 'success', 'cycle', 'Progressive DN rebalance handled after HF safety');
+        if (CHECK_ONLY) break;
+        await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL_MS));
+        continue;
+      }
 
       await logPriceCacheBeforeDecision(rangeManager, rpcPool);
 

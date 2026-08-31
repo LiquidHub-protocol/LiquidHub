@@ -22,7 +22,39 @@ interface IRangeManagerPostCheck {
     function priceCache() external view returns (uint128, uint128, uint160, int24, uint64, bool);
     function config() external view returns (RangeOperations.RangeConfig memory);
     function getOwnerPositions() external view returns (uint256[] memory);
+    function getCurrentBalances() external view returns (uint256 balance0, uint256 balance1);
+    function getOptimalSwapParams() external view returns (RangeOperations.OptimalSwapParams memory);
+    function initMultiSwapTvl() external view returns (uint256);
     function positionManager() external view returns (INonfungiblePositionManager);
+    function refreshPriceCache() external;
+    function executeSwap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut)
+        external
+        returns (uint256 amountOut);
+}
+
+interface IProgressiveRangeManager {
+    function progressiveRebalance(
+        uint8 step,
+        bytes32 expectedDecisionHash,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address keeper
+    ) external returns (int24 lower, int24 upper);
+}
+
+interface IProgressiveVault {
+    function endRebalance() external;
+    function isRebalancing() external view returns (bool);
+}
+
+interface IProgressiveHedgeGuard {
+    function hfRepairTriggerBps() external view returns (uint16);
+    function getHedgeData()
+        external
+        view
+        returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase);
 }
 
 contract SecureBotModule {
@@ -44,6 +76,11 @@ contract SecureBotModule {
     uint256 public lastResetDay;
     bool public paused;
     bool public directExecution;
+    uint8 public progressiveRebalanceStatus;
+    int24 public progressiveTickLower;
+    int24 public progressiveTickUpper;
+    bytes32 public progressiveDecisionHash;
+    uint256 public progressiveSwapBudgetUsdE8;
 
     // endRebalance() est exempte de la limite quotidienne: ce deverrouillage ne deplace aucun fonds.
     // Mints, depots, rebalances et ajustements hedge utilisent leurs entrees atomiques; l'ancien automate
@@ -65,6 +102,10 @@ contract SecureBotModule {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event ModuleSweep(address indexed token, uint256 amount);
+    event ProgressiveRebalanceStarted(bytes32 indexed decisionHash, int24 tickLower, int24 tickUpper, address keeper);
+    event ProgressiveRebalanceChunk(uint256 amountIn, uint256 amountOut, address keeper);
+    event ProgressiveRebalanceFinalized(bytes32 indexed decisionHash, address keeper);
+    event ProgressiveRebalanceCancelled(bytes32 indexed decisionHash, address safe);
 
     constructor(
         address _safe,
@@ -141,6 +182,128 @@ contract SecureBotModule {
     }
 
     receive() external payable {}
+
+    /// @notice Permissionless high-TVL path, independent from the hot-bot pause and fully bounded on-chain.
+    function beginProgressiveRebalance(bytes32 expectedDecisionHash) external {
+        require(progressiveRebalanceStatus == 0, "Progressive active");
+        _requireProgressiveHfSafe();
+        progressiveRebalanceStatus = 1;
+        IRangeManagerPostCheck(rangeManager).refreshPriceCache();
+        progressiveSwapBudgetUsdE8 = _requireProgressivePlan();
+        (int24 lower, int24 upper) =
+            IProgressiveRangeManager(rangeManager).progressiveRebalance(0, expectedDecisionHash, 0, 0, 0, 0, msg.sender);
+        progressiveTickLower = lower;
+        progressiveTickUpper = upper;
+        progressiveDecisionHash = expectedDecisionHash;
+        progressiveRebalanceStatus = 2;
+        emit ProgressiveRebalanceStarted(expectedDecisionHash, lower, upper, msg.sender);
+    }
+
+    function _requireProgressivePlan() private view returns (uint256 budgetUsdE8) {
+        IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
+        RangeOperations.OptimalSwapParams memory plan = rm.getOptimalSwapParams();
+        (uint128 price0, uint128 price1,,,, bool valid) = rm.priceCache();
+        require(valid && price0 > 0 && price1 > 0, "Invalid price");
+        RangeOperations.RangeConfig memory cfg = rm.config();
+        uint256 price = plan.zeroForOne ? price0 : price1;
+        uint256 decimals = plan.zeroForOne ? cfg.token0Decimals : cfg.token1Decimals;
+        uint256 amountUsd = Math.mulDiv(plan.amountIn, price, 10 ** decimals);
+        require(plan.swapNeeded && amountUsd > rm.initMultiSwapTvl() * 1e8, "Use atomic");
+        budgetUsdE8 = Math.mulDiv(plan.currentBalance0, price0, 10 ** cfg.token0Decimals)
+            + Math.mulDiv(plan.currentBalance1, price1, 10 ** cfg.token1Decimals);
+        require(budgetUsdE8 > 0, "Invalid budget");
+    }
+
+    function continueProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
+        require(progressiveRebalanceStatus == 2 && IProgressiveVault(vault).isRebalancing(), "No progressive");
+        _requireProgressiveHfSafe();
+        progressiveRebalanceStatus = 3;
+        IRangeManagerPostCheck(rangeManager).refreshPriceCache();
+        RangeOperations.OptimalSwapParams memory plan = _progressiveSwapParams();
+        require(plan.swapNeeded && amountIn > 0 && amountIn <= plan.amountIn, "Invalid chunk");
+        _consumeProgressiveSwapBudget(plan.zeroForOne, amountIn);
+        IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
+        address tokenIn = plan.zeroForOne ? rm.token0() : rm.token1();
+        address tokenOut = plan.zeroForOne ? rm.token1() : rm.token0();
+        uint256 amountOut = rm.executeSwap(tokenIn, tokenOut, amountIn, minAmountOut);
+        progressiveRebalanceStatus = 2;
+        emit ProgressiveRebalanceChunk(amountIn, amountOut, msg.sender);
+    }
+
+    function getProgressiveSwapParams() external view returns (RangeOperations.OptimalSwapParams memory) {
+        require(progressiveRebalanceStatus == 2, "No progressive");
+        return _progressiveSwapParams();
+    }
+
+    function _progressiveSwapParams() private view returns (RangeOperations.OptimalSwapParams memory) {
+        IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
+        (uint128 p0, uint128 p1, uint160 sqrtP, int24 tick, uint64 timestamp, bool valid) = rm.priceCache();
+        require(valid, "Invalid price");
+        (uint256 balance0, uint256 balance1) = rm.getCurrentBalances();
+        return RangeOperations.calculateOptimalSwapParams(
+            balance0,
+            balance1,
+            RangeOperations.PriceCache(p0, p1, sqrtP, tick, timestamp, valid),
+            rm.config(),
+            progressiveTickLower,
+            progressiveTickUpper
+        );
+    }
+
+    function finalizeProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
+        require(progressiveRebalanceStatus == 2 && IProgressiveVault(vault).isRebalancing(), "No progressive");
+        _requireProgressiveHfSafe();
+        progressiveRebalanceStatus = 3;
+        if (amountIn > 0) {
+            IRangeManagerPostCheck(rangeManager).refreshPriceCache();
+            RangeOperations.OptimalSwapParams memory plan = _progressiveSwapParams();
+            require(plan.swapNeeded && amountIn <= plan.amountIn, "Invalid chunk");
+            _consumeProgressiveSwapBudget(plan.zeroForOne, amountIn);
+        }
+        bytes32 decisionHash = progressiveDecisionHash;
+        IProgressiveRangeManager(rangeManager).progressiveRebalance(
+            2, bytes32(0), progressiveTickLower, progressiveTickUpper, amountIn, minAmountOut, msg.sender
+        );
+        delete progressiveTickLower;
+        delete progressiveTickUpper;
+        delete progressiveDecisionHash;
+        delete progressiveSwapBudgetUsdE8;
+        progressiveRebalanceStatus = 0;
+        emit ProgressiveRebalanceFinalized(decisionHash, msg.sender);
+    }
+
+    function _consumeProgressiveSwapBudget(bool zeroForOne, uint256 amountIn) private {
+        IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
+        (uint128 price0, uint128 price1,,,, bool valid) = rm.priceCache();
+        require(valid, "Invalid price");
+        RangeOperations.RangeConfig memory cfg = rm.config();
+        uint256 amountUsdE8 = Math.mulDiv(
+            amountIn, zeroForOne ? price0 : price1, 10 ** (zeroForOne ? cfg.token0Decimals : cfg.token1Decimals)
+        );
+        require(amountUsdE8 > 0 && amountUsdE8 <= progressiveSwapBudgetUsdE8, "Cycle budget");
+        progressiveSwapBudgetUsdE8 -= amountUsdE8;
+    }
+
+    function _requireProgressiveHfSafe() private view {
+        IProgressiveHedgeGuard hedge = IProgressiveHedgeGuard(hedgeManager);
+        (, uint256 debt, uint256 healthFactor,) = hedge.getHedgeData();
+        if (debt == 0) return;
+        require(healthFactor >= uint256(hedge.hfRepairTriggerBps()) * 1e14, "HF repair");
+    }
+
+    /// @notice Emergency-only release; no swap or principal transfer is performed.
+    function cancelProgressiveRebalance() external {
+        require(msg.sender == safe && progressiveRebalanceStatus != 0, "Only Safe");
+        bytes32 decisionHash = progressiveDecisionHash;
+        progressiveRebalanceStatus = 3;
+        if (IProgressiveVault(vault).isRebalancing()) IProgressiveVault(vault).endRebalance();
+        delete progressiveTickLower;
+        delete progressiveTickUpper;
+        delete progressiveDecisionHash;
+        delete progressiveSwapBudgetUsdE8;
+        progressiveRebalanceStatus = 0;
+        emit ProgressiveRebalanceCancelled(decisionHash, msg.sender);
+    }
 
     /// @notice LP/free RangeManager NAV reconstructed at the Chainlink token ratio (USD, 8 decimals).
     /// @dev Read-only and unaffected by the module kill-switch. The valuation sqrt is derived exclusively

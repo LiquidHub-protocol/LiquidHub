@@ -33,17 +33,28 @@ function divideIntoChunks(totalAmount, numChunks) {
 }
 
 class Rebalancer {
-  constructor(rangeManager, vault, strategyEngine, hedgeManager, wallet, rpcPool) {
+  constructor(
+    rangeManager,
+    vault,
+    strategyEngine,
+    hedgeManager,
+    wallet,
+    rpcPool,
+    secureBotModule = null,
+    beforeProgressiveStep = null
+  ) {
     this.rangeManager = rangeManager;
     this.vault = vault;
     this.strategyEngine = strategyEngine;
     this.hedgeManager = hedgeManager;
     this.wallet = wallet;
     this.rpcPool = rpcPool;
+    this.secureBotModule = secureBotModule;
+    this.beforeProgressiveStep = typeof beforeProgressiveStep === 'function' ? beforeProgressiveStep : null;
   }
 
   async executeRebalance(tokenId, expectedDecisionHash) {
-    console.log(`\n=== Starting atomic rebalance for position #${tokenId} ===`);
+    console.log(`\n=== Starting adaptive DN rebalance for position #${tokenId} ===`);
 
     try {
       let plan = null;
@@ -89,7 +100,12 @@ class Rebalancer {
       }
 
       this._logPlan(plan);
-      console.log('  Executing rebalance() on-chain...');
+      if (plan.chunkCount > 1n) {
+        console.log('  High-TVL DN plan: switching to the resumable on-chain rebalance path...');
+        return await this._runProgressiveRebalance(plan.decisionHash);
+      }
+
+      console.log('  Executing atomic rebalance() on-chain...');
       const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
         const signer = this.wallet.connect(provider);
         const rm = this.rangeManager.connect(signer);
@@ -259,6 +275,14 @@ class Rebalancer {
 
     plan.tokenIn = zeroForOne ? process.env.TOKEN0_ADDRESS : process.env.TOKEN1_ADDRESS;
     plan.tokenOut = zeroForOne ? process.env.TOKEN1_ADDRESS : process.env.TOKEN0_ADDRESS;
+    // A high-TVL rebalance is recomputed after every confirmed transaction. Do not allocate
+    // a potentially huge, stale off-chain chunk array that will never be submitted atomically.
+    if (!enforceDepositCap && chunkCount > 1n) {
+      plan.amountUsd8 = amountUsd8;
+      plan.chunkCount = chunkCount;
+      plan.capUsd = BigInt(initMultiSwapTvl);
+      return plan;
+    }
     plan.swapAmounts = divideIntoChunks(amountIn, chunkCount);
     plan.minOuts = plan.swapAmounts.map((amount) =>
       this._oracleMinOut(zeroForOne, amount, priceCache, dec0, dec1, Number(cfg.maxSlippageBps))
@@ -271,6 +295,10 @@ class Rebalancer {
 
   async _simulateRebalance(plan) {
     await this.rpcPool.executeWithRetry(async (provider) => {
+      if (plan.chunkCount > 1n) {
+        const module = this._requireProgressiveModule().connect(this.wallet.connect(provider));
+        return await module.beginProgressiveRebalance.staticCall(plan.decisionHash);
+      }
       const rm = this.rangeManager.connect(this.wallet.connect(provider));
       return await rm.rebalance.staticCall(
         plan.decisionHash,
@@ -280,6 +308,149 @@ class Rebalancer {
         plan.tokenOut
       );
     });
+  }
+
+  _requireProgressiveModule() {
+    if (!this.secureBotModule) {
+      throw new Error('SAFE_MODULE_ADDRESS is required for high-TVL DN rebalances');
+    }
+    return this.secureBotModule;
+  }
+
+  async getProgressiveRebalanceStatus() {
+    return Number(await this.rpcPool.executeWithRetry(async (provider) => {
+      return await this._requireProgressiveModule().connect(provider).progressiveRebalanceStatus();
+    }));
+  }
+
+  async _sendProgressiveTransaction(method, args, label) {
+    return await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
+      const signer = this.wallet.connect(provider);
+      const module = this._requireProgressiveModule().connect(signer);
+      const request = await module[method].populateTransaction(...args);
+      return {
+        wallet: signer,
+        request: await this._boundTransactionGas(provider, signer, request, label),
+      };
+    }, label);
+  }
+
+  async _readProgressivePlan() {
+    return await this.rpcPool.executeWithRetry(async (provider) => {
+      const module = this._requireProgressiveModule().connect(provider);
+      const rm = this.rangeManager.connect(provider);
+      const status = Number(await module.progressiveRebalanceStatus());
+      if (status !== 2) return { status };
+      const [plan, priceCache, cfg, capUsd] = await Promise.all([
+        module.getProgressiveSwapParams(),
+        rm.priceCache(),
+        rm.config(),
+        rm.initMultiSwapTvl(),
+      ]);
+      return { status, plan, priceCache, cfg, capUsd };
+    });
+  }
+
+  _progressiveAmountCap(plan, priceCache, cfg, capUsd) {
+    const tokenInIsToken0 = Boolean(plan.zeroForOne);
+    const priceIn = BigInt(tokenInIsToken0 ? priceCache.price0 : priceCache.price1);
+    const decimals = Number(tokenInIsToken0 ? cfg.token0Decimals : cfg.token1Decimals);
+    if (priceIn <= 0n || BigInt(capUsd) <= 0n) throw new Error('invalid on-chain progressive cap or price');
+    const capRaw = (BigInt(capUsd) * USD_SCALE * (10n ** BigInt(decimals))) / priceIn;
+    return capRaw > 0n ? capRaw : 1n;
+  }
+
+  async _runProgressiveRebalance(expectedDecisionHash = null) {
+    const txHashes = [];
+    let status = await this.getProgressiveRebalanceStatus();
+
+    if (status === 0) {
+      if (this.beforeProgressiveStep) await this.beforeProgressiveStep();
+      if (!expectedDecisionHash) throw new Error('canonical decision hash required to start progressive DN rebalance');
+      const receipt = await this._sendProgressiveTransaction(
+        'beginProgressiveRebalance', [expectedDecisionHash], 'beginProgressiveRebalance'
+      );
+      txHashes.push(receipt.hash);
+      status = await this.getProgressiveRebalanceStatus();
+    }
+    if (status !== 2) throw new Error(`unexpected progressive DN rebalance state: ${status}`);
+
+    let staleRetries = 0;
+    while (true) {
+      if (this.beforeProgressiveStep) await this.beforeProgressiveStep();
+      const state = await this._readProgressivePlan();
+      if (state.status === 0) break;
+      if (state.status !== 2) throw new Error(`non-executable progressive DN rebalance state: ${state.status}`);
+
+      const swapNeeded = Boolean(state.plan.swapNeeded);
+      const planAmount = BigInt(state.plan.amountIn);
+      const tokenInIsToken0 = Boolean(state.plan.zeroForOne);
+      if (!swapNeeded || planAmount === 0n) {
+        const receipt = await this._sendProgressiveTransaction(
+          'finalizeProgressiveRebalance', [0n, 0n], 'finalizeProgressiveRebalance'
+        );
+        txHashes.push(receipt.hash);
+        break;
+      }
+
+      const capRaw = this._progressiveAmountCap(state.plan, state.priceCache, state.cfg, state.capUsd);
+      let amountIn = planAmount < capRaw ? planAmount : capRaw;
+      let finalize = planAmount <= capRaw;
+      let receipt = null;
+      let refreshRequested = false;
+
+      for (let shrink = 0; shrink < 256 && amountIn > 0n; shrink++) {
+        const minOut = this._oracleMinOut(
+          tokenInIsToken0,
+          amountIn,
+          state.priceCache,
+          Number(state.cfg.token0Decimals),
+          Number(state.cfg.token1Decimals),
+          Number(state.cfg.maxSlippageBps)
+        );
+        const method = finalize ? 'finalizeProgressiveRebalance' : 'continueProgressiveRebalance';
+        try {
+          receipt = await this._sendProgressiveTransaction(method, [amountIn, minOut], method);
+          break;
+        } catch (error) {
+          const text = this._errorText(error).toLowerCase();
+          if (text.includes('hf repair') && this.beforeProgressiveStep) {
+            await this.beforeProgressiveStep();
+            refreshRequested = true;
+            break;
+          }
+          if (['partialfill', 'partial fill', 'sqrt', 'price limit', 'spl'].some((marker) => text.includes(marker)) && amountIn > 1n) {
+            amountIn /= 2n;
+            finalize = false;
+            console.log(`  Price-impact bound reached; retrying a smaller DN chunk (${amountIn})`);
+            continue;
+          }
+          if (this._shouldRefreshForPlanError(error) && staleRetries < 2) {
+            staleRetries += 1;
+            await this._refreshPriceCacheForAction('progressive DN rebalance retry');
+            refreshRequested = true;
+            break;
+          }
+          throw error;
+        }
+      }
+
+      if (!receipt) {
+        if (refreshRequested) continue;
+        throw new Error('unable to produce an executable progressive DN chunk');
+      }
+      staleRetries = 0;
+      txHashes.push(receipt.hash);
+      if (finalize) break;
+    }
+
+    return { success: true, progressive: true, txHashes };
+  }
+
+  async resumeProgressiveRebalanceIfActive() {
+    if (await this.getProgressiveRebalanceStatus() === 0) return null;
+    console.log('  Active progressive DN rebalance detected; resuming it before ordinary actions.');
+    return await this._runProgressiveRebalance();
   }
 
   async _simulateDeposit(plan) {

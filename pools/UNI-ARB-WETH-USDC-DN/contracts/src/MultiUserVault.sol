@@ -8,6 +8,7 @@ import "openzeppelin-contracts/contracts/access/Ownable.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "./RangeOperations.sol";
 import "./DnDepositLib.sol"; // EIP-170 : orchestration hedge au dépôt déportée (delegatecall)
+import "./interfaces/IRangeStrategyEngine.sol";
 
 // Interface etendue pour RangeManager
 interface IRangeManagerExtended {
@@ -616,6 +617,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (!hasPosition && msg.sender != botModule && msg.sender != owner()) revert E03();
         // 3. Refresh oracle atomique avant toute valorisation du depot permissionless.
         rangeManager.refreshPriceCache();
+        if (hasPosition) {
+            IRangeStrategyEngine.Decision memory decision =
+                IRangeStrategyEngine(IRangeManagerExtended(address(rangeManager)).strategyEngine()).previewDecision();
+            if (decision.dataFresh && decision.action == IRangeStrategyEngine.Action.RANGE_AND_HEDGE) revert E72();
+        }
         // Le checkpoint strategique suit sa propre epoch permissionless. Le traitement d'un depot ne peut donc
         // jamais cumuler artificiellement les bounties de depot et de checkpoint.
         RangeOperations.RangeConfig memory cfg = rangeManager.config();

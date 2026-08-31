@@ -710,11 +710,6 @@ contract AaveHedgeManager is ReentrancyGuard {
                 && driftBps < uint256(criticalHedgeBps)
         ) revert HedgeCheck(41);
         if (enforceThresholds && driftBps < uint256(adjustHedgeBps)) revert HedgeCheck(44);
-        if (!enforceThresholds && driftBps < uint256(adjustHedgeBps)) {
-            _requireHfMin();
-            emit HedgeAdjustmentSkipped(currentDebtWeth, targetShort, driftBps);
-            return;
-        }
         bool bountyEligible =
             DnDepositLib.rawDebtDriftExceeds(currentDebtWeth, targetShort, adjustHedgeBps, donationDustToken0);
 

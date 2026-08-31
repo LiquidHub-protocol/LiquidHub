@@ -114,6 +114,17 @@ const PAUSE_CONTROLLER_ABI = [
   "function withdrawalsPaused() external view returns (bool)"
 ];
 
+const SECURE_BOT_MODULE_ABI = [
+  "function rangeManager() external view returns (address)",
+  "function strategyEngine() external view returns (address)",
+  "function vault() external view returns (address)",
+  "function progressiveRebalanceStatus() external view returns (uint8)",
+  "function beginProgressiveRebalance(bytes32 expectedDecisionHash) external",
+  "function continueProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external",
+  "function finalizeProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external",
+  "function getProgressiveSwapParams() external view returns (tuple(bool swapNeeded, bool zeroForOne, uint256 amountIn, uint256 currentBalance0, uint256 currentBalance1, uint256 targetRatio0Bps, int24 tickLower, int24 tickUpper))"
+];
+
 function createContracts(provider) {
   const rangeManager = new ethers.Contract(
     process.env.RANGEMANAGER_ADDRESS,
@@ -130,6 +141,11 @@ function createContracts(provider) {
     RANGE_STRATEGY_ENGINE_ABI,
     provider
   );
+  const secureBotModule = new ethers.Contract(
+    process.env.SAFE_MODULE_ADDRESS,
+    SECURE_BOT_MODULE_ABI,
+    provider
+  );
   let pauseController = null;
   if (process.env.PAUSE_CONTROLLER_ADDRESS) {
     pauseController = new ethers.Contract(
@@ -138,14 +154,14 @@ function createContracts(provider) {
       provider
     );
   }
-  return { rangeManager, vault, strategyEngine, pauseController };
+  return { rangeManager, vault, strategyEngine, secureBotModule, pauseController };
 }
 
 function sameAddress(actual, expected) {
   return ethers.getAddress(actual) === ethers.getAddress(expected);
 }
 
-async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine }) {
+async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine, secureBotModule }) {
   const configuredProfile = String(process.env.STRATEGY_PROFILE || '').trim().toUpperCase();
   const expectedProfile = configuredProfile === 'EXPOSED' ? 0 : configuredProfile === 'STABLE' ? 2 : null;
   if (expectedProfile === null) {
@@ -157,17 +173,20 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
     token0: process.env.TOKEN0_ADDRESS,
     token1: process.env.TOKEN1_ADDRESS,
     strategyEngine: process.env.RANGE_STRATEGY_ENGINE_ADDRESS,
+    secureBotModule: process.env.SAFE_MODULE_ADDRESS,
   };
 
   const topology = await rpcPool.executeWithRetry(async (provider) => {
     const rm = rangeManager.connect(provider);
     const v = vault.connect(provider);
     const engine = strategyEngine.connect(provider);
-    const [rmCode, vaultCode, engineCode, rmVault, rmToken0, rmToken1, rmEngine, vaultRm, vaultToken0, vaultToken1,
-      engineRm, enginePool, rmPool, engineProfile, engineMode, engineVersion] = await Promise.all([
+    const module = secureBotModule.connect(provider);
+    const [rmCode, vaultCode, engineCode, moduleCode, rmVault, rmToken0, rmToken1, rmEngine, vaultRm, vaultToken0, vaultToken1,
+      engineRm, enginePool, rmPool, moduleRm, moduleVault, moduleEngine, engineProfile, engineMode, engineVersion] = await Promise.all([
       provider.getCode(expected.rangeManager),
       provider.getCode(expected.vault),
       provider.getCode(expected.strategyEngine),
+      provider.getCode(expected.secureBotModule),
       rm.vault(),
       rm.token0(),
       rm.token1(),
@@ -178,24 +197,31 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
       engine.rangeManager(),
       engine.pool(),
       rm.pool(),
+      module.rangeManager(),
+      module.vault(),
+      module.strategyEngine(),
       engine.profile(),
       engine.decisionMode(),
       engine.strategyVersion(),
     ]);
     return {
-      rmCode, vaultCode, engineCode, rmVault, rmToken0, rmToken1, rmEngine, vaultRm, vaultToken0,
-      vaultToken1, engineRm, enginePool, rmPool, engineProfile, engineMode, engineVersion,
+      rmCode, vaultCode, engineCode, moduleCode, rmVault, rmToken0, rmToken1, rmEngine, vaultRm, vaultToken0,
+      vaultToken1, engineRm, enginePool, rmPool, moduleRm, moduleVault, moduleEngine, engineProfile, engineMode, engineVersion,
     };
   });
 
   if (topology.rmCode === '0x') throw new Error('Keeper topology: RangeManager has no runtime code');
   if (topology.vaultCode === '0x') throw new Error('Keeper topology: Vault has no runtime code');
   if (topology.engineCode === '0x') throw new Error('Keeper topology: RangeStrategyEngine has no runtime code');
+  if (topology.moduleCode === '0x') throw new Error('Keeper topology: SecureBotModule has no runtime code');
   if (!sameAddress(topology.rmVault, expected.vault)) throw new Error('Keeper topology: RangeManager.vault mismatch');
   if (!sameAddress(topology.vaultRm, expected.rangeManager)) throw new Error('Keeper topology: Vault.rangeManager mismatch');
   if (!sameAddress(topology.rmEngine, expected.strategyEngine)) throw new Error('Keeper topology: RangeManager.strategyEngine mismatch');
   if (!sameAddress(topology.engineRm, expected.rangeManager)) throw new Error('Keeper topology: engine.rangeManager mismatch');
   if (!sameAddress(topology.enginePool, topology.rmPool)) throw new Error('Keeper topology: engine.pool mismatch');
+  if (!sameAddress(topology.moduleRm, expected.rangeManager)) throw new Error('Keeper topology: module.rangeManager mismatch');
+  if (!sameAddress(topology.moduleVault, expected.vault)) throw new Error('Keeper topology: module.vault mismatch');
+  if (!sameAddress(topology.moduleEngine, expected.strategyEngine)) throw new Error('Keeper topology: module.strategyEngine mismatch');
   if (Number(topology.engineProfile) !== expectedProfile) {
     throw new Error(`Keeper topology: engine profile does not match STRATEGY_PROFILE=${configuredProfile}`);
   }
@@ -223,6 +249,7 @@ module.exports = {
   TREASURY_ABI,
   ERC20_ABI,
   PAUSE_CONTROLLER_ABI,
+  SECURE_BOT_MODULE_ABI,
   createContracts,
   assertKeeperTopology,
 };

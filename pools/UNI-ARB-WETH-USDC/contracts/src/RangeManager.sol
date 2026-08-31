@@ -26,6 +26,7 @@ interface IMultiUserVault {
     function maxDepositUsd() external view returns (uint256);
     function startRebalance() external;
     function endRebalance() external;
+    function isRebalancing() external view returns (bool);
 }
 
 /**
@@ -417,10 +418,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
         }
     }
 
-    // rebalancePosition supprimee - le rebalance se fait maintenant via:
-    // 1. burnPosition() - collecte fees + retire liquidite
-    // 2. executeSwap() x N - swaps via Uniswap V3
-    // 3. mintInitialPosition() - mint nouvelle position
+    // Le chemin recurrent est adaptatif: rebalance() reste atomique sous le cap; le SecureBotModule
+    // orchestre un etat progressif reprenable au-dessus, sans exposer les anciennes jambes manuelles.
 
     /**
      * @notice Internal mint function - callable only via try/catch from this contract
@@ -698,9 +697,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     /// @dev Pays le bounty de rebalance sans jamais bloquer l'action principale.
-    function _payBounty() private {
+    function _payBounty(address keeper) private {
         if (treasuryAddress == address(0)) return;
-        try ITreasury(treasuryAddress).payKeeperBounty(msg.sender) {} catch {}
+        try ITreasury(treasuryAddress).payKeeperBounty(keeper) {} catch {}
     }
 
     function _updatePriceCache() private {
@@ -877,30 +876,45 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // perte par sandwich. Check déviation + plancher oracle (déporté en lib pour le bytecode). Cache
         // rafraîchi avant pour un prix courant (la barrière déviation est intégrée au refresh — V3).
         _refreshAndRequireValid();
-        bool tokenInIsToken0 = tokenIn == token0;
-        RangeOperations.validateSwapAgainstOracle(tokenInIsToken0, amountIn, minAmountOut, priceCache, config);
-        if (initMultiSwapTvl > 0) {
-            uint256 amountUsd = (amountIn * uint256(tokenInIsToken0 ? priceCache.price0 : priceCache.price1))
-                / (10 ** (tokenInIsToken0 ? config.token0Decimals : config.token1Decimals));
-            require(amountUsd <= initMultiSwapTvl * 1e8, "E91");
-        }
-
-        amountOut = RangeOperations.executeSwapCore(
-            tokenIn,
-            tokenOut,
-            amountIn,
-            minAmountOut,
-            config.fee,
-            address(this),
-            swapRouter,
-            _swapSqrtPriceLimit(tokenInIsToken0)
-        );
-        emit SwapExecuted(tokenIn, tokenOut, amountIn, amountOut);
-        return amountOut;
+        return _executeValidatedSwap(tokenIn == token0, amountIn, minAmountOut);
     }
 
-    /// @notice Atomic rebalance: burn → N swaps → mint → pay keeper bounty. Permissionless.
-    /// @dev Each swap chunk must be ≤ initMultiSwapTvl in USD. Pass empty arrays if no swap needed.
+    /// @notice One state-machine step for a resumable high-TVL rebalance.
+    /// @dev step 0 validates and burns; step 2 validates the final remainder, remints and unlocks.
+    function progressiveRebalance(
+        uint8 step,
+        bytes32 expectedDecisionHash,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address keeper
+    ) external onlyAuthorized nonReentrant returns (int24 lower, int24 upper) {
+        _refreshAndRequireValid();
+        if (step == 0) {
+            IRangeStrategyEngine.Decision memory decision = _validatedRebalanceDecision(expectedDecisionHash, keeper);
+            uint256 tokenId = indexToPosition[0];
+            _collectFeesForVault(tokenId);
+            strategyEngine.recordExecution(decision.decisionHash, decision.action, keeper);
+            IMultiUserVault(vault).startRebalance();
+            _burnTrackedPosition(tokenId);
+            return (decision.targetTickLower, decision.targetTickUpper);
+        }
+        require(positionCount == 0 && IMultiUserVault(vault).isRebalancing(), "E90");
+        RangeOperations.OptimalSwapParams memory plan = _optimalSwapParams(tickLower, tickUpper);
+        require(step == 2, "E90");
+        _requireSubmittedSwapPlan(
+            plan.swapNeeded ? plan.amountIn : 0, plan.zeroForOne, plan.zeroForOne, amountIn, config.toleranceBps
+        );
+        if (amountIn > 0) _executeValidatedSwap(plan.zeroForOne, amountIn, minAmountOut);
+        this._mintInternal(tickLower, tickUpper);
+        IMultiUserVault(vault).endRebalance();
+        _payBounty(keeper);
+        return (tickLower, tickUpper);
+    }
+
+    /// @notice Atomic rebalance: burn, at most one bounded swap, mint and pay keeper bounty. Permissionless.
+    /// @dev A larger canonical swap must use the resumable SecureBotModule path. Pass empty arrays if no swap is needed.
     ///      Intentionally keeps the position-maintenance path open when PauseController blocks user flows:
     ///      live oracle/deviation checks, the validated strategy decision, oracle minOuts, swap caps and the vault
     ///      lock guard remain active.
@@ -916,10 +930,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         address tokenOut
     ) external nonReentrant {
         require(swapAmountsIn.length == minAmountsOut.length, "len");
-        if (protectionConfig.mevProtectionEnabled) {
-            require(block.timestamp - config.lastRebalanceTime >= MIN_REBALANCE_INTERVAL, "E03");
-        }
-
         // SÉCURITÉ (audit V1 — High 2 / V3-H2) : rafraîchir le cache AVANT de valider les minOuts. La barrière
         // de déviation pool/oracle est INTÉGRÉE au refresh (updatePriceCache invalide le cache si divergence) :
         // le require(priceCache.valid) ci-dessous la rend INCONDITIONNELLE, y compris dans le cas n==0 (rebalance
@@ -927,13 +937,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // swaps (plancher minOut), mais ne dépend plus de la présence de swaps pour la déviation. Cohérent DN.
         _refreshAndRequireValid();
 
-        IRangeStrategyEngine.Decision memory decision = strategyEngine.validateDecision(expectedDecisionHash);
-        require(decision.action == IRangeStrategyEngine.Action.RANGE_REBALANCE && positionCount == 1, "E90");
+        IRangeStrategyEngine.Decision memory decision = _validatedRebalanceDecision(expectedDecisionHash, msg.sender);
         uint256 tokenId = indexToPosition[0];
-        if (isProtocolBotCaller(msg.sender)) {
-            IRangeStrategyEngine.Telemetry memory telemetry = strategyEngine.currentTelemetry();
-            require(block.timestamp >= uint256(telemetry.checkpointTimestamp) + MAIN_BOT_KEEPER_DELAY, "E03");
-        }
 
         // Crystallise les fees avant de figer le plan. Toute la sequence reste atomique : une validation,
         // un swap ou un mint qui revert annule aussi collect, commission et accounting Vault.
@@ -942,6 +947,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
             _optimalSwapParams(decision.targetTickLower, decision.targetTickUpper);
 
         uint256 n = swapAmountsIn.length;
+        require(n <= 1, "E91");
         uint256 totalSwapIn;
         bool tokenInIsToken0 = tokenIn == token0;
         if (n > 0) {
@@ -992,7 +998,46 @@ contract RangeManager is Ownable, ReentrancyGuard {
         IMultiUserVault(vault).endRebalance();
 
         // 6. Pay keeper bounty (silent - don't revert if bounty fails)
-        _payBounty();
+        _payBounty(msg.sender);
+    }
+
+    function _validatedRebalanceDecision(bytes32 expectedDecisionHash, address keeper)
+        private
+        view
+        returns (IRangeStrategyEngine.Decision memory decision)
+    {
+        if (protectionConfig.mevProtectionEnabled) {
+            require(block.timestamp - config.lastRebalanceTime >= MIN_REBALANCE_INTERVAL, "E03");
+        }
+        decision = strategyEngine.validateDecision(expectedDecisionHash);
+        require(decision.action == IRangeStrategyEngine.Action.RANGE_REBALANCE && positionCount == 1, "E90");
+        if (isProtocolBotCaller(keeper)) {
+            IRangeStrategyEngine.Telemetry memory telemetry = strategyEngine.currentTelemetry();
+            require(block.timestamp >= uint256(telemetry.checkpointTimestamp) + MAIN_BOT_KEEPER_DELAY, "E03");
+        }
+    }
+
+    function _executeValidatedSwap(bool tokenInIsToken0, uint256 amountIn, uint256 minAmountOut)
+        private
+        returns (uint256 amountOut)
+    {
+        RangeOperations.validateSwapAgainstOracle(tokenInIsToken0, amountIn, minAmountOut, priceCache, config);
+        uint256 amountUsd = (amountIn * uint256(tokenInIsToken0 ? priceCache.price0 : priceCache.price1))
+            / (10 ** (tokenInIsToken0 ? config.token0Decimals : config.token1Decimals));
+        require(amountUsd <= initMultiSwapTvl * 1e8, "E91");
+        address tokenIn = tokenInIsToken0 ? token0 : token1;
+        address tokenOut = tokenInIsToken0 ? token1 : token0;
+        amountOut = RangeOperations.executeSwapCore(
+            tokenIn,
+            tokenOut,
+            amountIn,
+            minAmountOut,
+            config.fee,
+            address(this),
+            swapRouter,
+            _swapSqrtPriceLimit(tokenInIsToken0)
+        );
+        emit SwapExecuted(tokenIn, tokenOut, amountIn, amountOut);
     }
 
     /// @dev Bounds one swap to roughly config.maxSlippageBps of price movement from the validated live pool price.
