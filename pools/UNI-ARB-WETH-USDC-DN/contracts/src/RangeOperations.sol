@@ -39,11 +39,27 @@ library RangeOperations {
     error Uint128Overflow();
     error SwapTotalAboveLimit();
     error ZeroDenominator();
+    error InvalidSlippage();
     error E45();
     error E46();
 
     int24 private constant MIN_TICK = -887272;
     int24 private constant MAX_TICK = 887272;
+    uint160 private constant MIN_SQRT_PRICE_LIMIT_X96 = 4295128740;
+    uint160 private constant MAX_SQRT_PRICE_LIMIT_X96 = 1461446703485210103287273052203988822378723970341;
+
+    /// @notice Applies the configured movement limit while remaining strictly inside TickMath bounds.
+    function boundedSwapSqrtPriceLimit(uint160 sqrtPriceX96, uint24 maxSlippageBps, bool zeroForOne)
+        internal
+        pure
+        returns (uint160)
+    {
+        if (maxSlippageBps >= 20000) revert InvalidSlippage();
+        uint256 limit = uint256(sqrtPriceX96) * (zeroForOne ? 20000 - maxSlippageBps : 20000 + maxSlippageBps) / 20000;
+        if (limit < MIN_SQRT_PRICE_LIMIT_X96) return MIN_SQRT_PRICE_LIMIT_X96;
+        if (limit > MAX_SQRT_PRICE_LIMIT_X96) return MAX_SQRT_PRICE_LIMIT_X96;
+        return uint160(limit);
+    }
 
     function mulDivUp(uint256 x, uint256 y, uint256 denominator) external pure returns (uint256) {
         return Math.mulDiv(x, y, denominator, Math.Rounding.Up);
@@ -78,12 +94,10 @@ library RangeOperations {
     }
 
     struct ProtectionConfig {
-        // Legacy field names kept for ABI compatibility:
         // sandwichDetectionEnabled = spot/TWAP guard enabled.
         bool sandwichDetectionEnabled;
         bool mevProtectionEnabled;
-        // sandwichThresholdBps = max spot/TWAP tick drift in bps-like ticks.
-        uint16 sandwichThresholdBps;
+        uint16 maxTwapDeviationTicks;
         uint16 maxOracleDeviationBps;
         // audit V1 (V3) : âge max par feed Chainlink (secondes). Différent par feed (ETH/USD vs USDC/USD
         // ont des heartbeats distincts). 0 => fallback sur la valeur par défaut historique (90000s/25h).
@@ -127,7 +141,7 @@ library RangeOperations {
         IUniswapV3Pool pool,
         RangeConfig memory cfg,
         bool twapGuardEnabled,
-        uint16 maxTwapDeviationBps,
+        uint16 maxTwapDeviationTicks,
         uint16 maxDeviationBps,
         uint32 maxAge0In,
         uint32 maxAge1In
@@ -176,20 +190,20 @@ library RangeOperations {
             newCache.valid = false;
             return newCache;
         }
-        if (twapGuardEnabled && _twapDeviationExceeds(pool, tick, maxTwapDeviationBps)) {
+        if (twapGuardEnabled && _twapDeviationExceeds(pool, tick, maxTwapDeviationTicks)) {
             newCache.valid = false;
             return newCache;
         }
     }
 
-    function _twapDeviationExceeds(IUniswapV3Pool pool, int24 spotTick, uint16 maxTwapDeviationBps)
+    function _twapDeviationExceeds(IUniswapV3Pool pool, int24 spotTick, uint16 maxTwapDeviationTicks)
         private
         view
         returns (bool)
     {
         int24 twapTick = _trustedTwapTick(pool);
         int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
-        return uint24(diff) > uint24(maxTwapDeviationBps);
+        return uint24(diff) > uint24(maxTwapDeviationTicks);
     }
 
     /// @notice Shared 5-minute TWAP tick for DN safety checks.

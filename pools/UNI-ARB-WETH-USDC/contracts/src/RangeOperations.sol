@@ -52,6 +52,8 @@ library RangeOperations {
 
     int24 private constant MIN_TICK = -887272;
     int24 private constant MAX_TICK = 887272;
+    uint160 private constant MIN_SQRT_PRICE_LIMIT_X96 = 4295128740;
+    uint160 private constant MAX_SQRT_PRICE_LIMIT_X96 = 1461446703485210103287273052203988822378723970341;
 
     // ===== STRUCTS (partages) =====
 
@@ -76,12 +78,10 @@ library RangeOperations {
     }
 
     struct ProtectionConfig {
-        // Legacy field names kept for ABI compatibility:
         // sandwichDetectionEnabled = spot/TWAP guard enabled.
         bool sandwichDetectionEnabled;
         bool mevProtectionEnabled;
-        // sandwichThresholdBps = max spot/TWAP tick drift in bps-like ticks.
-        uint16 sandwichThresholdBps;
+        uint16 maxTwapDeviationTicks;
         uint16 maxOracleDeviationBps;
         // audit V1 (V3) : heartbeats Chainlink PAR FEED (cohérence std/DN). 0 => défaut 90000s (25h) fallback.
         uint32 maxAge0;
@@ -112,6 +112,19 @@ library RangeOperations {
 
     // ===== FONCTIONS PRINCIPALES =====
 
+    /// @notice Applies the configured movement limit while remaining strictly inside TickMath bounds.
+    function boundedSwapSqrtPriceLimit(uint160 sqrtPriceX96, uint24 maxSlippageBps, bool zeroForOne)
+        external
+        pure
+        returns (uint160)
+    {
+        if (maxSlippageBps >= 20000) revert InvalidSlippage();
+        uint256 limit = uint256(sqrtPriceX96) * (zeroForOne ? 20000 - maxSlippageBps : 20000 + maxSlippageBps) / 20000;
+        if (limit < MIN_SQRT_PRICE_LIMIT_X96) return MIN_SQRT_PRICE_LIMIT_X96;
+        if (limit > MAX_SQRT_PRICE_LIMIT_X96) return MAX_SQRT_PRICE_LIMIT_X96;
+        return uint160(limit);
+    }
+
     /**
      * @notice Met a jour le cache prix avec validation des oracles
      */
@@ -124,7 +137,7 @@ library RangeOperations {
         IUniswapV3Pool pool,
         RangeConfig memory cfg,
         bool twapGuardEnabled,
-        uint16 maxTwapDeviationBps,
+        uint16 maxTwapDeviationTicks,
         uint16 maxDeviationBps,
         uint32 maxAge0In,
         uint32 maxAge1In
@@ -167,12 +180,12 @@ library RangeOperations {
         {
             return PriceCache(0, 0, 0, 0, 0, false);
         }
-        if (twapGuardEnabled && _twapDeviationExceeds(pool, tick, maxTwapDeviationBps)) {
+        if (twapGuardEnabled && _twapDeviationExceeds(pool, tick, maxTwapDeviationTicks)) {
             return PriceCache(0, 0, 0, 0, 0, false);
         }
     }
 
-    function _twapDeviationExceeds(IUniswapV3Pool pool, int24 spotTick, uint16 maxTwapDeviationBps)
+    function _twapDeviationExceeds(IUniswapV3Pool pool, int24 spotTick, uint16 maxTwapDeviationTicks)
         private
         view
         returns (bool)
@@ -184,7 +197,7 @@ library RangeOperations {
             int24 twapTick = int24(tickDelta / 300);
             if (tickDelta < 0 && tickDelta % 300 != 0) twapTick--;
             int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
-            return uint24(diff) > uint24(maxTwapDeviationBps);
+            return uint24(diff) > uint24(maxTwapDeviationTicks);
         } catch {
             // Bypass uniquement au bootstrap (une seule observation initialisee). Des la deuxieme,
             // tout echec observe() invalide le cache, y compris pendant le reste du warm-up 300s.

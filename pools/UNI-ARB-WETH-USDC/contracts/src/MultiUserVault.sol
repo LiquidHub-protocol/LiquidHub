@@ -174,7 +174,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // Age max (secondes) du cache prix accepte par processDepositPermissionless (anti-prix-perime).
     // Reglable par la Safe sans redeploiement. Defaut 300s, aligne bot/keepers.
     uint256 public depositMaxCacheAge = 300;
-    uint256 public depositRefundDelay = 7 days;
+    uint256 public depositRefundDelay = 6 hours;
 
     // Systeme de tracking lazy des fees nettes par share
     // audit V1 (M3-B-fix, retour Codex) : COMPTA DES FEES — accFeePerShare pro-rata des SHARES courantes.

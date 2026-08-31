@@ -75,6 +75,7 @@ contract SwapTreasury is Ownable2Step, ReentrancyGuard {
 
     error BridgeBountyCooldownZero();
     error BridgeBountyMinRatioZero();
+    error BridgeTransferMismatch();
 
     /// @dev Canonical native-token placeholder used by the Velora API.
     address public constant NATIVE_TOKEN = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
@@ -220,7 +221,7 @@ contract SwapTreasury is Ownable2Step, ReentrancyGuard {
     }
 
     function setRescueSafe(address newSafe) external onlyOwner {
-        require(newSafe != address(0), "Invalid safe");
+        require(newSafe.code.length > 0, "Invalid safe");
         emit RescueSafeUpdated(rescueSafe, newSafe);
         rescueSafe = newSafe;
     }
@@ -414,13 +415,20 @@ contract SwapTreasury is Ownable2Step, ReentrancyGuard {
 
         MessagingFee memory fee = stargatePool.quoteSend(sendParam, false);
         require(msg.value >= fee.nativeFee, "Insufficient native fee");
+        uint256 balanceBefore = usdc.balanceOf(address(this));
 
         usdc.safeApprove(address(stargatePool), 0);
         usdc.safeApprove(address(stargatePool), amount);
 
         (MessagingReceipt memory msgReceipt, OFTReceipt memory oftReceipt,) =
             stargatePool.sendToken{value: fee.nativeFee}(sendParam, fee, msg.sender);
-        return (oftReceipt.amountSentLD, oftReceipt.amountReceivedLD, msgReceipt.guid, fee.nativeFee);
+        usdc.safeApprove(address(stargatePool), 0);
+        uint256 balanceAfter = usdc.balanceOf(address(this));
+        if (
+            balanceAfter > balanceBefore || balanceBefore - balanceAfter != amount || oftReceipt.amountSentLD != amount
+                || oftReceipt.amountReceivedLD < sendParam.minAmountLD
+        ) revert BridgeTransferMismatch();
+        return (amount, oftReceipt.amountReceivedLD, msgReceipt.guid, fee.nativeFee);
     }
 
     function _sendParam(uint256 amount, uint256 minAmount) internal view returns (SendParam memory) {

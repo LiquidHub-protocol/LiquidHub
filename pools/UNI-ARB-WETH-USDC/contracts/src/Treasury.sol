@@ -76,6 +76,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
 
     error BridgeBountyCooldownZero();
     error BridgeBountyMinRatioZero();
+    error BridgeTransferMismatch();
 
     uint256 private constant USD_SCALE = 1e8;
     uint16 private constant DEPOSIT_BOUNTY_MIN_RATIO = 100;
@@ -317,6 +318,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         // Get messaging fee in native token
         MessagingFee memory fee = stargatePool.quoteSend(sendParam, false);
         require(msg.value >= fee.nativeFee, "Insufficient native fee");
+        uint256 balanceBefore = usdc.balanceOf(address(this));
 
         // Approve Stargate pool to spend USDC
         usdc.safeApprove(address(stargatePool), 0);
@@ -325,11 +327,17 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         // Execute cross-chain transfer
         (MessagingReceipt memory msgReceipt, OFTReceipt memory oftReceipt,) =
             stargatePool.sendToken{value: fee.nativeFee}(sendParam, fee, msg.sender);
+        usdc.safeApprove(address(stargatePool), 0);
+        uint256 balanceAfter = usdc.balanceOf(address(this));
+        if (
+            balanceAfter > balanceBefore || balanceBefore - balanceAfter != amount || oftReceipt.amountSentLD != amount
+                || oftReceipt.amountReceivedLD < sendParam.minAmountLD
+        ) revert BridgeTransferMismatch();
 
         emit BridgedToStakers(
             oftReceipt.amountSentLD, oftReceipt.amountReceivedLD, bridgeDestinationEid, msgReceipt.guid
         );
-        _payBridgeBounty(msg.sender, oftReceipt.amountSentLD);
+        _payBridgeBounty(msg.sender, amount);
         _refundNativeSurplus(fee.nativeFee);
     }
 

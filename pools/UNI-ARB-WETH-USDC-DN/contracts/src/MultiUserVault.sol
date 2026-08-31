@@ -214,7 +214,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     uint16 public dnPostCheckMaxDriftBps = 300; // plafond fixe ; DnDepositLib applique dynamiquement min(plafond, seuil critique range)
     uint256 public dnDustFloorUsd = 50e8; // plancher anti-poussière (USD 8 déc) : sous ce target, pas de post-check strict
     uint256 public dnMaxDepositUsd = 0; // plafond dépôt en tête (USD 8 déc) anti-DoS file ; setter interdit 0
-    uint256 public dnDepositRefundDelay = 7 days; // délai après lequel un dépôt en tête inexécutable peut être remboursé au déposant
+    uint256 public dnDepositRefundDelay = 6 hours; // délai après lequel un dépôt en tête inexécutable peut être remboursé au déposant
     uint8 private constant DN_MAX_SWAP_CHUNKS = 10; // borne agrégée de swaps (cohérent bot/keepers)
 
     // audit V1 (M3-B-fix, retour Codex) : COMPTA DES FEES — accFeePerShare pro-rata des SHARES courantes.

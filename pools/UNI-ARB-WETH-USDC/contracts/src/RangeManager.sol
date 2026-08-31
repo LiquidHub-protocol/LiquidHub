@@ -222,7 +222,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         protectionConfig = RangeOperations.ProtectionConfig({
             sandwichDetectionEnabled: false,
             mevProtectionEnabled: true,
-            sandwichThresholdBps: 50,
+            maxTwapDeviationTicks: 50,
             maxOracleDeviationBps: 100,
             maxAge0: 90000, // heartbeat par défaut (25h) — cohérent avec la pool DN
             maxAge1: 90000
@@ -317,17 +317,16 @@ contract RangeManager is Ownable, ReentrancyGuard {
         emit ToleranceUpdated(oldTolerance, _toleranceBps);
     }
 
-    function configureProtections(bool _twapGuardEnabled, bool _mevProtection, uint16 _maxTwapDeviationBps)
+    function configureProtections(bool _twapGuardEnabled, bool _mevProtection, uint16 _maxTwapDeviationTicks)
         external
         onlyVaultOwner
     {
-        // Les champs de stockage historiques portent le guard spot/TWAP et son seuil maximal.
-        if (_maxTwapDeviationBps > 1000) revert E21();
-        if (_twapGuardEnabled && _maxTwapDeviationBps == 0) revert E21();
+        if (_maxTwapDeviationTicks > 1000) revert E21();
+        if (_twapGuardEnabled && _maxTwapDeviationTicks == 0) revert E21();
 
         protectionConfig.sandwichDetectionEnabled = _twapGuardEnabled;
         protectionConfig.mevProtectionEnabled = _mevProtection;
-        protectionConfig.sandwichThresholdBps = _maxTwapDeviationBps;
+        protectionConfig.maxTwapDeviationTicks = _maxTwapDeviationTicks;
     }
 
     /// @notice (audit V1 — V3-M1) Paramètres oracle : seuil de déviation pool/oracle + heartbeats par feed.
@@ -739,7 +738,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
             pool,
             config,
             protectionConfig.sandwichDetectionEnabled,
-            protectionConfig.sandwichThresholdBps,
+            protectionConfig.maxTwapDeviationTicks,
             protectionConfig.maxOracleDeviationBps,
             protectionConfig.maxAge0,
             protectionConfig.maxAge1
@@ -998,9 +997,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /// @dev Bounds one swap to roughly config.maxSlippageBps of price movement from the validated live pool price.
     function _swapSqrtPriceLimit(bool zeroForOne) private view returns (uint160) {
-        uint256 sqrtP = priceCache.poolSqrtPriceX96;
-        uint256 bps = config.maxSlippageBps;
-        return uint160((sqrtP * (zeroForOne ? 20000 - bps : 20000 + bps)) / 20000);
+        return RangeOperations.boundedSwapSqrtPriceLimit(priceCache.poolSqrtPriceX96, config.maxSlippageBps, zeroForOne);
     }
 
     function _requireSubmittedSwapPlan(
