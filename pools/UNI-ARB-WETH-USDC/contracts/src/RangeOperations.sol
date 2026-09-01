@@ -178,10 +178,14 @@ library RangeOperations {
         // capturés au même instant => cache LIVE. Tous les appelants de _updatePriceCache héritent de la barrière.
         if (maxDeviationBps > 0 && _deviationExceeds(newCache, maxDeviationBps, cfg.token0Decimals, cfg.token1Decimals))
         {
-            return PriceCache(0, 0, 0, 0, 0, false);
+            // Conserve uniquement les valeurs oracle fraiches pour le fallback de retrait protege.
+            // Toutes les actions LP ordinaires continuent d'exiger valid=true.
+            newCache.valid = false;
+            return newCache;
         }
         if (twapGuardEnabled && _twapDeviationExceeds(pool, tick, maxTwapDeviationTicks)) {
-            return PriceCache(0, 0, 0, 0, 0, false);
+            newCache.valid = false;
+            return newCache;
         }
     }
 

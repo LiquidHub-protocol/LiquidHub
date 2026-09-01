@@ -292,33 +292,43 @@ contract SecureBotModule {
     }
 
     /// @notice LP/free RangeManager NAV reconstructed at the Chainlink token ratio (USD, 8 decimals).
-    /// @dev Read-only and unaffected by the module kill-switch. Two Newton steps start from a spot sqrt price
-    ///      bounded by the mandatory RangeManager oracle-deviation guard, removing meaningful flash-slot0
-    ///      influence from share minting without constraining bot or keeper execution paths.
+    /// @dev Read-only and unaffected by the module kill-switch. During a guarded withdrawal fallback,
+    ///      invalid is accepted only for oracle values refreshed in the current block. The sqrt valuation
+    ///      remains derived exclusively from those oracle prices and never from the divergent spot.
     function getOracleLpValueUsd() external view returns (uint256 valueUsd) {
         IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
         RangeOperations.PriceCache memory cache = rm.priceCache();
-        require(cache.valid && cache.price0 > 0 && cache.price1 > 0 && cache.poolSqrtPriceX96 > 0, "E_NAV");
+        require(
+            cache.price0 > 0 && cache.price1 > 0 && (cache.valid || cache.timestamp == uint64(block.timestamp)), "E_NAV"
+        );
         RangeOperations.RangeConfig memory cfg = rm.config();
-        uint160 oracleSqrt =
-            _oracleSqrtPrice(cache.price0, cache.price1, cache.poolSqrtPriceX96, cfg.token0Decimals, cfg.token1Decimals);
+        uint160 oracleSqrt = _oracleSqrtPrice(cache.price0, cache.price1, cfg.token0Decimals, cfg.token1Decimals);
         (uint256 balance0, uint256 balance1) = _balancesAtPrice(rm, oracleSqrt);
         valueUsd = Math.mulDiv(balance0, cache.price0, 10 ** cfg.token0Decimals)
             + Math.mulDiv(balance1, cache.price1, 10 ** cfg.token1Decimals);
     }
 
-    function _oracleSqrtPrice(uint128 price0, uint128 price1, uint160 seed, uint8 dec0, uint8 dec1)
-        private
-        pure
-        returns (uint160)
+    /// @notice Oracle-value post-check used only by the Vault's fresh-divergence withdrawal fallback.
+    function isWithdrawValueSufficient(uint256 amount0, uint256 amount1, uint256 minValueUsd)
+        external
+        view
+        returns (bool)
     {
+        IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
+        RangeOperations.PriceCache memory cache = rm.priceCache();
+        if (cache.price0 == 0 || cache.price1 == 0 || cache.timestamp != uint64(block.timestamp)) return false;
+        RangeOperations.RangeConfig memory cfg = rm.config();
+        uint256 valueUsd = Math.mulDiv(amount0, cache.price0, 10 ** cfg.token0Decimals)
+            + Math.mulDiv(amount1, cache.price1, 10 ** cfg.token1Decimals);
+        return valueUsd >= minValueUsd;
+    }
+
+    function _oracleSqrtPrice(uint128 price0, uint128 price1, uint8 dec0, uint8 dec1) private pure returns (uint160) {
         uint256 ratioX192 =
             Math.mulDiv(uint256(price0) * (10 ** dec1), uint256(1) << 192, uint256(price1) * (10 ** dec0));
-        uint256 guess = seed;
-        guess = (guess + ratioX192 / guess) >> 1;
-        guess = (guess + ratioX192 / guess) >> 1;
-        require(guess > 0 && guess <= type(uint160).max, "E_RATIO");
-        return uint160(guess);
+        uint256 sqrtPriceX96 = Math.sqrt(ratioX192);
+        require(sqrtPriceX96 > 0 && sqrtPriceX96 <= type(uint160).max, "E_RATIO");
+        return uint160(sqrtPriceX96);
     }
 
     function _balancesAtPrice(IRangeManagerBotState rm, uint160 sqrtPriceX96)

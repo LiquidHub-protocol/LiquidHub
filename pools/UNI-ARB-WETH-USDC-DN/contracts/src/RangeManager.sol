@@ -511,7 +511,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
     function removeLiquidityForWithdraw(uint256 tokenId, uint128 liquidityToRemove) external onlyVault nonReentrant {
         if (liquidityToRemove > 0) {
             // decrease + collect du principal (fees deja collectees par collectFeesForVault)
-            _refreshAndRequireValid();
+            // Le Vault a rafraichi le cache dans cette meme transaction. Une divergence seule est
+            // toleree ici; le Vault exige ensuite que le settlement total respecte son plancher oracle.
+            require(priceCache.timestamp == block.timestamp, "E38");
             RangeOperations.decreaseLiquidityPartialCore(
                 tokenId, liquidityToRemove, positionManager, pool, config.maxSlippageBps, address(this)
             );
@@ -715,7 +717,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     function _updatePriceCache() private {
         if (address(token0PriceFeed) == address(0) || address(token1PriceFeed) == address(0)) {
-            priceCache.valid = false;
+            delete priceCache;
             return;
         }
         // SIMPLIFIÉ (audit V1 — gain bytecode) : le pré-check try/catch sur latestRoundData + price<=0 était
@@ -724,7 +726,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
         try this._updatePriceCacheInternal() {
             emit PriceCacheUpdated(priceCache.price0, priceCache.price1, priceCache.poolTick);
         } catch {
-            priceCache.valid = false;
+            // Never retain a same-block timestamp from an earlier refresh when a feed is now unreadable.
+            // Only updatePriceCache()'s explicit market-divergence branch may preserve fresh oracle values.
+            delete priceCache;
         }
     }
 

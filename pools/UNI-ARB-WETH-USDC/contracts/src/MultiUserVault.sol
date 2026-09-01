@@ -5,6 +5,7 @@ import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
+import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "./RangeOperations.sol";
 import "./interfaces/IRangeStrategyEngine.sol";
@@ -57,6 +58,10 @@ interface ITreasuryDeposit {
 
 interface IBotNav {
     function getOracleLpValueUsd() external view returns (uint256);
+    function isWithdrawValueSufficient(uint256 amount0, uint256 amount1, uint256 minValueUsd)
+        external
+        view
+        returns (bool);
 }
 
 contract MultiUserVault is Ownable, ReentrancyGuard {
@@ -72,6 +77,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     error EmergencyLiquidityShortfall();
     error InvalidRecipient();
     error NoPositionToBurn();
+    error WithdrawalValueTooLow();
 
     // ===== STRUCTURES =====
 
@@ -693,15 +699,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         require(block.number > user.lastDepositBlock, "E_SAME_BLOCK");
         _requireWithdrawalAllowed(user.lastDepositTime);
 
-        // SÉCURITÉ (audit V1 — High/Medium) : le burn de liquidité utilise désormais des amountMin
-        // dérivés du slot0 live et bornés par maxSlippageBps. On garde en plus le check pool/oracle
-        // live pour refuser un withdraw sur un slot0 manipulé ou divergent.
-        // V3-H1 : REFRESH d'abord (slot0+oracle LIVE), updatePriceCache invalide le cache si déviation. Coh. DN.
-        {
-            rangeManager.refreshPriceCache();
-            (,,,,, bool _valid) = rangeManager.priceCache();
-            require(_valid, "E38"); // cache invalidé (déviation pool/oracle ou feed stale) -> on bloque le retrait
-        }
+        // Refresh dans la transaction de retrait. Une divergence pool/oracle/TWAP n'autorise jamais
+        // aveuglément le burn: le fallback ci-dessous exige des oracles frais puis vérifie la valeur USD
+        // réellement récupérée. Un feed stale, illisible ou nul reste fail-closed.
+        rangeManager.refreshPriceCache();
 
         uint256 totalSharesBefore = totalShares;
         bool isFullWithdraw = totalSharesBefore - shareAmount <= DEAD_SHARES;
@@ -712,13 +713,21 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         // Calculer montants pour le retrait (commission = 0, deja au Treasury)
         (uint256 principal0, uint256 principal1) = _calculateWithdrawAmounts(shareAmount, totalSharesBefore);
+        uint256 minWithdrawValueUsd = _withdrawOracleGuard(shareAmount, totalSharesBefore);
 
         // ===== EFFECTS =====
         _finalizeWithdrawal(user, shareAmount);
 
         // ===== INTERACTIONS =====
         (uint256 toSend0, uint256 toSend1) =
-            _executeWithdrawAndSend(principal0, principal1, shareAmount, totalSharesBefore, isFullWithdraw);
+            _executeWithdraw(principal0, principal1, shareAmount, totalSharesBefore, isFullWithdraw);
+
+        if (
+            minWithdrawValueUsd != 0
+                && !IBotNav(botModule).isWithdrawValueSufficient(toSend0, toSend1, minWithdrawValueUsd)
+        ) revert WithdrawalValueTooLow();
+        if (toSend0 > 0) token0.safeTransfer(msg.sender, toSend0);
+        if (toSend1 > 0) token1.safeTransfer(msg.sender, toSend1);
 
         emit Withdraw(msg.sender, toSend0, toSend1, shareAmount);
     }
@@ -963,7 +972,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         // Une fois le dernier utilisateur sorti, le NFT vide doit aussi quitter le PositionManager et le
         // tracking RangeManager. Le prochain dépôt repassera ainsi par un mint initial propre.
-        if (isFullWithdraw && tokenId > 0) rangeManager.burnPosition(tokenId);
+        if (isFullWithdraw && tokenId > 0) rangeManager.emergencyBurnPosition(tokenId);
 
         // ===== ETAPE 3 : TRANSFERER DEPUIS RANGEMANAGER VERS VAULT =====
         // SÉCURITÉ (audit V1) : on n'envoie QUE le principal proportionnel du user, borné par
@@ -1032,7 +1041,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     /**
      * @notice Execute le retrait et envoie les fonds (auto-compound: pas de fees separees)
      */
-    function _executeWithdrawAndSend(
+    function _executeWithdraw(
         uint256 principal0,
         uint256 principal1,
         uint256 shareAmount,
@@ -1053,9 +1062,27 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 after1 = token1.balanceOf(address(this));
         toSend0 = after0 > before0 ? after0 - before0 : 0;
         toSend1 = after1 > before1 ? after1 - before1 : 0;
+    }
 
-        if (toSend0 > 0) token0.safeTransfer(msg.sender, toSend0);
-        if (toSend1 > 0) token1.safeTransfer(msg.sender, toSend1);
+    /// @dev Normal withdrawals keep the existing valid-cache path. During a pure market divergence,
+    ///      a fallback is opened only when both oracle values were freshly validated in this block.
+    function _withdrawOracleGuard(uint256 shareAmount, uint256 totalSharesBefore)
+        private
+        view
+        returns (uint256 minValueUsd)
+    {
+        bool valid;
+        (,,,,, valid) = rangeManager.priceCache();
+        if (valid) return 0;
+
+        // getCurrentPortfolioValue() appelle le module oracle: un prix nul/stale ou non rafraichi
+        // dans ce bloc revert fail-closed avant tout changement d'etat du retrait.
+        uint256 nav = getCurrentPortfolioValue();
+        require(nav > 0, "E38");
+        RangeOperations.RangeConfig memory cfg = rangeManager.config();
+        uint256 userValue = Math.mulDiv(nav, shareAmount, totalSharesBefore);
+        minValueUsd = Math.mulDiv(userValue, 10_000 - cfg.maxSlippageBps, 10_000);
+        if (minValueUsd == 0) revert WithdrawalValueTooLow();
     }
 
     // audit V1 (M3-B-fix4, retour Codex/Slither) : _calculateSendAmount() SUPPRIMEE — fonction morte (aucun

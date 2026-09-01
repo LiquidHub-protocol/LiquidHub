@@ -259,8 +259,8 @@ library DnDepositLib {
     function idleHedgeValueUsd(address hedgeManager, address rangeManager) external view returns (uint256 valueUsd) {
         IRmDep rm = IRmDep(rangeManager);
         IHedgeDep hm = IHedgeDep(hedgeManager);
-        (uint128 price0, uint128 price1,,,, bool valid) = rm.priceCache();
-        if (!valid) return 0;
+        (uint128 price0, uint128 price1,,, uint64 timestamp, bool valid) = rm.priceCache();
+        if (!valid && timestamp != uint64(block.timestamp)) return 0;
         (, uint8 dec0, uint8 dec1,,,,,) = rm.config();
         valueUsd = _toUsd(hm.getWethBalance(), price0, dec0);
         valueUsd += (hm.getUsdcBalance() * uint256(price1)) / (10 ** dec1);
@@ -596,8 +596,8 @@ library DnDepositLib {
         uint8 stableDecimals,
         uint8 volatileDecimals
     ) external view returns (uint256 collateralUsd, uint256 debtUsd) {
-        (uint128 price0, uint128 price1,,,, bool valid) = IRmDep(rangeManager).priceCache();
-        if (!valid || price0 == 0 || price1 == 0) revert InvalidSwapPlan();
+        (uint128 price0, uint128 price1,,, uint64 timestamp, bool valid) = IRmDep(rangeManager).priceCache();
+        if ((!valid && timestamp != uint64(block.timestamp)) || price0 == 0 || price1 == 0) revert InvalidSwapPlan();
         collateralUsd = (IERC20(aToken).balanceOf(address(this)) * uint256(price1)) / (10 ** stableDecimals);
         debtUsd = (IERC20(debtToken).balanceOf(address(this)) * uint256(price0)) / (10 ** volatileDecimals);
     }

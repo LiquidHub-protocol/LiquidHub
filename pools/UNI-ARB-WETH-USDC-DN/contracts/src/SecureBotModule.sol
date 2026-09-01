@@ -341,13 +341,28 @@ contract SecureBotModule {
     ///      from oracle prices; it remains exact and spot-independent even when the spot deviation guard is zero.
     function getOracleLpValueUsd() external view returns (uint256 valueUsd) {
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
-        (uint128 price0, uint128 price1,,,, bool valid) = rm.priceCache();
-        require(valid && price0 > 0 && price1 > 0, "E_NAV");
+        (uint128 price0, uint128 price1,,, uint64 timestamp, bool valid) = rm.priceCache();
+        require(price0 > 0 && price1 > 0 && (valid || timestamp == uint64(block.timestamp)), "E_NAV");
         RangeOperations.RangeConfig memory cfg = rm.config();
         uint160 oracleSqrt = _oracleSqrtPrice(price0, price1, cfg.token0Decimals, cfg.token1Decimals);
         (uint256 balance0, uint256 balance1) = _balancesAtPrice(rm, oracleSqrt);
         valueUsd = Math.mulDiv(balance0, price0, 10 ** cfg.token0Decimals)
             + Math.mulDiv(balance1, price1, 10 ** cfg.token1Decimals);
+    }
+
+    /// @notice Oracle-value post-check used only by the Vault's fresh-divergence withdrawal fallback.
+    function isWithdrawValueSufficient(uint256 amount0, uint256 amount1, uint256 minValueUsd)
+        external
+        view
+        returns (bool)
+    {
+        IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
+        (uint128 price0, uint128 price1,,, uint64 timestamp,) = rm.priceCache();
+        if (price0 == 0 || price1 == 0 || timestamp != uint64(block.timestamp)) return false;
+        RangeOperations.RangeConfig memory cfg = rm.config();
+        uint256 valueUsd = Math.mulDiv(amount0, price0, 10 ** cfg.token0Decimals)
+            + Math.mulDiv(amount1, price1, 10 ** cfg.token1Decimals);
+        return valueUsd >= minValueUsd;
     }
 
     function _oracleSqrtPrice(uint128 price0, uint128 price1, uint8 dec0, uint8 dec1) private pure returns (uint160) {
