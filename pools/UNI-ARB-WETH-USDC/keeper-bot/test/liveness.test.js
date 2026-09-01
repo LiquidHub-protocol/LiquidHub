@@ -476,6 +476,25 @@ test('progressive rebalance recomputes the remaining plan after every confirmed 
   assert.equal(result.txHashes.length, 4);
 });
 
+test('progressive chunks respect total and reverse-direction on-chain budgets', () => {
+  const rebalancer = new Rebalancer({}, {}, {}, {}, {}, {});
+  const usd8 = 100_000_000n;
+  const base = {
+    priceCache: { price0: usd8, price1: usd8 },
+    cfg: { token0Decimals: 0, token1Decimals: 0 },
+    capUsd: 10n,
+    budgetUsd8: 5n * usd8,
+    reverseBudgetUsd8: 1n * usd8,
+    initialZeroForOne: true,
+  };
+  assert.equal(rebalancer._progressiveAmountCap({ ...base, plan: { zeroForOne: true } }), 5n);
+  assert.equal(rebalancer._progressiveAmountCap({ ...base, plan: { zeroForOne: false } }), 1n);
+  assert.throws(
+    () => rebalancer._progressiveAmountCap({ ...base, reverseBudgetUsd8: 0n, plan: { zeroForOne: false } }),
+    /budget exhausted/
+  );
+});
+
 test('atomic action gas is buffered but never allowed to reach the block limit', async () => {
   const rebalancer = new Rebalancer({}, {}, {}, {}, {});
   const signer = { address: '0x0000000000000000000000000000000000000011' };

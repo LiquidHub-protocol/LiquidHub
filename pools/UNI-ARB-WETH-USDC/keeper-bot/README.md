@@ -30,10 +30,11 @@ The execution path is selected from current on-chain values:
 
 The progressive state is stored on-chain, so any keeper can resume it after a restart or RPC failure. A keeper cannot
 reuse a stale multi-transaction plan: direction, useful amount, oracle floor, USD cap and sqrt-price impact are checked
-again for every chunk, and partial fills revert. The module also values the initial RangeManager NAV through its
-oracles and decrements that cumulative USD budget after every swap, so an unrestricted chunk count cannot rotate
-more than the initial LP capital. The Safe can cancel a stuck progressive cycle without swapping or transferring
-principal; the assets remain idle in the RangeManager and withdrawals can use those idle balances.
+again for every chunk, and partial fills revert. The cumulative budget is the initial canonical swap requirement plus
+the governed slippage/tolerance margin; only that margin can be spent after a direction reversal. This keeps the
+chunk count open for large TVL without permitting repeated NAV turnover. A Safe cancellation waits for the next
+canonical checkpoint, remints through the four-layer strategy engine, then unlocks without swapping or transferring
+principal.
 
 ### Adaptive range intelligence (100% on-chain)
 

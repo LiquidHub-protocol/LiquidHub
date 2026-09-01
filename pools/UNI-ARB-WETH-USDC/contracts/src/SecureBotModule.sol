@@ -82,6 +82,8 @@ contract SecureBotModule {
     int24 public progressiveTickUpper;
     bytes32 public progressiveDecisionHash;
     uint256 public progressiveSwapBudgetUsdE8;
+    uint256 public progressiveReverseBudgetUsdE8;
+    bool public progressiveInitialZeroForOne;
 
     // endRebalance() est exempte de la limite quotidienne: ce deverrouillage ne deplace aucun fonds.
     // Mints, depots et rebalances utilisent leurs entrees atomiques; l'ancien automate module
@@ -164,7 +166,8 @@ contract SecureBotModule {
         require(progressiveRebalanceStatus == 0, "Progressive active");
         progressiveRebalanceStatus = 1;
         IRangeManagerBotState(rangeManager).refreshPriceCache();
-        progressiveSwapBudgetUsdE8 = _requireProgressivePlan();
+        (progressiveSwapBudgetUsdE8, progressiveReverseBudgetUsdE8, progressiveInitialZeroForOne) =
+            _requireProgressivePlan();
         (int24 lower, int24 upper) =
             IProgressiveRangeManager(rangeManager).progressiveRebalance(0, expectedDecisionHash, 0, 0, 0, 0, msg.sender);
         progressiveTickLower = lower;
@@ -174,7 +177,11 @@ contract SecureBotModule {
         emit ProgressiveRebalanceStarted(expectedDecisionHash, lower, upper, msg.sender);
     }
 
-    function _requireProgressivePlan() private view returns (uint256 budgetUsdE8) {
+    function _requireProgressivePlan()
+        private
+        view
+        returns (uint256 budgetUsdE8, uint256 reverseBudgetUsdE8, bool zeroForOne)
+    {
         IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
         RangeOperations.OptimalSwapParams memory plan = rm.getOptimalSwapParams();
         RangeOperations.PriceCache memory cache = rm.priceCache();
@@ -184,9 +191,11 @@ contract SecureBotModule {
         uint256 decimals = plan.zeroForOne ? cfg.token0Decimals : cfg.token1Decimals;
         uint256 amountUsd = Math.mulDiv(plan.amountIn, price, 10 ** decimals);
         require(plan.swapNeeded && amountUsd > rm.initMultiSwapTvl() * 1e8, "Use atomic");
-        budgetUsdE8 = Math.mulDiv(plan.currentBalance0, cache.price0, 10 ** cfg.token0Decimals)
-            + Math.mulDiv(plan.currentBalance1, cache.price1, 10 ** cfg.token1Decimals);
-        require(budgetUsdE8 > 0, "Invalid budget");
+        uint256 marginBps = uint256(cfg.maxSlippageBps) + uint256(cfg.toleranceBps);
+        reverseBudgetUsdE8 = Math.mulDiv(amountUsd, marginBps, 10000, Math.Rounding.Up);
+        if (reverseBudgetUsdE8 == 0) reverseBudgetUsdE8 = 1;
+        budgetUsdE8 = amountUsd + reverseBudgetUsdE8;
+        zeroForOne = plan.zeroForOne;
     }
 
     function continueProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
@@ -236,6 +245,8 @@ contract SecureBotModule {
         delete progressiveTickUpper;
         delete progressiveDecisionHash;
         delete progressiveSwapBudgetUsdE8;
+        delete progressiveReverseBudgetUsdE8;
+        delete progressiveInitialZeroForOne;
         progressiveRebalanceStatus = 0;
         emit ProgressiveRebalanceFinalized(decisionHash, msg.sender);
     }
@@ -250,6 +261,10 @@ contract SecureBotModule {
             10 ** (zeroForOne ? cfg.token0Decimals : cfg.token1Decimals)
         );
         require(amountUsdE8 > 0 && amountUsdE8 <= progressiveSwapBudgetUsdE8, "Cycle budget");
+        if (zeroForOne != progressiveInitialZeroForOne) {
+            require(amountUsdE8 <= progressiveReverseBudgetUsdE8, "Reverse budget");
+            progressiveReverseBudgetUsdE8 -= amountUsdE8;
+        }
         progressiveSwapBudgetUsdE8 -= amountUsdE8;
     }
 
@@ -262,13 +277,16 @@ contract SecureBotModule {
         progressiveRebalanceStatus = 3;
         require(IProgressiveVault(vault).isRebalancing(), "Vault unlocked");
         IProgressiveStrategy engine = IProgressiveStrategy(strategyEngine);
-        if (engine.checkpointDue()) engine.checkpointMarketState();
+        require(engine.checkpointDue(), "Wait checkpoint");
+        engine.checkpointMarketState();
         IProgressiveRangeManager(rangeManager).mintInitialPosition();
         IProgressiveVault(vault).endRebalance();
         delete progressiveTickLower;
         delete progressiveTickUpper;
         delete progressiveDecisionHash;
         delete progressiveSwapBudgetUsdE8;
+        delete progressiveReverseBudgetUsdE8;
+        delete progressiveInitialZeroForOne;
         progressiveRebalanceStatus = 0;
         emit ProgressiveRebalanceCancelled(decisionHash, msg.sender);
     }

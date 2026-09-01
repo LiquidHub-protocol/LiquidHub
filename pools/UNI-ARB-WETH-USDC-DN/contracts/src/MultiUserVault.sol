@@ -31,6 +31,22 @@ interface IAaveHedgeSettlement {
         external
         view
         returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase);
+    function adjustHedgeBps() external view returns (uint16);
+}
+
+interface IDnStrategyHedgeState {
+    function getHedgeStrategyState()
+        external
+        view
+        returns (
+            bool positionExists,
+            uint256 token0InLp,
+            uint256 targetShort,
+            uint256 debtToken0,
+            int256 effectiveShort,
+            uint256 driftBps,
+            uint256 healthFactor
+        );
 }
 
 interface IRangeManager {
@@ -631,6 +647,20 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // Crystallize incumbent fees first. If the tiny balance change invalidates the prepared plan,
         // validation below reverts atomically and the next bot/keeper cycle recomputes from fresh state.
         if (hasPosition) rangeManager.collectFeesForVault();
+        uint16 depositPostCheckMaxDriftBps = dnPostCheckMaxDriftBps;
+        if (hedgeManager != address(0)) {
+            (bool positionExists,,,, int256 effectiveShort, uint256 driftBps,) = IDnStrategyHedgeState(
+                IRangeManagerExtended(address(rangeManager)).strategyEngine()
+            ).getHedgeStrategyState();
+            uint16 adjustThresholdBps = IAaveHedgeSettlement(hedgeManager).adjustHedgeBps();
+            if (adjustThresholdBps <= dnPostCheckMaxDriftBps) revert E72();
+            if (positionExists && (effectiveShort < 0 || driftBps >= adjustThresholdBps)) revert E72();
+            if (driftBps > depositPostCheckMaxDriftBps) {
+                uint256 inheritedLimit = driftBps + 1;
+                if (inheritedLimit >= adjustThresholdBps) inheritedLimit = uint256(adjustThresholdBps) - 1;
+                depositPostCheckMaxDriftBps = uint16(inheritedLimit);
+            }
+        }
         PendingDeposit memory pdPlan = pendingDeposits[_pendingHead];
         uint256 plannedDepositValue = _calculateDepositValue(pdPlan.amount0, pdPlan.amount1);
         try DnDepositLib.validateDepositSwapPlan(
@@ -696,7 +726,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 DnDepositLib.Addrs(hedgeManager, address(rangeManager), address(token0), address(token1)),
                 price0,
                 cfgPc.token0Decimals,
-                dnPostCheckMaxDriftBps,
+                depositPostCheckMaxDriftBps,
                 dnDustFloorUsd
             );
         }

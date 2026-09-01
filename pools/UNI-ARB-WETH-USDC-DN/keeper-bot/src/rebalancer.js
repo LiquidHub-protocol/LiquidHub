@@ -341,23 +341,36 @@ class Rebalancer {
       const rm = this.rangeManager.connect(provider);
       const status = Number(await module.progressiveRebalanceStatus());
       if (status !== 2) return { status };
-      const [plan, priceCache, cfg, capUsd] = await Promise.all([
+      const [plan, priceCache, cfg, capUsd, budgetUsd8, reverseBudgetUsd8, initialZeroForOne] = await Promise.all([
         module.getProgressiveSwapParams(),
         rm.priceCache(),
         rm.config(),
         rm.initMultiSwapTvl(),
+        module.progressiveSwapBudgetUsdE8(),
+        module.progressiveReverseBudgetUsdE8(),
+        module.progressiveInitialZeroForOne(),
       ]);
-      return { status, plan, priceCache, cfg, capUsd };
+      return { status, plan, priceCache, cfg, capUsd, budgetUsd8, reverseBudgetUsd8, initialZeroForOne };
     });
   }
 
-  _progressiveAmountCap(plan, priceCache, cfg, capUsd) {
+  _progressiveAmountCap(state) {
+    const { plan, priceCache, cfg, capUsd } = state;
     const tokenInIsToken0 = Boolean(plan.zeroForOne);
     const priceIn = BigInt(tokenInIsToken0 ? priceCache.price0 : priceCache.price1);
     const decimals = Number(tokenInIsToken0 ? cfg.token0Decimals : cfg.token1Decimals);
     if (priceIn <= 0n || BigInt(capUsd) <= 0n) throw new Error('invalid on-chain progressive cap or price');
-    const capRaw = (BigInt(capUsd) * USD_SCALE * (10n ** BigInt(decimals))) / priceIn;
-    return capRaw > 0n ? capRaw : 1n;
+    let remainingBudgetUsd8 = BigInt(state.budgetUsd8);
+    if (tokenInIsToken0 !== Boolean(state.initialZeroForOne)) {
+      const reverseBudgetUsd8 = BigInt(state.reverseBudgetUsd8);
+      if (reverseBudgetUsd8 < remainingBudgetUsd8) remainingBudgetUsd8 = reverseBudgetUsd8;
+    }
+    if (remainingBudgetUsd8 <= 0n) throw new Error('progressive budget exhausted; cycle remains resumable or Safe-cancellable');
+    const perChunkCapUsd8 = BigInt(capUsd) * USD_SCALE;
+    const effectiveCapUsd8 = remainingBudgetUsd8 < perChunkCapUsd8 ? remainingBudgetUsd8 : perChunkCapUsd8;
+    const capRaw = (effectiveCapUsd8 * (10n ** BigInt(decimals))) / priceIn;
+    if (capRaw === 0n) throw new Error('progressive budget is below the smallest token input unit');
+    return capRaw;
   }
 
   async _runProgressiveRebalance(expectedDecisionHash = null) {
@@ -393,7 +406,7 @@ class Rebalancer {
         break;
       }
 
-      const capRaw = this._progressiveAmountCap(state.plan, state.priceCache, state.cfg, state.capUsd);
+      const capRaw = this._progressiveAmountCap(state);
       let amountIn = planAmount < capRaw ? planAmount : capRaw;
       let finalize = planAmount <= capRaw;
       let receipt = null;
@@ -482,7 +495,7 @@ class Rebalancer {
 
   _shouldRefreshForPlanError(error) {
     const text = this._errorText(error).toLowerCase();
-    return ['stale', 'cache', 'oracle', 'twap', 'price', 'minout', 'too little received', 'partialfill', 'partial fill', 'e38', 'e72', 'e73', 'e90', 'e96', 'e93', 'e94']
+    return ['stale', 'cache', 'oracle', 'twap', 'price', 'minout', 'too little received', 'partialfill', 'partial fill', 'cycle budget', 'reverse budget', 'e38', 'e72', 'e73', 'e90', 'e96', 'e93', 'e94']
       .some((marker) => text.includes(marker));
   }
 

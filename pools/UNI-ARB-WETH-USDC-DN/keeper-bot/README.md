@@ -39,9 +39,10 @@ impact bound, and rejects partial fills. The final call mints the engine-approve
 checks the resulting hedge, unlocks the vault and pays the finalizer bounty. Any keeper can resume the cycle after a
 restart. The module checks the live Aave HF before begin, every chunk and finalization; while debt exists below
 `hfRepairTriggerBps`, only the permissionless `repairHealthFactor()` safety lane can restore eligibility. The same
-cycle then resumes. Its cumulative oracle-USD swap budget is the initial RangeManager NAV and is decremented after
-every swap, preventing unlimited turnover without imposing a chunk-count ceiling. The Safe can cancel a stuck
-progressive cycle without swapping or transferring principal.
+cycle then resumes. The module bounds cumulative turnover to the initial canonical swap requirement plus its governed
+slippage/tolerance margin, and limits opposite-direction corrections to that margin without imposing a chunk-count
+ceiling. A Safe cancellation waits for the next canonical checkpoint, remints through the four-layer strategy engine,
+resynchronizes the hedge and unlocks without transferring principal.
 
 Community keepers may checkpoint from the epoch boundary. Identities configured as protocol-bot callers are
 rejected on-chain during the first 60 seconds for canonical checkpoints and normal eligible rebalances, then act

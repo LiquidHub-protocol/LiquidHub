@@ -205,8 +205,9 @@ library RangeStrategyDnLib {
 
         context.debtToken0 = hedge.getWethDebt();
         uint256 dust = hedge.donationDustToken0();
-        uint256 idle = IERC20(token0).balanceOf(hedgeManager) + IERC20(token0).balanceOf(rangeManager);
-        uint256 countedIdle = idle > dust ? idle - dust : 0;
+        uint256 idleHm = IERC20(token0).balanceOf(hedgeManager);
+        uint256 idleRm = IERC20(token0).balanceOf(rangeManager);
+        uint256 countedIdle = (idleHm > dust ? idleHm - dust : 0) + (idleRm > dust ? idleRm - dust : 0);
         context.effectiveShortToken0 = int256(context.debtToken0) - int256(countedIdle);
         (, context.token0Decimals, context.token1Decimals,,,,,) = IDnRangeManagerState(rangeManager).config();
         (uint128 price0, uint128 price1,,,,) = IDnRangeManagerState(rangeManager).priceCache();
