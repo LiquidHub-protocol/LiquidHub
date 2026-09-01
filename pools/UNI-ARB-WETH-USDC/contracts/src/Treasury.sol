@@ -293,6 +293,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     /// @notice Bridge USDC to staking contract on destination chain via Stargate v2. Callable by anyone.
     /// @dev Uses Taxi mode (immediate delivery). Caller pays native gas for cross-chain fees via msg.value.
     function bridgeToStakers(uint256 amount) external payable nonReentrant {
+        require(!adminWithdrawEnabled, "Phase 1");
         require(!distributionsPaused, "Distributions paused");
         require(bridgeEnabled, "Bridge disabled");
         require(amount > 0, "Zero amount");
@@ -909,6 +910,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
 
     /// @notice Distribute USDC to local staking contract (same chain). Callable by anyone.
     function distributeToStakers(uint256 amount) external nonReentrant {
+        require(!adminWithdrawEnabled, "Phase 1");
         require(!distributionsPaused, "Distributions paused");
         require(stakingRewardsAddress != address(0), "Staking not configured");
         _requireDistributableUsdc(amount);

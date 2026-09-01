@@ -99,6 +99,9 @@ interface IAavePoolDep {
 library DnDepositLib {
     using SafeERC20 for IERC20;
 
+    uint160 private constant MIN_SQRT_PRICE_LIMIT_X96 = 4295128740;
+    uint160 private constant MAX_SQRT_PRICE_LIMIT_X96 = 1461446703485210103287273052203988822378723970341;
+
     error ProtectedVaultFunds();
     error ExactTransferRequired();
     error InvalidStrategyDecision();
@@ -829,7 +832,7 @@ library DnDepositLib {
         uint256 theoretical = Math.mulDiv(amount0In, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0));
         amountOutMinimum = Math.mulDiv(theoretical, 10000 - uint256(slippageBps), 10000);
         if (amountOutMinimum == 0) revert BadOracle();
-        sqrtPriceLimitX96 = uint160(
+        sqrtPriceLimitX96 = _clampSqrtPriceLimitX96(
             (uint256(sqrtP) * (zeroForOne ? 20000 - uint256(slippageBps) : 20000 + uint256(slippageBps))) / 20000
         );
     }
@@ -854,9 +857,15 @@ library DnDepositLib {
             Math.mulDiv(amount0Out, uint256(price0) * (10 ** dec1), uint256(price1) * (10 ** dec0), Math.Rounding.Up);
         amountInMaximum = Math.mulDiv(theoretical, 10000 + uint256(slippageBps), 10000, Math.Rounding.Up);
         if (amountInMaximum == 0) revert BadOracle();
-        sqrtPriceLimitX96 = uint160(
+        sqrtPriceLimitX96 = _clampSqrtPriceLimitX96(
             (uint256(sqrtP) * (zeroForOne ? 20000 - uint256(slippageBps) : 20000 + uint256(slippageBps))) / 20000
         );
+    }
+
+    function _clampSqrtPriceLimitX96(uint256 limit) private pure returns (uint160) {
+        if (limit < MIN_SQRT_PRICE_LIMIT_X96) return MIN_SQRT_PRICE_LIMIT_X96;
+        if (limit > MAX_SQRT_PRICE_LIMIT_X96) return MAX_SQRT_PRICE_LIMIT_X96;
+        return uint160(limit);
     }
 
     /// @notice Returns the only strategy fields consumed by AaveHedgeManager and validates HEDGE_ONLY in-engine.

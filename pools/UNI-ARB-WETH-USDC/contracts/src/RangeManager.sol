@@ -390,11 +390,11 @@ contract RangeManager is Ownable, ReentrancyGuard {
         returns (uint256 tokenId, uint128 liquidity)
     {
         require(config.oraclesConfigured, "E26");
-        // The bot module calls processDepositPermissionless() on the Vault. The Vault enforces that
-        // only its configured bot module (or governance) can process the first queued deposit, then
-        // calls this function itself. Requiring the module here would make the atomic call chain
-        // impossible because Solidity does not preserve the original caller across contracts.
-        require(msg.sender == vault, "E99");
+        // Normal initial mint comes from the Vault. The only direct module exception is Safe recovery of a
+        // progressive cycle after its NFT was burned: the Vault must still be locked and no position may exist.
+        bool progressiveRecovery = msg.sender == protocolBotAddress && IMultiUserVault(vault).isRebalancing();
+        require(msg.sender == vault || progressiveRecovery, "E99");
+        if (progressiveRecovery) require(positionCount == 0, "E90");
         _refreshAndRequireValid();
         IRangeStrategyEngine.Decision memory decision = _validatedStrategyDecision();
         require(

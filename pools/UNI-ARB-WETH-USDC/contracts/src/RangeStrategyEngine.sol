@@ -659,13 +659,6 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             return _finishDecision(decision, summary);
         }
 
-        (,,,,, uint64 lastRebalanceTime,,) = rm.config();
-        if (block.timestamp < uint256(lastRebalanceTime) + strategyConfig.rebalanceCooldownSeconds) {
-            decision.action = Action.NO_ACTION;
-            decision.reason = ReasonCode.COOLDOWN_ACTIVE;
-            return _finishDecision(decision, summary);
-        }
-
         bool forcePersistent = !position.inRange && _outOfRangeSince > 0
             && block.timestamp >= uint256(_outOfRangeSince) + strategyConfig.maxOutOfRangeSeconds;
         uint256 outsideDepth = liveTick < position.lower
@@ -674,6 +667,15 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         uint256 currentHalfWidth =
             position.upper > position.lower ? uint256(uint24(position.upper - position.lower)) / 2 : 0;
         bool forceDeep = !position.inRange && currentHalfWidth > 0 && outsideDepth >= currentHalfWidth;
+        (,,,,, uint64 lastRebalanceTime,,) = rm.config();
+        if (
+            !forcePersistent && !forceDeep
+                && block.timestamp < uint256(lastRebalanceTime) + strategyConfig.rebalanceCooldownSeconds
+        ) {
+            decision.action = Action.NO_ACTION;
+            decision.reason = ReasonCode.COOLDOWN_ACTIVE;
+            return _finishDecision(decision, summary);
+        }
         bool edgeEnough = decision.edgeBps > decision.thresholdBps;
         bool confirmedEdge =
             edgeEnough && (position.inRange || _exitConfirmed(position, liveTick, outsideDepth, currentHalfWidth));

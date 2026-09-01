@@ -42,11 +42,18 @@ interface IProgressiveRangeManager {
         uint256 minAmountOut,
         address keeper
     ) external returns (int24 lower, int24 upper);
+
+    function mintInitialPosition() external returns (uint256 tokenId, uint128 liquidity);
 }
 
 interface IProgressiveVault {
     function endRebalance() external;
     function isRebalancing() external view returns (bool);
+}
+
+interface IProgressiveStrategy {
+    function checkpointDue() external view returns (bool);
+    function checkpointMarketState() external;
 }
 
 interface IProgressiveHedgeGuard {
@@ -291,12 +298,18 @@ contract SecureBotModule {
         require(healthFactor >= uint256(hedge.hfRepairTriggerBps()) * 1e14, "HF repair");
     }
 
-    /// @notice Emergency-only release; no swap or principal transfer is performed.
+    /// @notice Safe-only recovery. Rebuilds a fresh four-layer range and synchronizes the DN hedge before unlock.
+    /// @dev No principal is transferred. Any checkpoint, mint, hedge or oracle failure reverts atomically and leaves
+    ///      the progressive cycle active so keepers can still resume it.
     function cancelProgressiveRebalance() external {
         require(msg.sender == safe && progressiveRebalanceStatus != 0, "Only Safe");
         bytes32 decisionHash = progressiveDecisionHash;
         progressiveRebalanceStatus = 3;
-        if (IProgressiveVault(vault).isRebalancing()) IProgressiveVault(vault).endRebalance();
+        require(IProgressiveVault(vault).isRebalancing(), "Vault unlocked");
+        IProgressiveStrategy engine = IProgressiveStrategy(strategyEngine);
+        if (engine.checkpointDue()) engine.checkpointMarketState();
+        IProgressiveRangeManager(rangeManager).mintInitialPosition();
+        IProgressiveVault(vault).endRebalance();
         delete progressiveTickLower;
         delete progressiveTickUpper;
         delete progressiveDecisionHash;
@@ -437,6 +450,7 @@ contract SecureBotModule {
         // la limite quotidienne — sinon un jour de forte activite pourrait laisser le vault verrouille.
         // Toutes les autres fonctions vault (dont startRebalance) restent soumises a la limite.
         bytes4 selector = bytes4(data[:4]);
+        if (selector == END_REBALANCE_SELECTOR) require(progressiveRebalanceStatus == 0, "Progressive active");
         _requireInflowsForSelector(selector);
         if (selector != END_REBALANCE_SELECTOR) {
             _consumeDailyLimit();
