@@ -7,7 +7,6 @@ import "v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "./interfaces/IRangeStrategyEngine.sol";
 import "./RangeOperations.sol";
-import "./DnDepositLib.sol";
 import "./RangeStrategyDnLib.sol";
 
 interface IRangeManagerStrategy {
@@ -299,7 +298,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         (uint128 price0, uint128 price1,, int24 liveTick,, bool valid) = rm.priceCache();
         if (!valid || price0 == 0 || price1 == 0) revert StrategyDataUnavailable();
 
-        (int24 tacticalTick, int24 strategicTick) = DnDepositLib.strategyCanonicalTwaps(
+        (int24 tacticalTick, int24 strategicTick) = RangeStrategyDnLib.canonicalTwaps(
             pool, epoch, cfg.epochSeconds, cfg.tacticalHorizonSeconds, cfg.strategicHorizonSeconds
         );
         uint256 feeGrowth0 = IUniswapV3Pool(pool).feeGrowthGlobal0X128();
@@ -729,7 +728,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     }
 
     function _dnContext() private view returns (RangeStrategyDnLib.Context memory dn) {
-        (bool rateAvailable, uint256 rateRay) = DnDepositLib.strategyAaveBorrowRateRay(hedgeManager);
+        (bool rateAvailable, uint256 rateRay) = RangeStrategyDnLib.aaveBorrowRateRay(hedgeManager);
         dn = RangeStrategyDnLib.loadContext(hedgeManager, rangeManager, _strategyToken0, rateAvailable, rateRay);
     }
 

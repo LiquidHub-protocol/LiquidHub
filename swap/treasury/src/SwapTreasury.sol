@@ -46,7 +46,7 @@ struct OFTFeeDetail {
 }
 
 struct Ticket {
-    uint56 ticketId;
+    uint72 ticketId;
     bytes passengerBytes;
 }
 
@@ -256,9 +256,11 @@ contract SwapTreasury is Ownable2Step, ReentrancyGuard {
     }
 
     function distributeToStakers(uint256 amount) external onlyOwner nonReentrant {
+        require(!adminWithdrawEnabled, "Phase 1");
         require(!distributionsPaused, "Distributions paused");
         require(stakingRewardsAddress != address(0), "Staking not set");
         require(amount > 0, "Zero amount");
+        _requireDistributableUsdc(amount);
         usdc.safeTransfer(stakingRewardsAddress, amount);
         emit FeesDistributed(amount);
     }

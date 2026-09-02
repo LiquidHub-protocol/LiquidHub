@@ -691,8 +691,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
         return RangeOperations.calculateOptimalSwapParams(bal0, bal1, priceCache, config, tickLower, tickUpper);
     }
 
-    // Le solveur rebalance DN compatible dette vit dans DnDepositLib et est utilisé/testé côté bot/library.
-    // Il n'est pas exposé ici pour préserver la marge EIP-170 du RangeManager.
+    // Le bot et le SecureBotModule utilisent ce plan issu de la decision canonique a quatre etapes.
+    // La normalisation du hedge reste atomique dans AaveHedgeManager et fail-closed apres le remint.
 
     // ===== FONCTIONS INTERNES =====
 

@@ -9,6 +9,7 @@ import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "./DnDepositLib.sol";
+import "./RangeStrategyDnLib.sol";
 import "./interfaces/IRangeStrategyEngine.sol";
 
 /// @dev Interface minimale du RangeManager pour lire la liste des positions LP (adjustHedge).
@@ -631,16 +632,25 @@ contract AaveHedgeManager is ReentrancyGuard {
         (, uint256 debtBaseBefore,,,, uint256 hfBefore) = pool.getUserAccountData(address(this));
         (uint256 directRepair, uint256 flashRepair) = DnDepositLib.aaveHfRepairAmounts();
         if (directRepair == 0 && flashRepair == 0) revert HedgeCheck(44);
+        bool residualDeferred;
         if (directRepair > 0) _doRepayDebt(directRepair);
         if (flashRepair > 0) {
             _flashLoanActive = true;
-            pool.flashLoanSimple(
-                address(this), address(weth), flashRepair, abi.encode(flashRepair, 0, false, address(0), 0), 0
-            );
+            bytes memory params = abi.encode(flashRepair, 0, false, address(0), 0);
+            if (directRepair > 0) {
+                // Preserve a safe direct repayment if the residual flash leg is temporarily unavailable.
+                try pool.flashLoanSimple(address(this), address(weth), flashRepair, params, 0) {}
+                catch {
+                    residualDeferred = true;
+                }
+            } else {
+                pool.flashLoanSimple(address(this), address(weth), flashRepair, params, 0);
+            }
             _flashLoanActive = false;
         }
-        _requireHfMin();
+        if (!residualDeferred) _requireHfMin();
         (, uint256 debtBaseAfter,,,, uint256 hfAfter) = pool.getUserAccountData(address(this));
+        if (debtBaseAfter >= debtBaseBefore || hfAfter <= hfBefore) revert BadHealthFactor();
         uint256 debtRepaidBase = debtBaseBefore > debtBaseAfter ? debtBaseBefore - debtBaseAfter : 0;
         bool bountyEligible = debtRepaidBase >= uint256(hfRepairBountyMinUsd);
         if (bountyEligible && treasuryAddress != address(0)) {
@@ -693,12 +703,7 @@ contract AaveHedgeManager is ReentrancyGuard {
         //    int256 OBLIGATOIRE : si idle > dette (ex. donation), effectiveShort < 0 => sous-hedge AGGRAVE.
         //    Anti-grief donation : on ne compte que la PART AU-DELA du seuil dust (pas tout-ou-rien), et on
         //    filtre AUSSI le token0 du HedgeManager (sinon une donation au HM force un sous-hedge artificiel = DoS).
-        (uint256 currentDebtWeth, int256 effectiveShort) =
-            DnDepositLib.aaveEffectiveShort(address(variableDebtWeth), address(weth), rangeManager, donationDustToken0);
-
-        // Une exposition nette negative signifie que les soldes token0 idle depassent la dette (donation,
-        // fees non reinvesties ou etat transitoire). Ne jamais emprunter un montant dicte par ces soldes:
-        // le rebalance atomique doit d'abord les integrer a la composition LP.
+        (uint256 currentDebtWeth, int256 effectiveShort) = RangeStrategyDnLib.normalizeNegativeEffectiveShort();
         if (effectiveShort < 0) revert HedgeCheck(57);
         bool borrowed = effectiveShort < int256(targetShort);
         uint256 diff =

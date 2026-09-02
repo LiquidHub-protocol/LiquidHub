@@ -345,6 +345,25 @@ test('same signer on two pools shares state and serializes signed actions', asyn
   assert.deepEqual(order, ['first-start', 'first-end', 'second-start', 'second-end']);
 });
 
+test('a stale signer lock is reclaimed even when its PID has been reused', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-stale-lock-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const wallet = ethers.Wallet.createRandom();
+  const pool = Object.create(RPCPool.prototype);
+  configureSignerState(pool, { dir, wallet });
+  const provider = { send: async () => '0xa4b1' };
+  pool.providers = [{ provider, healthy: true, chainVerified: false, chainMismatch: false }];
+  await pool._ensureSignerState(provider);
+  fsSync.writeFileSync(pool.processLockFile, `${JSON.stringify({ pid: process.pid, token: 'stale' })}\n`);
+  const staleAt = new Date(Date.now() - 3 * 60_000);
+  fsSync.utimesSync(pool.processLockFile, staleAt, staleAt);
+
+  let executed = false;
+  await pool._withSignerLock(provider, async () => { executed = true; });
+  assert.equal(executed, true);
+  assert.equal(fsSync.existsSync(pool.processLockFile), false);
+});
+
 test('persisted transaction is cleared when its nonce was mined by a replacement', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-replaced-nonce-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));

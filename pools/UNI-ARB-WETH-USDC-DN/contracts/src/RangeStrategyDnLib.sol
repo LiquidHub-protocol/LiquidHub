@@ -2,10 +2,14 @@
 pragma solidity 0.8.36;
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import "openzeppelin-contracts/contracts/utils/math/Math.sol";
+import "v3-core/contracts/interfaces/IUniswapV3Pool.sol";
+import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "./RangeOperations.sol";
 import "./interfaces/IRangeStrategyEngine.sol";
 
 interface IDnRangeManagerState {
+    function refreshPriceCache() external;
     function priceCache()
         external
         view
@@ -23,6 +27,24 @@ interface IDnRangeManagerState {
             bool oraclesConfigured,
             uint32 maxPositions
         );
+}
+
+interface IDnNegativeHedgeContext {
+    function pool() external view returns (address);
+    function weth() external view returns (address);
+    function usdc() external view returns (address);
+    function variableDebtWeth() external view returns (address);
+    function rangeManager() external view returns (address);
+    function swapRouter() external view returns (address);
+    function swapPoolFee() external view returns (uint24);
+    function volatileDecimals() external view returns (uint8);
+    function stableDecimals() external view returns (uint8);
+    function donationDustToken0() external view returns (uint256);
+    function swapSlippageBps() external view returns (uint16);
+}
+
+interface IDnAaveSupply {
+    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
 }
 
 interface IDnAaveStrategyState {
@@ -59,6 +81,114 @@ library RangeStrategyDnLib {
     uint128 private constant SAMPLE_LIQUIDITY = 1e12;
     int24 private constant MIN_TICK = -887272;
     int24 private constant MAX_TICK = 887272;
+    uint160 private constant MIN_SQRT_PRICE_LIMIT_X96 = 4295128740;
+    uint160 private constant MAX_SQRT_PRICE_LIMIT_X96 = 1461446703485210103287273052203988822378723970341;
+
+    error InvalidNegativeHedgeSwap();
+
+    function canonicalTwaps(
+        address pool,
+        uint64 epoch,
+        uint32 epochSeconds,
+        uint32 tacticalHorizonSeconds,
+        uint32 strategicHorizonSeconds
+    ) external view returns (int24 tacticalTick, int24 strategicTick) {
+        uint32 endAgo = uint32(block.timestamp - uint256(epoch) * epochSeconds);
+        uint32[] memory secondsAgos = new uint32[](3);
+        secondsAgos[0] = endAgo + strategicHorizonSeconds;
+        secondsAgos[1] = endAgo + tacticalHorizonSeconds;
+        secondsAgos[2] = endAgo;
+        (int56[] memory cumulatives,) = IUniswapV3Pool(pool).observe(secondsAgos);
+        strategicTick = _meanCanonicalTick(cumulatives[2] - cumulatives[0], strategicHorizonSeconds);
+        tacticalTick = _meanCanonicalTick(cumulatives[2] - cumulatives[1], tacticalHorizonSeconds);
+    }
+
+    function aaveBorrowRateRay(address hedgeManager) external view returns (bool available, uint256 rateRay) {
+        (bool poolOk, bytes memory poolData) = hedgeManager.staticcall(abi.encodeWithSignature("pool()"));
+        (bool assetOk, bytes memory assetData) = hedgeManager.staticcall(abi.encodeWithSignature("weth()"));
+        if (!poolOk || !assetOk || poolData.length < 32 || assetData.length < 32) return (false, 0);
+        address aavePool = abi.decode(poolData, (address));
+        address asset = abi.decode(assetData, (address));
+        (bool reserveOk, bytes memory reserveData) =
+            aavePool.staticcall(abi.encodeWithSignature("getReserveData(address)", asset));
+        if (!reserveOk || reserveData.length < 5 * 32) return (false, 0);
+        assembly ("memory-safe") {
+            rateRay := mload(add(reserveData, 0xa0))
+        }
+        available = rateRay > 0 && rateRay <= 10e27;
+    }
+
+    /// @dev Called by delegatecall from AaveHedgeManager. It sells only the exact token0 excess held by that
+    ///      manager, with the same live oracle and sqrt-price bounds as an ordinary under-hedge adjustment.
+    function normalizeNegativeEffectiveShort() external returns (uint256 debt, int256 effectiveShort) {
+        IDnNegativeHedgeContext context = IDnNegativeHedgeContext(address(this));
+        address token0 = context.weth();
+        address rangeManager = context.rangeManager();
+        uint256 dustFloor = context.donationDustToken0();
+        uint256 idleHm;
+        (debt, effectiveShort, idleHm) = _effectiveShort(context.variableDebtWeth(), token0, rangeManager, dustFloor);
+        if (effectiveShort >= 0) return (debt, effectiveShort);
+
+        uint256 excessToken0 = uint256(-effectiveShort);
+        if (idleHm < excessToken0) return (debt, effectiveShort);
+
+        IDnRangeManagerState(rangeManager).refreshPriceCache();
+        (uint128 price0, uint128 price1, uint160 sqrtP,,, bool valid) = IDnRangeManagerState(rangeManager).priceCache();
+        if (!(valid && price0 > 0 && price1 > 0 && sqrtP > 0)) revert InvalidNegativeHedgeSwap();
+
+        address token1 = context.usdc();
+        uint256 theoretical = Math.mulDiv(
+            excessToken0,
+            uint256(price0) * (10 ** context.stableDecimals()),
+            uint256(price1) * (10 ** context.volatileDecimals())
+        );
+        uint256 slippageBps = context.swapSlippageBps();
+        uint256 minOut = Math.mulDiv(theoretical, BPS - slippageBps, BPS);
+        if (minOut == 0) revert InvalidNegativeHedgeSwap();
+        uint256 rawLimit = (uint256(sqrtP) * (token0 < token1 ? 20000 - slippageBps : 20000 + slippageBps)) / 20000;
+        uint160 sqrtLimit = rawLimit < MIN_SQRT_PRICE_LIMIT_X96
+            ? MIN_SQRT_PRICE_LIMIT_X96
+            : rawLimit > MAX_SQRT_PRICE_LIMIT_X96 ? MAX_SQRT_PRICE_LIMIT_X96 : uint160(rawLimit);
+
+        uint256 token0Before = IERC20(token0).balanceOf(address(this));
+        uint256 amount1 = ISwapRouter(context.swapRouter()).exactInputSingle(
+            ISwapRouter.ExactInputSingleParams({
+                tokenIn: token0,
+                tokenOut: token1,
+                fee: context.swapPoolFee(),
+                recipient: address(this),
+                deadline: block.timestamp,
+                amountIn: excessToken0,
+                amountOutMinimum: minOut,
+                sqrtPriceLimitX96: sqrtLimit
+            })
+        );
+        if (IERC20(token0).balanceOf(address(this)) != token0Before - excessToken0) {
+            revert InvalidNegativeHedgeSwap();
+        }
+        if (amount1 > 0) IDnAaveSupply(context.pool()).supply(token1, amount1, address(this), 0);
+        (debt, effectiveShort,) = _effectiveShort(context.variableDebtWeth(), token0, rangeManager, dustFloor);
+    }
+
+    function _meanCanonicalTick(int56 delta, uint32 seconds_) private pure returns (int24 tick) {
+        tick = int24(delta / int56(uint56(seconds_)));
+        if (delta < 0 && delta % int56(uint56(seconds_)) != 0) tick--;
+    }
+
+    function _effectiveShort(address debtToken, address token0, address rangeManager, uint256 dustFloor)
+        private
+        view
+        returns (uint256 debt, int256 effectiveShort, uint256 idleHm)
+    {
+        debt = IERC20(debtToken).balanceOf(address(this));
+        idleHm = _netOfDust(IERC20(token0).balanceOf(address(this)), dustFloor);
+        uint256 idleRm = _netOfDust(IERC20(token0).balanceOf(rangeManager), dustFloor);
+        effectiveShort = int256(debt) - int256(idleHm) - int256(idleRm);
+    }
+
+    function _netOfDust(uint256 balance, uint256 dustFloor) private pure returns (uint256) {
+        return balance > dustFloor ? balance - dustFloor : 0;
+    }
 
     struct Context {
         bool configured;
@@ -426,12 +556,12 @@ library RangeStrategyDnLib {
         int24 upper,
         int24 liveTick
     ) private pure returns (bool admissible, uint256 penaltyBps, uint256 hedgeDriftBps) {
-        if (!context.configured || context.effectiveShortToken0 < 0) return (false, 0, 0);
+        if (!context.configured) return (false, 0, 0);
         if (!position.exists) return (true, 0, 0);
 
         uint256 targetShort = _candidateTargetShort(context, position, lower, upper, liveTick);
         if (targetShort == 0) return (false, 0, 0);
-        uint256 effectiveShort = uint256(context.effectiveShortToken0);
+        uint256 effectiveShort = context.effectiveShortToken0 < 0 ? 0 : uint256(context.effectiveShortToken0);
         Projection memory projected = _projectHedgeState(context, risk, targetShort);
         if (!projected.admissible) return (false, 0, projected.hedgeDriftBps);
 
@@ -449,7 +579,7 @@ library RangeStrategyDnLib {
         uint16 width,
         SearchConfig memory config
     ) private pure returns (int24 bestLower, int24 bestUpper, bool found) {
-        if (!position.exists || !context.configured || context.effectiveShortToken0 < 0) return (0, 0, false);
+        if (!position.exists || !context.configured) return (0, 0, false);
         int256 spacing = int256(config.tickSpacing);
         int256 low = int256(config.liveTick) - int256(uint256(width)) + spacing;
         int256 high = int256(config.liveTick) + int256(uint256(width)) - spacing;
@@ -465,7 +595,7 @@ library RangeStrategyDnLib {
         if (low > high) return (0, 0, false);
         int256 minimumSearchCenter = low;
         int256 maximumSearchCenter = high;
-        uint256 effectiveShort = uint256(context.effectiveShortToken0);
+        uint256 effectiveShort = context.effectiveShortToken0 < 0 ? 0 : uint256(context.effectiveShortToken0);
         uint256 bestDifference = type(uint256).max;
 
         for (uint256 iteration; iteration < 12 && low <= high; ++iteration) {
@@ -569,8 +699,10 @@ library RangeStrategyDnLib {
         (token0InLp,) =
             RangeOperations.strategyAmountsAtTick(position.lower, position.upper, liveTick, position.liquidity);
         targetShort = token0InLp * context.hedgeTargetBps / BPS;
-        if (targetShort > 0 && context.effectiveShortToken0 >= 0) {
-            driftBps = _absDiff(uint256(context.effectiveShortToken0), targetShort) * BPS / targetShort;
+        if (targetShort > 0) {
+            driftBps = context.effectiveShortToken0 < 0
+                ? (targetShort + uint256(-context.effectiveShortToken0)) * BPS / targetShort
+                : _absDiff(uint256(context.effectiveShortToken0), targetShort) * BPS / targetShort;
         }
     }
 
@@ -638,11 +770,23 @@ library RangeStrategyDnLib {
         pure
         returns (uint256 driftBps, uint256 exposureBps, bool adjustmentFeasible, uint8 direction)
     {
-        if (!context.configured || context.effectiveShortToken0 < 0 || context.debtBase == 0) return (0, 0, false, 0);
+        if (!context.configured) return (0, 0, false, 0);
         if (!position.exists || position.liquidity == 0) return (0, 0, false, 0);
         (uint256 token0InLp, uint256 token1InLp) =
             RangeOperations.strategyAmountsAtTick(position.lower, position.upper, liveTick, position.liquidity);
         uint256 target = token0InLp * context.hedgeTargetBps / BPS;
+        if (context.effectiveShortToken0 < 0) {
+            uint256 excessToken0 = uint256(-context.effectiveShortToken0);
+            uint256 negativeToken0Units = 10 ** context.token0Decimals;
+            uint256 negativePortfolioBase = token0InLp * uint256(context.price0) / negativeToken0Units
+                + token1InLp * uint256(context.price1) / (10 ** context.token1Decimals);
+            uint256 negativeExposureToken0 = target + excessToken0;
+            uint256 negativeExposureBase = negativeExposureToken0 * uint256(context.price0) / negativeToken0Units;
+            exposureBps =
+                negativePortfolioBase == 0 ? type(uint256).max : negativeExposureBase * BPS / negativePortfolioBase;
+            driftBps = target == 0 ? type(uint256).max : negativeExposureToken0 * BPS / target;
+            return (driftBps, exposureBps, false, 1);
+        }
         uint256 effectiveShort = uint256(context.effectiveShortToken0);
         direction = target > effectiveShort ? 1 : target < effectiveShort ? 2 : 0;
         uint256 exposureToken0 = _absDiff(effectiveShort, target);
@@ -840,8 +984,8 @@ library RangeStrategyDnLib {
         pure
         returns (Projection memory projected)
     {
-        if (!context.configured || context.effectiveShortToken0 < 0 || targetShort == 0) return projected;
-        uint256 effectiveShort = uint256(context.effectiveShortToken0);
+        if (!context.configured || targetShort == 0) return projected;
+        uint256 effectiveShort = context.effectiveShortToken0 < 0 ? 0 : uint256(context.effectiveShortToken0);
         projected.hedgeDriftBps = _absDiff(targetShort, effectiveShort) * BPS / targetShort;
         uint256 units = 10 ** context.token0Decimals;
         uint256 targetBase = targetShort * uint256(context.price0) / units;

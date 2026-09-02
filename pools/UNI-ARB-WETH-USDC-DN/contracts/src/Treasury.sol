@@ -49,7 +49,7 @@ struct OFTFeeDetail {
 }
 
 struct Ticket {
-    uint56 ticketId;
+    uint72 ticketId;
     bytes passengerBytes;
 }
 

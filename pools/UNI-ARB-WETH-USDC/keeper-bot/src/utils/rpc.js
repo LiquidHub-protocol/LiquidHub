@@ -10,6 +10,8 @@ const RPC_READ_TIMEOUT_MS = 20_000;
 const RPC_TX_TIMEOUT_MS = 90_000;
 const SIGNER_LOCK_TIMEOUT_MS = 5 * 60_000;
 const SIGNER_LOCK_POLL_MS = 250;
+const SIGNER_LOCK_HEARTBEAT_MS = 5_000;
+const SIGNER_LOCK_STALE_MS = 2 * 60_000;
 const HF_REPAIR_DATA = '0x30cbb735'; // repairHealthFactor()
 
 function readPositiveGweiEnv(name) {
@@ -232,6 +234,11 @@ class RPCPool {
   _isLockOwnerAlive(lock) {
     if (!Number.isInteger(lock?.pid) || lock.pid <= 0) return false;
     try {
+      if (Date.now() - fs.statSync(this.processLockFile).mtimeMs > SIGNER_LOCK_STALE_MS) return false;
+    } catch {
+      return false;
+    }
+    try {
       process.kill(lock.pid, 0);
       return true;
     } catch (error) {
@@ -254,10 +261,20 @@ class RPCPool {
           acquiredAt: new Date().toISOString(),
         })}\n`);
         fs.closeSync(fd);
+        const heartbeat = setInterval(() => {
+          try {
+            const current = JSON.parse(fs.readFileSync(this.processLockFile, 'utf8'));
+            if (current.token !== token) return;
+            const now = new Date();
+            fs.utimesSync(this.processLockFile, now, now);
+          } catch {}
+        }, SIGNER_LOCK_HEARTBEAT_MS);
+        heartbeat.unref?.();
         try {
           this._migrateLegacyPendingTx();
           return await fn();
         } finally {
+          clearInterval(heartbeat);
           try {
             const current = JSON.parse(fs.readFileSync(this.processLockFile, 'utf8'));
             if (current.token === token) fs.unlinkSync(this.processLockFile);

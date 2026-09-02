@@ -602,22 +602,6 @@ library DnDepositLib {
         debtUsd = (IERC20(debtToken).balanceOf(address(this)) * uint256(price0)) / (10 ** volatileDecimals);
     }
 
-    /// @notice Reads the annualized Aave variable borrow rate (RAY) used by the strategy engine.
-    function strategyAaveBorrowRateRay(address hedgeManager) external view returns (bool available, uint256 rateRay) {
-        (bool poolOk, bytes memory poolData) = hedgeManager.staticcall(abi.encodeWithSignature("pool()"));
-        (bool assetOk, bytes memory assetData) = hedgeManager.staticcall(abi.encodeWithSignature("weth()"));
-        if (!poolOk || !assetOk || poolData.length < 32 || assetData.length < 32) return (false, 0);
-        address aavePool = abi.decode(poolData, (address));
-        address asset = abi.decode(assetData, (address));
-        (bool reserveOk, bytes memory reserveData) =
-            aavePool.staticcall(abi.encodeWithSignature("getReserveData(address)", asset));
-        if (!reserveOk || reserveData.length < 5 * 32) return (false, 0);
-        assembly ("memory-safe") {
-            rateRay := mload(add(reserveData, 0xa0))
-        }
-        available = rateRay > 0 && rateRay <= 10e27;
-    }
-
     function aaveReserveExcessStable(
         address aavePool,
         address aToken,
@@ -896,23 +880,6 @@ library DnDepositLib {
         return (diff * 10000) / target >= uint256(thresholdBps);
     }
 
-    function strategyCanonicalTwaps(
-        address pool,
-        uint64 epoch,
-        uint32 epochSeconds,
-        uint32 tacticalHorizonSeconds,
-        uint32 strategicHorizonSeconds
-    ) external view returns (int24 tacticalTick, int24 strategicTick) {
-        uint32 endAgo = uint32(block.timestamp - uint256(epoch) * epochSeconds);
-        uint32[] memory secondsAgos = new uint32[](3);
-        secondsAgos[0] = endAgo + strategicHorizonSeconds;
-        secondsAgos[1] = endAgo + tacticalHorizonSeconds;
-        secondsAgos[2] = endAgo;
-        (int56[] memory cumulatives,) = IUniswapV3Pool(pool).observe(secondsAgos);
-        strategicTick = _meanStrategyTick(cumulatives[2] - cumulatives[0], strategicHorizonSeconds);
-        tacticalTick = _meanStrategyTick(cumulatives[2] - cumulatives[1], tacticalHorizonSeconds);
-    }
-
     function _readDecision(address engine, bytes32 expectedHash, bool validate)
         private
         view
@@ -951,11 +918,6 @@ library DnDepositLib {
 
     function _isProtocolBotCaller(address rangeManager, address caller) private view returns (bool) {
         return IRmDep(rangeManager).isProtocolBotCaller(caller);
-    }
-
-    function _meanStrategyTick(int56 delta, uint32 seconds_) private pure returns (int24 tick) {
-        tick = int24(delta / int56(uint56(seconds_)));
-        if (delta < 0 && delta % int56(uint56(seconds_)) != 0) tick--;
     }
 
     // ===== helpers internes (inlinés dans la library) =====

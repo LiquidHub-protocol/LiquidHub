@@ -47,6 +47,7 @@ interface IProgressiveRangeManager {
 }
 
 interface IProgressiveVault {
+    function syncFeesForDeposits() external;
     function endRebalance() external;
     function isRebalancing() external view returns (bool);
 }
@@ -197,6 +198,7 @@ contract SecureBotModule {
         require(progressiveRebalanceStatus == 0, "Progressive active");
         _requireProgressiveHfSafe();
         progressiveRebalanceStatus = 1;
+        IProgressiveVault(vault).syncFeesForDeposits();
         IRangeManagerPostCheck(rangeManager).refreshPriceCache();
         (progressiveSwapBudgetUsdE8, progressiveReverseBudgetUsdE8, progressiveInitialZeroForOne) =
             _requireProgressivePlan();
