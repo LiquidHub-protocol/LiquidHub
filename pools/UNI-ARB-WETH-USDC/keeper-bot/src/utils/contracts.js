@@ -4,6 +4,7 @@ const { ethers } = require('ethers');
 
 // RangeManager ABI (only functions needed by keeper)
 const RANGEMANAGER_ABI = [
+  "error SwapChunkAboveCap()",
   "function rebalance(bytes32 expectedDecisionHash, uint256[] calldata swapAmountsIn, uint256[] calldata minAmountsOut, address tokenIn, address tokenOut) external",
   "function getOptimalSwapParams() external view returns (tuple(bool swapNeeded, bool zeroForOne, uint256 amountIn, uint256 currentBalance0, uint256 currentBalance1, uint256 targetRatio0Bps, int24 tickLower, int24 tickUpper))",
   "function getPositionDetails(uint256 tokenId) external view returns (bool inRange, int24 tickLower, int24 tickUpper, uint128 liquidity, int24 currentTick)",
@@ -115,6 +116,7 @@ const PAUSE_CONTROLLER_ABI = [
 ];
 
 const SECURE_BOT_MODULE_ABI = [
+  "error SwapChunkAboveCap()",
   "function rangeManager() external view returns (address)",
   "function strategyEngine() external view returns (address)",
   "function vault() external view returns (address)",

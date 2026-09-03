@@ -102,6 +102,8 @@ test('nonce conflicts are not treated as an already-known raw transaction', () =
   assert.equal(pool.isAlreadyKnownTx(new Error('already known')), true);
   assert.equal(pool.isAlreadyKnownTx(new Error('nonce too low')), false);
   assert.equal(pool.isAlreadyKnownTx(new Error('nonce has already been used')), false);
+  assert.equal(pool.isConsumedNonceError(new Error('nonce too low')), true);
+  assert.equal(pool.isConsumedNonceError(new Error('nonce has already been used')), true);
 });
 
 function configureSignerState(pool, { dir, wallet, poolName = 'POOL' }) {
@@ -124,6 +126,44 @@ test('nonce reconciliation requires agreement and ignores one high outlier', asy
     provider: { getTransactionCount: async () => nonce },
   }));
   assert.equal(await pool._latestSignerNonce(), 7);
+});
+
+test('nonce reconciliation uses one surviving RPC but rejects live disagreement', async () => {
+  const pool = Object.create(RPCPool.prototype);
+  pool.signerAddress = '0x0000000000000000000000000000000000000011';
+  pool.withTimeout = async (fn) => await fn();
+  pool._authenticatedProviderEntries = async () => [
+    { provider: { getTransactionCount: async () => 7 } },
+    { provider: { getTransactionCount: async () => { throw new Error('offline'); } } },
+  ];
+  assert.equal(await pool._latestSignerNonce(), 7);
+
+  pool._authenticatedProviderEntries = async () => [7, 8].map((nonce) => ({
+    provider: { getTransactionCount: async () => nonce },
+  }));
+  assert.equal(await pool._latestSignerNonce(), null);
+});
+
+test('signed broadcast reconciles a consumed nonce through the next RPC', async () => {
+  const pool = Object.create(RPCPool.prototype);
+  pool.withTimeout = async (fn) => await fn();
+  let unhealthyMarks = 0;
+  pool.markUnhealthy = () => { unhealthyMarks += 1; };
+  const first = {
+    getTransactionReceipt: async () => null,
+    broadcastTransaction: async () => { throw new Error('nonce too low'); },
+  };
+  const expectedReceipt = { status: 1, hash: '0xabcd' };
+  const second = { getTransactionReceipt: async () => expectedReceipt };
+  const entries = [first, second].map((provider) => ({ provider }));
+  pool.providers = entries;
+  pool._authenticatedProviderEntries = async () => entries;
+
+  assert.equal(
+    await pool._broadcastSignedTransaction('0x1234', '0xabcd', 'rebalance', 0, 1),
+    expectedReceipt
+  );
+  assert.equal(unhealthyMarks, 0, 'a consumed nonce is not an RPC health failure');
 });
 
 test('keeper rejects RPC fee suggestions above its env-defined ceiling', () => {
@@ -640,6 +680,11 @@ test('router fill errors trigger one action-coupled refresh and plan recompute',
   const rebalancer = new Rebalancer({}, {}, {}, {}, {});
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('Too little received')), true);
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: PartialFill()')), true);
+  assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: Use atomic')), true);
+  assert.equal(rebalancer._shouldRefreshForPlanError(new Error('execution reverted: E91')), true);
+  assert.equal(rebalancer._shouldRefreshForPlanError(new Error('SwapChunkAboveCap()')), true);
+  const contractsSource = fsSync.readFileSync(path.join(__dirname, '../src/utils/contracts.js'), 'utf8');
+  assert.match(contractsSource, /error SwapChunkAboveCap\(\)/);
 });
 
 test('rebalance no longer needed does not sync fees, refresh, or send a tx', async () => {

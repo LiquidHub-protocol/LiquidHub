@@ -476,6 +476,11 @@ class RPCPool {
       msg.includes('known transaction');
   }
 
+  isConsumedNonceError(error) {
+    const msg = `${error?.shortMessage || ''} ${error?.message || ''}`.toLowerCase();
+    return msg.includes('nonce too low') || msg.includes('nonce has already been used');
+  }
+
   async withTimeout(fn, timeoutMs, label = 'RPC request') {
     let timeoutId;
     try {
@@ -529,10 +534,10 @@ class RPCPool {
       ).catch(() => null);
       if (nonce !== null) counts.set(nonce, (counts.get(nonce) || 0) + 1);
     }
-    const expectedProviders = Array.isArray(this.providers)
-      ? this.providers.filter((entry) => !entry.chainMismatch).length
-      : entries.length;
-    const quorum = expectedProviders === 1 ? 1 : 2;
+    const successfulResponses = [...counts.values()].reduce((total, count) => total + count, 0);
+    // One surviving authenticated RPC is no weaker than the keeper's supported single-RPC mode.
+    // As soon as two or more answer, agreement remains mandatory and divergent nonces fail closed.
+    const quorum = successfulResponses === 1 ? 1 : 2;
     const confirmed = [...counts.entries()]
       .filter(([, count]) => count >= quorum)
       .map(([nonce]) => nonce);
@@ -939,13 +944,15 @@ class RPCPool {
           if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
           return receipt;
         }
-        if (!this.isProviderError(error) && !this.isAlreadyKnownTx(error)) {
+        const providerError = this.isProviderError(error);
+        const consumedNonce = this.isConsumedNonceError(error);
+        if (!providerError && !this.isAlreadyKnownTx(error) && !consumedNonce) {
           error = sanitizeRpcError(error);
           error.message = `${safeErrorMessage(error)} (signed tx: ${txHash})`;
           throw error;
         }
         lastError = error;
-        this.markUnhealthy(provider, true);
+        if (providerError) this.markUnhealthy(provider, true);
         console.warn(`RPC signed tx attempt ${attempt}/${attempts} failed: ${safeErrorMessage(error)}`);
       }
     }
