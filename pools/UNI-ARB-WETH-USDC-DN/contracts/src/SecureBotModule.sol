@@ -324,8 +324,7 @@ contract SecureBotModule {
         progressiveRebalanceStatus = 3;
         require(IProgressiveVault(vault).isRebalancing(), "Vault unlocked");
         IProgressiveStrategy engine = IProgressiveStrategy(strategyEngine);
-        require(engine.checkpointDue(), "Wait checkpoint");
-        engine.checkpointMarketState();
+        if (engine.checkpointDue()) engine.checkpointMarketState();
         IProgressiveRangeManager(rangeManager).mintInitialPosition();
         IProgressiveVault(vault).endRebalance();
         delete progressiveTickLower;
