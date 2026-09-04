@@ -317,6 +317,18 @@ class Rebalancer {
     return this.secureBotModule;
   }
 
+  async compoundPosition() {
+    const investedUsdE8 = BigInt(await this.rpcPool.executeWithRetry(async (provider) => {
+      return this._requireProgressiveModule().connect(provider).compound.staticCall({ from: this.wallet.address });
+    }));
+    // Same threshold as the main bot; no new Aave call or independently chosen hedge target.
+    if (investedUsdE8 < 100000000n) {
+      return { success: true, noAction: true, investedUsdE8, txHashes: [] };
+    }
+    const receipt = await this._sendProgressiveTransaction('compound', [], 'compound');
+    return { success: true, investedUsdE8, txHashes: [receipt.hash] };
+  }
+
   async getProgressiveRebalanceStatus() {
     return Number(await this.rpcPool.executeWithRetry(async (provider) => {
       return await this._requireProgressiveModule().connect(provider).progressiveRebalanceStatus();
@@ -341,16 +353,17 @@ class Rebalancer {
       const rm = this.rangeManager.connect(provider);
       const status = Number(await module.progressiveRebalanceStatus());
       if (status !== 2) return { status };
-      const [plan, priceCache, cfg, capUsd, budgetUsd8, reverseBudgetUsd8, initialZeroForOne] = await Promise.all([
+      const [plan, priceCache, cfg, capUsd, budgetUsd8, cycleBudgetUsd8, reverseBudgetUsd8, initialZeroForOne] = await Promise.all([
         module.getProgressiveSwapParams(),
         rm.priceCache(),
         rm.config(),
         rm.initMultiSwapTvl(),
         module.progressiveSwapBudgetUsdE8(),
+        module.progressiveCycleBudgetUsdE8(),
         module.progressiveReverseBudgetUsdE8(),
         module.progressiveInitialZeroForOne(),
       ]);
-      return { status, plan, priceCache, cfg, capUsd, budgetUsd8, reverseBudgetUsd8, initialZeroForOne };
+      return { status, plan, priceCache, cfg, capUsd, budgetUsd8, cycleBudgetUsd8, reverseBudgetUsd8, initialZeroForOne };
     });
   }
 
@@ -361,6 +374,8 @@ class Rebalancer {
     const decimals = Number(tokenInIsToken0 ? cfg.token0Decimals : cfg.token1Decimals);
     if (priceIn <= 0n || BigInt(capUsd) <= 0n) throw new Error('invalid on-chain progressive cap or price');
     let remainingBudgetUsd8 = BigInt(state.budgetUsd8);
+    const cycleBudgetUsd8 = BigInt(state.cycleBudgetUsd8);
+    if (cycleBudgetUsd8 < remainingBudgetUsd8) remainingBudgetUsd8 = cycleBudgetUsd8;
     if (tokenInIsToken0 !== Boolean(state.initialZeroForOne)) {
       const reverseBudgetUsd8 = BigInt(state.reverseBudgetUsd8);
       if (reverseBudgetUsd8 < remainingBudgetUsd8) remainingBudgetUsd8 = reverseBudgetUsd8;
@@ -373,8 +388,59 @@ class Rebalancer {
     return capRaw;
   }
 
+  async _maybeRefreshProgressiveTarget(txHashes) {
+    const readState = () => this.rpcPool.executeWithRetry(async (provider) => {
+      const module = this._requireProgressiveModule().connect(provider);
+      const engine = this.strategyEngine.connect(provider);
+      const [status, locked, positions, planEpoch, decision, checkpointDue] = await Promise.all([
+        module.progressiveRebalanceStatus(),
+        this.vault.connect(provider).isRebalancing(),
+        this.rangeManager.connect(provider).getOwnerPositions(),
+        module.progressivePlanEpoch(),
+        engine.previewDecision(),
+        engine.checkpointDue(),
+      ]);
+      return { status: Number(status), locked, positions, planEpoch, decision, checkpointDue };
+    });
+    let state = await readState();
+    if (![0, 2].includes(state.status) || !state.locked || state.positions.length !== 0) return false;
+    if (state.checkpointDue) {
+      // The current engine must authorise the new target. Never invent ticks or widen a swap budget locally.
+
+      try {
+        const receipt = await this.rpcPool.executeSignedTxWithRetry(async (provider) => {
+          const signer = this.wallet.connect(provider);
+          const engine = (this.strategyEngine.connect(provider)).connect(signer);
+          const request = await engine.checkpointMarketState.populateTransaction();
+          return { wallet: signer, request: await this._boundTransactionGas(provider, signer, request, 'checkpointMarketState progressive') };
+        }, 'checkpointMarketState progressive');
+        txHashes.push(receipt.hash || receipt.transactionHash);
+      } catch (error) {
+
+        // Another keeper may have checkpointed, or the protocol bot may still be in the keeper window.
+        state = await readState();
+        if (state.checkpointDue) return false;
+      }
+      state = await readState();
+    }
+    if (!state.locked || state.positions.length !== 0 || ![0, 2].includes(state.status)) return false;
+    if (!state.decision.dataFresh || Number(state.decision.reason) !== 1) return false;
+    if (state.status === 2 && BigInt(state.decision.epoch) <= BigInt(state.planEpoch)) return false;
+    await this.rpcPool.executeWithRetry(async (provider) => {
+      return this._requireProgressiveModule().connect(provider).refreshProgressiveRebalance.staticCall(state.decision.decisionHash, {
+        from: this.wallet.address,
+      });
+    });
+    const receipt = await this._sendProgressiveTransaction(
+      'refreshProgressiveRebalance', [state.decision.decisionHash], 'refreshProgressiveRebalance'
+    );
+    txHashes.push(receipt.hash || receipt.transactionHash);
+    return true;
+  }
+
   async _runProgressiveRebalance(expectedDecisionHash = null) {
     const txHashes = [];
+    await this._maybeRefreshProgressiveTarget(txHashes);
     let status = await this.getProgressiveRebalanceStatus();
 
     if (status === 0) {
@@ -391,6 +457,7 @@ class Rebalancer {
     let staleRetries = 0;
     while (true) {
       if (this.beforeProgressiveStep) await this.beforeProgressiveStep();
+      await this._maybeRefreshProgressiveTarget(txHashes);
       const state = await this._readProgressivePlan();
       if (state.status === 0) break;
       if (state.status !== 2) throw new Error(`non-executable progressive DN rebalance state: ${state.status}`);
@@ -461,7 +528,10 @@ class Rebalancer {
   }
 
   async resumeProgressiveRebalanceIfActive() {
-    if (await this.getProgressiveRebalanceStatus() === 0) return null;
+    if (await this.getProgressiveRebalanceStatus() === 0) {
+      const locked = await this.rpcPool.executeWithRetry(async (provider) => this.vault.connect(provider).isRebalancing());
+      if (!locked) return null;
+    }
     console.log('  Active progressive DN rebalance detected; resuming it before ordinary actions.');
     return await this._runProgressiveRebalance();
   }

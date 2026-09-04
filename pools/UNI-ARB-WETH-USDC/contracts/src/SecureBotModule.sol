@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import "./RangeOperations.sol";
+import "./interfaces/IRangeStrategyEngine.sol";
 import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 
@@ -17,6 +18,8 @@ interface IERC20Sweep {
 }
 
 interface IRangeManagerBotState {
+    function addLiquidityToPosition() external;
+    function protocolBotAddress() external view returns (address);
     function token0() external view returns (address);
     function token1() external view returns (address);
     function priceCache() external view returns (RangeOperations.PriceCache memory);
@@ -82,6 +85,9 @@ contract SecureBotModule {
     int24 public progressiveTickLower;
     int24 public progressiveTickUpper;
     bytes32 public progressiveDecisionHash;
+    uint64 public progressivePlanEpoch;
+    // All retargets share this remaining turnover cap; only Safe recovery can renew it.
+    uint256 public progressiveCycleBudgetUsdE8;
     uint256 public progressiveSwapBudgetUsdE8;
     uint256 public progressiveReverseBudgetUsdE8;
     bool public progressiveInitialZeroForOne;
@@ -105,6 +111,7 @@ contract SecureBotModule {
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event ModuleSweep(address indexed token, uint256 amount);
     event ProgressiveRebalanceStarted(bytes32 indexed decisionHash, int24 tickLower, int24 tickUpper, address keeper);
+    event ProgressiveRebalanceRefreshed(bytes32 indexed decisionHash, int24 tickLower, int24 tickUpper, address keeper);
     event ProgressiveRebalanceChunk(uint256 amountIn, uint256 amountOut, address keeper);
     event ProgressiveRebalanceFinalized(bytes32 indexed decisionHash, address keeper);
     event ProgressiveRebalanceCancelled(bytes32 indexed decisionHash, address safe);
@@ -161,9 +168,66 @@ contract SecureBotModule {
 
     receive() external payable {}
 
+    event LiquidityCompounded(uint256 indexed tokenId, uint256 amount0, uint256 amount1, address indexed keeper);
+
+    /// @notice Collect fees and reinvest free balances into the current NFT. No caller-selected swap or range.
+    /// @dev Public maintenance uses the module's existing executor grant in both governance phases.
+    function compound() external returns (uint256 investedUsdE8) {
+        _requireCurrentModule();
+        if (progressiveRebalanceStatus != 0 || IProgressiveVault(vault).isRebalancing()) return 0;
+        progressiveRebalanceStatus = 3;
+        investedUsdE8 = _compoundPosition();
+        progressiveRebalanceStatus = 0;
+    }
+
+    function _compoundPosition() private returns (uint256) {
+        IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
+        uint256[] memory positions = rm.getOwnerPositions();
+        if (positions.length != 1) return 0;
+        rm.refreshPriceCache();
+        RangeOperations.PriceCache memory cache = _progressiveCache();
+        (,,,,, int24 lower, int24 upper,,,,,) = rm.positionManager().positions(positions[0]);
+        if (cache.poolTick <= lower || cache.poolTick >= upper) return 0;
+        IProgressiveVault(vault).syncFeesForDeposits();
+        RangeOperations.RangeConfig memory cfg = rm.config();
+        address t0 = rm.token0();
+        address t1 = rm.token1();
+        uint256 b0 = IERC20Sweep(t0).balanceOf(rangeManager);
+        uint256 b1 = IERC20Sweep(t1).balanceOf(rangeManager);
+        RangeOperations.OptimalSwapParams memory plan =
+            RangeOperations.calculateOptimalSwapParams(b0, b1, cache, cfg, lower, upper);
+        if (plan.swapNeeded && plan.amountIn > 0) {
+            uint256 priceIn = plan.zeroForOne ? cache.price0 : cache.price1;
+            uint256 priceOut = plan.zeroForOne ? cache.price1 : cache.price0;
+            uint256 scaleIn = 10 ** (plan.zeroForOne ? cfg.token0Decimals : cfg.token1Decimals);
+            uint256 scaleOut = 10 ** (plan.zeroForOne ? cfg.token1Decimals : cfg.token0Decimals);
+            uint256 cap = Math.mulDiv(rm.initMultiSwapTvl() * 1e8, scaleIn, priceIn);
+            uint256 amount = Math.min(plan.amountIn, cap);
+            uint256 minOut = Math.mulDiv(amount, priceIn * scaleOut, priceOut * scaleIn);
+            minOut = Math.mulDiv(minOut, 10000 - cfg.maxSlippageBps, 10000);
+            if (amount > 0 && minOut > 0) {
+                rm.executeSwap(plan.zeroForOne ? t0 : t1, plan.zeroForOne ? t1 : t0, amount, minOut);
+            }
+            b0 = IERC20Sweep(t0).balanceOf(rangeManager);
+            b1 = IERC20Sweep(t1).balanceOf(rangeManager);
+        }
+        // Skip quantities below oracle precision before calling the position manager.
+        if (
+            Math.mulDiv(b0, cache.price0, 10 ** cfg.token0Decimals) == 0
+                || Math.mulDiv(b1, cache.price1, 10 ** cfg.token1Decimals) == 0
+        ) return 0;
+        rm.addLiquidityToPosition();
+        uint256 added0 = b0 - IERC20Sweep(t0).balanceOf(rangeManager);
+        uint256 added1 = b1 - IERC20Sweep(t1).balanceOf(rangeManager);
+        emit LiquidityCompounded(positions[0], added0, added1, msg.sender);
+        return Math.mulDiv(added0, cache.price0, 10 ** cfg.token0Decimals)
+            + Math.mulDiv(added1, cache.price1, 10 ** cfg.token1Decimals);
+    }
+
     /// @notice Permissionless high-TVL path. It remains callable if the hot-bot relay is paused because
     ///         every decision, price, direction and amount is revalidated by RangeManager on-chain.
     function beginProgressiveRebalance(bytes32 expectedDecisionHash) external {
+        _requireCurrentModule();
         require(progressiveRebalanceStatus == 0, "Progressive active");
         progressiveRebalanceStatus = 1;
         IProgressiveVault(vault).syncFeesForDeposits();
@@ -172,6 +236,8 @@ contract SecureBotModule {
             _requireProgressivePlan();
         (int24 lower, int24 upper) =
             IProgressiveRangeManager(rangeManager).progressiveRebalance(0, expectedDecisionHash, 0, 0, 0, 0, msg.sender);
+        progressivePlanEpoch = IRangeStrategyEngine(strategyEngine).previewDecision().epoch;
+        progressiveCycleBudgetUsdE8 = _progressiveAssetsUsd();
         progressiveTickLower = lower;
         progressiveTickUpper = upper;
         progressiveDecisionHash = expectedDecisionHash;
@@ -186,21 +252,80 @@ contract SecureBotModule {
     {
         IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
         RangeOperations.OptimalSwapParams memory plan = rm.getOptimalSwapParams();
-        RangeOperations.PriceCache memory cache = rm.priceCache();
-        RangeOperations.RangeConfig memory cfg = rm.config();
+        (budgetUsdE8, reverseBudgetUsdE8, zeroForOne) = _progressivePlanBudget(plan);
+        require(plan.swapNeeded && budgetUsdE8 - reverseBudgetUsdE8 > rm.initMultiSwapTvl() * 1e8, "Use atomic");
+    }
+
+    function _progressiveCache() private view returns (RangeOperations.PriceCache memory cache) {
+        IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
+        cache = rm.priceCache();
         require(cache.valid && cache.price0 > 0 && cache.price1 > 0, "Invalid price");
-        uint256 price = plan.zeroForOne ? cache.price0 : cache.price1;
-        uint256 decimals = plan.zeroForOne ? cfg.token0Decimals : cfg.token1Decimals;
-        uint256 amountUsd = Math.mulDiv(plan.amountIn, price, 10 ** decimals);
-        require(plan.swapNeeded && amountUsd > rm.initMultiSwapTvl() * 1e8, "Use atomic");
+    }
+
+    function _progressivePlanBudget(RangeOperations.OptimalSwapParams memory plan)
+        private
+        view
+        returns (uint256 budgetUsdE8, uint256 reverseBudgetUsdE8, bool zeroForOne)
+    {
+        RangeOperations.PriceCache memory cache = _progressiveCache();
+        RangeOperations.RangeConfig memory cfg = IRangeManagerBotState(rangeManager).config();
+        uint256 amountUsd = Math.mulDiv(
+            plan.amountIn,
+            plan.zeroForOne ? cache.price0 : cache.price1,
+            10 ** (plan.zeroForOne ? cfg.token0Decimals : cfg.token1Decimals)
+        );
         uint256 marginBps = uint256(cfg.maxSlippageBps) + uint256(cfg.toleranceBps);
         reverseBudgetUsdE8 = Math.mulDiv(amountUsd, marginBps, 10000, Math.Rounding.Up);
         if (reverseBudgetUsdE8 == 0) reverseBudgetUsdE8 = 1;
-        budgetUsdE8 = amountUsd + reverseBudgetUsdE8;
-        zeroForOne = plan.zeroForOne;
+        return (amountUsd + reverseBudgetUsdE8, reverseBudgetUsdE8, plan.zeroForOne);
+    }
+
+    function _progressiveAssetsUsd() private view returns (uint256) {
+        IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
+        RangeOperations.PriceCache memory cache = _progressiveCache();
+        RangeOperations.RangeConfig memory cfg = rm.config();
+        (uint256 balance0, uint256 balance1) = rm.getCurrentBalances();
+        return Math.mulDiv(balance0, cache.price0, 10 ** cfg.token0Decimals)
+            + Math.mulDiv(balance1, cache.price1, 10 ** cfg.token1Decimals);
+    }
+
+    /// @notice Retarget an interrupted cycle to the engine's fresh canonical initial-mint range.
+    /// @dev A later epoch may renew the plan budget, never the total cycle turnover cap. A newly
+    ///      governed module may recover an already locked Vault whose old NFT has been burned.
+    function refreshProgressiveRebalance(bytes32 expectedDecisionHash) external {
+        _refreshProgressiveRebalance(expectedDecisionHash, false);
+    }
+
+    function _refreshProgressiveRebalance(bytes32 expectedDecisionHash, bool safeRecovery) private {
+        _requireCurrentModule();
+        require(progressiveRebalanceStatus == 0 || progressiveRebalanceStatus == 2, "Progressive active");
+        require(IProgressiveVault(vault).isRebalancing(), "Vault unlocked");
+        bool newCycle = progressiveRebalanceStatus == 0;
+        progressiveRebalanceStatus = 3;
+        IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
+        require(rm.getOwnerPositions().length == 0, "Position exists");
+        rm.refreshPriceCache();
+        IRangeStrategyEngine.Decision memory decision =
+            IRangeStrategyEngine(strategyEngine).validateDecision(expectedDecisionHash);
+        require(decision.reason == IRangeStrategyEngine.ReasonCode.INITIAL_MINT_REQUIRED, "Invalid recovery");
+        require(newCycle || safeRecovery || decision.epoch > progressivePlanEpoch, "Plan epoch");
+        RangeOperations.PriceCache memory cache = _progressiveCache();
+        require(
+            cache.poolTick > decision.targetTickLower && cache.poolTick < decision.targetTickUpper, "Invalid recovery"
+        );
+        progressiveTickLower = decision.targetTickLower;
+        progressiveTickUpper = decision.targetTickUpper;
+        progressiveDecisionHash = expectedDecisionHash;
+        progressivePlanEpoch = decision.epoch;
+        (progressiveSwapBudgetUsdE8, progressiveReverseBudgetUsdE8, progressiveInitialZeroForOne) =
+            _progressivePlanBudget(_progressiveSwapParams());
+        if (newCycle || safeRecovery) progressiveCycleBudgetUsdE8 = _progressiveAssetsUsd();
+        progressiveRebalanceStatus = 2;
+        emit ProgressiveRebalanceRefreshed(expectedDecisionHash, progressiveTickLower, progressiveTickUpper, msg.sender);
     }
 
     function continueProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
+        _requireCurrentModule();
         require(progressiveRebalanceStatus == 2 && IProgressiveVault(vault).isRebalancing(), "No progressive");
         progressiveRebalanceStatus = 3;
         IRangeManagerBotState(rangeManager).refreshPriceCache();
@@ -231,6 +356,7 @@ contract SecureBotModule {
     }
 
     function finalizeProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
+        _requireCurrentModule();
         require(progressiveRebalanceStatus == 2 && IProgressiveVault(vault).isRebalancing(), "No progressive");
         progressiveRebalanceStatus = 3;
         if (amountIn > 0) {
@@ -243,6 +369,13 @@ contract SecureBotModule {
         IProgressiveRangeManager(rangeManager).progressiveRebalance(
             2, bytes32(0), progressiveTickLower, progressiveTickUpper, amountIn, minAmountOut, msg.sender
         );
+        _clearProgressiveRebalance();
+        emit ProgressiveRebalanceFinalized(decisionHash, msg.sender);
+    }
+
+    function _clearProgressiveRebalance() private {
+        delete progressivePlanEpoch;
+        delete progressiveCycleBudgetUsdE8;
         delete progressiveTickLower;
         delete progressiveTickUpper;
         delete progressiveDecisionHash;
@@ -250,7 +383,6 @@ contract SecureBotModule {
         delete progressiveReverseBudgetUsdE8;
         delete progressiveInitialZeroForOne;
         progressiveRebalanceStatus = 0;
-        emit ProgressiveRebalanceFinalized(decisionHash, msg.sender);
     }
 
     function _consumeProgressiveSwapBudget(bool zeroForOne, uint256 amountIn) private {
@@ -263,6 +395,8 @@ contract SecureBotModule {
             10 ** (zeroForOne ? cfg.token0Decimals : cfg.token1Decimals)
         );
         require(amountUsdE8 > 0 && amountUsdE8 <= progressiveSwapBudgetUsdE8, "Cycle budget");
+        require(amountUsdE8 <= progressiveCycleBudgetUsdE8, "Turnover budget");
+        progressiveCycleBudgetUsdE8 -= amountUsdE8;
         if (zeroForOne != progressiveInitialZeroForOne) {
             require(amountUsdE8 <= progressiveReverseBudgetUsdE8, "Reverse budget");
             progressiveReverseBudgetUsdE8 -= amountUsdE8;
@@ -270,26 +404,27 @@ contract SecureBotModule {
         progressiveSwapBudgetUsdE8 -= amountUsdE8;
     }
 
-    /// @notice Safe-only recovery. Rebuilds a fresh four-layer range before unlocking the Vault.
-    /// @dev No principal is transferred. Any checkpoint, mint or oracle failure reverts atomically and leaves the
-    ///      progressive cycle active so keepers can still resume it.
+    /// @notice Safe recovery renews the bounded cycle using the current canonical range.
+    /// @dev If balancing is still needed the Vault stays locked and keepers resume the refreshed plan.
+    ///      A no-swap recovery remints atomically through the normal finalization path before unlocking.
     function cancelProgressiveRebalance() external {
-        require(msg.sender == safe && progressiveRebalanceStatus != 0, "Only Safe");
-        bytes32 decisionHash = progressiveDecisionHash;
-        progressiveRebalanceStatus = 3;
-        require(IProgressiveVault(vault).isRebalancing(), "Vault unlocked");
+        require(msg.sender == safe && progressiveRebalanceStatus == 2, "Only Safe");
         IProgressiveStrategy engine = IProgressiveStrategy(strategyEngine);
         if (engine.checkpointDue()) engine.checkpointMarketState();
-        IProgressiveRangeManager(rangeManager).mintInitialPosition();
-        IProgressiveVault(vault).endRebalance();
-        delete progressiveTickLower;
-        delete progressiveTickUpper;
-        delete progressiveDecisionHash;
-        delete progressiveSwapBudgetUsdE8;
-        delete progressiveReverseBudgetUsdE8;
-        delete progressiveInitialZeroForOne;
-        progressiveRebalanceStatus = 0;
-        emit ProgressiveRebalanceCancelled(decisionHash, msg.sender);
+        bytes32 decisionHash = IRangeStrategyEngine(strategyEngine).previewDecision().decisionHash;
+        _refreshProgressiveRebalance(decisionHash, true);
+        if (!_progressiveSwapParams().swapNeeded) {
+            progressiveRebalanceStatus = 3;
+            IProgressiveRangeManager(rangeManager).progressiveRebalance(
+                2, bytes32(0), progressiveTickLower, progressiveTickUpper, 0, 0, msg.sender
+            );
+            _clearProgressiveRebalance();
+            emit ProgressiveRebalanceCancelled(decisionHash, msg.sender);
+        }
+    }
+
+    function _requireCurrentModule() private view {
+        require(IRangeManagerBotState(rangeManager).protocolBotAddress() == address(this), "Retired module");
     }
 
     /// @notice LP/free RangeManager NAV reconstructed at the Chainlink token ratio (USD, 8 decimals).
@@ -371,6 +506,7 @@ contract SecureBotModule {
     modifier onlyBot() {
         require(msg.sender == botAddress, "Only bot allowed");
         require(!paused, "Module paused");
+        _requireCurrentModule();
         _;
     }
 

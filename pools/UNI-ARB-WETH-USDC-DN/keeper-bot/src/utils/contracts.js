@@ -19,6 +19,7 @@ const RANGEMANAGER_ABI = [
   "function pool() external view returns (address)",
   "function positionManager() external view returns (address)",
   "function strategyEngine() external view returns (address)",
+  "function protocolBotAddress() external view returns (address)",
   // getOwnerPositions: confirme qu'un NFT existe (depot permissionless interdit si aucune position)
   "function getOwnerPositions() external view returns (uint256[] memory)"
 ];
@@ -105,6 +106,10 @@ const PAUSE_CONTROLLER_ABI = [
 ];
 
 const SECURE_BOT_MODULE_ABI = [
+  "function refreshProgressiveRebalance(bytes32 expectedDecisionHash) external",
+  "function progressivePlanEpoch() external view returns (uint64)",
+  "function progressiveCycleBudgetUsdE8() external view returns (uint256)",
+  "function compound() external returns (uint256 investedUsdE8)",
   "error SwapChunkAboveCap()",
   "function rangeManager() external view returns (address)",
   "function strategyEngine() external view returns (address)",
@@ -190,6 +195,20 @@ function sameAddress(actual, expected) {
   return ethers.getAddress(actual) === ethers.getAddress(expected);
 }
 
+async function syncCurrentBotModule(rpcPool, rangeManager, currentModule, rebalancer = null) {
+  // Governance rotates this link atomically with the executor grant. Follow it before
+  // inspecting progressive state: a retired module can retain state 2 indefinitely.
+  const address = ethers.getAddress(await rpcPool.executeWithRetry(async (provider) => {
+    return rangeManager.connect(provider).protocolBotAddress();
+  }));
+  if (address === ethers.ZeroAddress) throw new Error('RangeManager has no active bot module');
+  const module = sameAddress(await currentModule.getAddress(), address)
+    ? currentModule
+    : currentModule.attach(address);
+  if (rebalancer) rebalancer.secureBotModule = module;
+  return module;
+}
+
 async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine, secureBotModule, hedgeManager }) {
   if (String(process.env.STRATEGY_PROFILE || '').trim().toUpperCase() !== 'DELTA_NEUTRAL') {
     throw new Error('Keeper topology: STRATEGY_PROFILE must be DELTA_NEUTRAL for a DN keeper');
@@ -199,7 +218,7 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
     vault: process.env.VAULT_ADDRESS,
     hedgeManager: process.env.AAVE_HEDGE_MANAGER_ADDRESS,
     strategyEngine: process.env.RANGE_STRATEGY_ENGINE_ADDRESS,
-    secureBotModule: process.env.SAFE_MODULE_ADDRESS,
+    secureBotModule: await secureBotModule.getAddress(),
     token0: process.env.TOKEN0_ADDRESS,
     token1: process.env.TOKEN1_ADDRESS,
   };
@@ -318,5 +337,6 @@ module.exports = {
   PAUSE_CONTROLLER_ABI,
   SECURE_BOT_MODULE_ABI,
   createContracts,
+  syncCurrentBotModule,
   assertKeeperTopology,
 };

@@ -250,6 +250,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
     // --- Public Functions ---
 
     /// @notice Swap an approved ERC-20 held by this Treasury to USDC through an owner-authorized route.
+    /// @dev A zero minAmountOut uses the live oracle floor; a higher caller minimum is preserved.
     // SÉCURITÉ (audit V1) : restreint à onlyOwner (Safe Phase 1 / Timelock Phase 2).
     // Avant, swapToUSDC était public : n'importe qui
     // pouvait déclencher un swap des tokens de la Treasury avec un minAmountOut faible / une route
@@ -268,7 +269,7 @@ contract Treasury is Ownable2Step, ReentrancyGuard {
         uint256 balanceBefore = token.balanceOf(address(this));
         require(balanceBefore >= amountIn, "Insufficient balance");
         (uint256 oracleFloor, uint160 sqrtPriceLimitX96) = _oracleSwapBounds(tokenIn, amountIn);
-        require(minAmountOut >= oracleFloor, "minOut<oracle");
+        minAmountOut = minAmountOut > oracleFloor ? minAmountOut : oracleFloor;
 
         // Approve swap router for this token (safe pattern: reset then set)
         token.safeApprove(address(swapRouter), 0);

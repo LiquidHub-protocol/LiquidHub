@@ -150,6 +150,43 @@ library DnDepositLib {
     error LpPriceDeviation();
     error LpTwapDeviation();
     error SqrtRatioAIsZero();
+    // Preserve the HedgeManager's existing revert selectors when checking its settlement by delegatecall.
+    error BadHealthFactor();
+    error HedgeCheck(uint8 code);
+
+    /// @dev A partial exit must meet the ordinary HF target, or preserve an already lower HF. The only
+    ///      allowance below that inherited HF covers one native unit of each Aave token plus USD-base
+    ///      conversion/percentMul rounding. It scales with debt, not a fixed percentage of the position.
+    function aavePostSettlement(
+        address aavePool,
+        address aToken,
+        address debtToken,
+        bool fullWithdraw,
+        uint256 hfBefore,
+        uint16 targetHfBps
+    ) external view {
+        if (fullWithdraw) {
+            if (IERC20(debtToken).balanceOf(address(this)) > 0 || IERC20(aToken).balanceOf(address(this)) > 0) {
+                revert HedgeCheck(56);
+            }
+            return;
+        }
+        (uint256 collateralBase, uint256 debtBase,,,, uint256 hfAfter) =
+            IAavePoolDep(aavePool).getUserAccountData(address(this));
+        uint256 targetHf = uint256(targetHfBps) * 1e14;
+        if (hfAfter >= targetHf) return;
+        if (hfBefore >= targetHf || hfAfter < 1e18 || debtBase == 0) revert BadHealthFactor();
+        if (hfAfter >= hfBefore) return;
+
+        uint256 collateralBalance = IERC20(aToken).balanceOf(address(this));
+        uint256 debtBalance = IERC20(debtToken).balanceOf(address(this));
+        if (collateralBalance == 0 || debtBalance == 0) revert BadHealthFactor();
+        uint256 collateralUnitBase = Math.mulDiv(collateralBase, 1, collateralBalance, Math.Rounding.Up) + 2;
+        uint256 debtUnitBase = Math.mulDiv(debtBase, 1, debtBalance, Math.Rounding.Up) + 1;
+        uint256 roundingAllowance = Math.mulDiv(hfBefore, debtUnitBase, debtBase, Math.Rounding.Up)
+            + Math.mulDiv(1e18, collateralUnitBase, debtBase, Math.Rounding.Up) + 1;
+        if (hfBefore - hfAfter > roundingAllowance) revert BadHealthFactor();
+    }
 
     /// @notice Exact debt-token amount to repay through the existing flash-loan path when HF is below target.
     /// @dev Solves the repay-first equation while accounting for the collateral needed to buy back the flash
@@ -646,7 +683,11 @@ library DnDepositLib {
         uint16 maxDriftBps,
         uint256 dustFloorUsd
     ) external view {
-        _postCheck(a.hedgeManager, a.rangeManager, a.token0, price0, dec0, maxDriftBps, dustFloorUsd);
+        // Preserve maintenance's anti-donation guard. If it reports excess debt only because it masks
+        // real idle token0, a deposit may instead prove physical coverage within the same drift ceiling.
+        if (_postCheck(a.hedgeManager, a.rangeManager, a.token0, price0, dec0, maxDriftBps, dustFloorUsd) == 0) {
+            revert PreAdjustRequired();
+        }
     }
 
     /// @notice Post-check DN du REBALANCE permissionless. Args plats (RangeManager appelle avec address(this),
@@ -663,12 +704,15 @@ library DnDepositLib {
     ) external view {
         address hedgeManager = IVaultDep(IRmDep(rangeManager).vault()).hedgeManager();
         if (hedgeManager == address(0)) return;
-        _postCheck(hedgeManager, rangeManager, token0, price0, dec0, maxDriftBps, dustFloorUsd);
+        if (_postCheck(hedgeManager, rangeManager, token0, price0, dec0, maxDriftBps, dustFloorUsd) != 1) {
+            revert PreAdjustRequired();
+        }
     }
 
-    /// @dev Cœur du post-check DN (partagé dépôt + rebalance). Audit H-03/M-02 : dette EXACTE (getWethDebt),
-    ///      wethInLp = NFT seulement (total − libre RM, pas de double comptage avec idleRm), filtre dust cohérent.
+    /// @dev Dette exacte et cible NFT-only. Le depot dispose d'un repli sur les soldes physiques afin de
+    ///      ne pas masquer le token0 emprunte encore libre. Le calibrage du rebalance reste inchange.
     ///      Le drift max effectif = min(maxDriftBps configure, seuil critique gouverne du HedgeManager).
+    /// @return coverage 0: echec; 1: controle historique satisfait; 2: bilan physique seul satisfait.
     function _postCheck(
         address hedgeManager,
         address rangeManager,
@@ -677,17 +721,18 @@ library DnDepositLib {
         uint8 dec0,
         uint16 maxDriftBps,
         uint256 dustFloorUsd
-    ) private view {
+    ) private view returns (uint8 coverage) {
         IHedgeDep hm = IHedgeDep(hedgeManager);
         uint16 effectiveMaxDriftBps = _postCheckMaxDriftBps(hedgeManager, maxDriftBps);
-        (bool ok,,) = _driftBps(hedgeManager, rangeManager, token0, price0, dec0, effectiveMaxDriftBps, dustFloorUsd);
-        if (!ok) revert PreAdjustRequired();
+        (bool filteredOk, bool physicalOk) =
+            _hedgeChecks(hedgeManager, rangeManager, token0, price0, dec0, effectiveMaxDriftBps, dustFloorUsd);
 
         if (_toUsd(hm.getWethDebt(), price0, dec0) > 0) {
             (,, uint256 hf,) = hm.getHedgeData();
             uint256 hfMin = (uint256(hm.reserveHfTargetBps()) * 1e18) / 10000;
             if (hf < hfMin) revert PreAdjustRequired();
         }
+        return filteredOk ? 1 : physicalOk ? 2 : 0;
     }
 
     /// @dev Le post-check garde le parametre .env comme plafond, puis applique le seuil critique gouverne.
@@ -698,9 +743,9 @@ library DnDepositLib {
         return effectiveMaxBps;
     }
 
-    /// @dev Cœur de lecture du drift DN on-chain (effectiveShort vs cible). Retourne (ok, driftBps).
-    ///      Audit H-03/M-02 : dette exacte, NFT-only, filtre dust cohérent. Partagé post-check + trigger H-06.
-    function _driftBps(
+    /// @dev Lit les soldes une seule fois et conserve le controle historique; s'il echoue, calcule aussi
+    ///      le bilan physique. Le rebalance n'utilise jamais ce deuxieme resultat.
+    function _hedgeChecks(
         address hedgeManager,
         address rangeManager,
         address token0,
@@ -708,23 +753,33 @@ library DnDepositLib {
         uint8 dec0,
         uint16 maxDriftBps,
         uint256 dustFloorUsd
-    ) private view returns (bool ok, uint256 driftBps, bool rawDebtDriftExceeds_) {
+    ) private view returns (bool filteredOk, bool physicalOk) {
         IHedgeDep hm = IHedgeDep(hedgeManager);
         IRmDep rm = IRmDep(rangeManager);
-        uint256 dustTok0 = hm.donationDustToken0();
+        uint256 idleDustToken0 = hm.donationDustToken0();
         uint256 debtUsd = _toUsd(hm.getWethDebt(), price0, dec0);
         uint256 freeRmWeth = IERC20(token0).balanceOf(rangeManager);
-        uint256 idleHmUsd = _toUsd(_dust(hm.getWethBalance(), dustTok0), price0, dec0);
-        uint256 idleRmUsd = _toUsd(_dust(freeRmWeth, dustTok0), price0, dec0);
+        uint256 freeHmWeth = hm.getWethBalance();
+        uint256 idleHmUsd = _toUsd(_dust(freeHmWeth, idleDustToken0), price0, dec0);
+        uint256 idleRmUsd = _toUsd(_dust(freeRmWeth, idleDustToken0), price0, dec0);
         (uint256 totalBal0,) = rm.getCurrentBalances();
         uint256 nftWeth = totalBal0 > freeRmWeth ? totalBal0 - freeRmWeth : 0;
         uint256 wethInLpUsd = _toUsd(nftWeth, price0, dec0);
-        (ok, driftBps) = RangeOperations.checkHedgeDelta(
-            debtUsd, idleHmUsd, idleRmUsd, wethInLpUsd, hm.hedgeTargetBps(), maxDriftBps, dustFloorUsd
+        uint16 targetBps = hm.hedgeTargetBps();
+        (filteredOk,) = RangeOperations.checkHedgeDelta(
+            debtUsd, idleHmUsd, idleRmUsd, wethInLpUsd, targetBps, maxDriftBps, dustFloorUsd
         );
-        (bool rawOk,) =
-            RangeOperations.checkHedgeDelta(debtUsd, 0, 0, wethInLpUsd, hm.hedgeTargetBps(), maxDriftBps, dustFloorUsd);
-        rawDebtDriftExceeds_ = !rawOk;
+        if (!filteredOk && idleDustToken0 > 0) {
+            (physicalOk,) = RangeOperations.checkHedgeDelta(
+                debtUsd,
+                _toUsd(freeHmWeth, price0, dec0),
+                _toUsd(freeRmWeth, price0, dec0),
+                wethInLpUsd,
+                targetBps,
+                maxDriftBps,
+                dustFloorUsd
+            );
+        }
     }
 
     /// @notice Composition token0 du NFT LP + ticks, utilisée par AaveHedgeManager.adjustHedge().

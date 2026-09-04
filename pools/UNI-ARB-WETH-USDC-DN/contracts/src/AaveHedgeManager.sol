@@ -257,6 +257,7 @@ contract AaveHedgeManager is ReentrancyGuard {
     {
         if (recipient == address(0)) revert HedgeCheck(16);
         if (proportionBps == 0 || proportionBps > SHARE_SCALE) revert HedgeCheck(16);
+        (,,,,, uint256 hfBefore) = pool.getUserAccountData(address(this));
         (uint256 idleWethBefore, uint256 idleUsdcBefore) = _idleBeforeSettlement(wethReceived);
         uint256 recipientUsdcBefore = usdc.balanceOf(recipient);
 
@@ -274,7 +275,7 @@ contract AaveHedgeManager is ReentrancyGuard {
                 recipient
             );
             if (!isFullWithdraw) _sendIdleShare(idleWethBefore, idleUsdcBefore, proportionBps, recipient);
-            _postSettlement(isFullWithdraw);
+            _postSettlement(isFullWithdraw, hfBefore);
             emit SettleProportional(0, proportionBps, recipient, usdc.balanceOf(recipient) - recipientUsdcBefore);
             return;
         }
@@ -310,19 +311,15 @@ contract AaveHedgeManager is ReentrancyGuard {
             if (usdcResidual > 0) usdc.safeTransfer(recipient, usdcResidual);
         }
 
-        _postSettlement(isFullWithdraw);
+        _postSettlement(isFullWithdraw, hfBefore);
 
         emit SettleProportional(wethReceived, proportionBps, recipient, usdc.balanceOf(recipient) - recipientUsdcBefore);
     }
 
-    function _postSettlement(bool isFullWithdraw) private view {
-        if (isFullWithdraw) {
-            if (variableDebtWeth.balanceOf(address(this)) > 0 || aTokenUsdc.balanceOf(address(this)) > 0) {
-                revert HedgeCheck(56);
-            }
-        } else {
-            _requireHfMin();
-        }
+    function _postSettlement(bool isFullWithdraw, uint256 hfBefore) private view {
+        DnDepositLib.aavePostSettlement(
+            address(pool), address(aTokenUsdc), address(variableDebtWeth), isFullWithdraw, hfBefore, reserveHfTargetBps
+        );
     }
 
     /// @notice AAVE V3 flash loan callback

@@ -15,6 +15,7 @@ interface IRangeManagerExtended {
     function setSafeAddress(address _safe) external;
     function setAuthorizedExecutor(address _executor, bool _authorized) external;
     function strategyEngine() external view returns (address);
+    function setStrategyEngine(address engine, address protocolBot) external;
 }
 
 interface IRangeManager {
@@ -1181,10 +1182,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit DepositRefundDelayUpdated(oldDelay, refundDelay);
     }
 
+    /// @notice Atomically rotates the operational module and RangeManager identity, preserving the engine.
+    /// @dev Safe governance in Phase 1; the same entry point belongs to the Timelock in Phase 2.
     function setBotModule(address _module) external onlyOwner {
         require(_module != address(0), "E19");
         address oldModule = botModule;
         botModule = _module;
+        IRangeManagerExtended rm = IRangeManagerExtended(address(rangeManager));
+        address engine = rm.strategyEngine();
+        if (engine != address(0)) rm.setStrategyEngine(engine, _module);
         emit BotModuleUpdated(oldModule, _module);
     }
 

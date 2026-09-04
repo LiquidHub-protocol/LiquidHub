@@ -12,6 +12,26 @@ const { Rebalancer, calculateChunkPlan, divideIntoChunks } = require('../src/reb
 const { PersistentActionAlerts } = require('../src/utils/action-alerts');
 const { RPCPool } = require('../src/utils/rpc');
 
+test('compound simulates a useful reinvestment before sending one parameterless operation', async () => {
+  const r = Object.create(Rebalancer.prototype);
+  const sent = [];
+  let invested = 250000000n;
+  r.wallet = { address: '0x0000000000000000000000000000000000000001' };
+  r.rpcPool = { executeWithRetry: async (fn) => fn({}) };
+  r._requireProgressiveModule = () => ({ connect: () => ({ compound: {
+    staticCall: async ({ from }) => { assert.equal(from, r.wallet.address); return invested; },
+  } }) });
+  r._sendProgressiveTransaction = async (...args) => { sent.push(args); return { hash: '0xcompound' }; };
+  assert.deepEqual((await r.compoundPosition()).txHashes, ['0xcompound']);
+  assert.deepEqual(sent, [['compound', [], 'compound']]);
+  invested = 99999999n;
+  assert.equal((await r.compoundPosition()).noAction, true);
+  assert.equal(sent.length, 1, 'negligible reinvestments do not spend gas');
+  r.rpcPool.executeWithRetry = async () => { throw new Error('oracle unavailable'); };
+  await assert.rejects(r.compoundPosition(), /oracle unavailable/);
+  assert.equal(sent.length, 1, 'a failed simulation cannot sign a transaction');
+});
+
 test('RPC timeout releases a silent provider call', async () => {
   const pool = Object.create(RPCPool.prototype);
   await assert.rejects(
@@ -504,6 +524,7 @@ test('a high-TVL plan does not allocate a stale off-chain chunk array', async ()
 
 test('progressive rebalance recomputes the remaining plan after every confirmed chunk', async () => {
   const rebalancer = new Rebalancer({}, {}, {}, {}, {}, {});
+  rebalancer._maybeRefreshProgressiveTarget = async () => false;
   const methods = [];
   const remaining = [25n, 15n, 5n];
   let statusReads = 0;
@@ -543,6 +564,7 @@ test('progressive chunks respect total and reverse-direction on-chain budgets', 
     cfg: { token0Decimals: 0, token1Decimals: 0 },
     capUsd: 10n,
     budgetUsd8: 5n * usd8,
+    cycleBudgetUsd8: 5n * usd8,
     reverseBudgetUsd8: 1n * usd8,
     initialZeroForOne: true,
   };

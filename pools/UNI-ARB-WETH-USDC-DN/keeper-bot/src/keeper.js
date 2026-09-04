@@ -6,6 +6,7 @@ const { ethers } = require('ethers');
 const { RPCPool } = require('./utils/rpc');
 const {
   createContracts,
+  syncCurrentBotModule,
   assertKeeperTopology,
   TREASURY_ABI,
   ERC20_ABI,
@@ -195,6 +196,7 @@ async function runHfSafetyLane({ rpcPool, hedgeManager, wallet, actionAlerts = n
 
 function persistedActionName(label) {
   const value = String(label || '').toLowerCase();
+  if (value.includes('compound')) return 'compound';
   if (value.includes('checkpoint')) return 'checkpoint';
   if (value.includes('rebalance')) return 'rebalance';
   if (value.includes('hedge')) return 'adjustHedge';
@@ -380,7 +382,9 @@ async function main() {
       process.exit(1);
     }
   }
-  const { rangeManager, vault, strategyEngine, secureBotModule, hedgeManager, pauseController } = createContracts(provider);
+  const contracts = createContracts(provider);
+  const { rangeManager, vault, strategyEngine, hedgeManager, pauseController } = contracts;
+  let secureBotModule = await syncCurrentBotModule(rpcPool, rangeManager, contracts.secureBotModule);
   await assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine, secureBotModule, hedgeManager });
   console.log('Keeper topology: RangeManager/Vault/RangeStrategyEngine/SecureBotModule/AaveHedgeManager/tokens verified\n');
 
@@ -444,10 +448,11 @@ async function main() {
 
       await reconcileSignerState(rpcPool, actionAlerts);
 
+      secureBotModule = await syncCurrentBotModule(rpcPool, rangeManager, secureBotModule, rebalancer);
       const progressiveStatus = Number(await readContract(
         rpcPool, secureBotModule, 'progressiveRebalanceStatus'
       ));
-      if (progressiveStatus !== 0) {
+      if (progressiveStatus !== 0 || await readContract(rpcPool, vault, 'isRebalancing')) {
         if (CHECK_ONLY) {
           console.log(`  Progressive DN rebalance active (state ${progressiveStatus}); an active keeper must resume it.`);
         } else {
@@ -714,6 +719,18 @@ async function main() {
         } else {
           console.error(`  -> Failed: ${result.error}\n`);
           await trackAction(actionAlerts, 'failure', 'rebalance', result.error);
+        }
+      }
+
+      // HF/hedge/range actions retain priority; HOLD may reinvest without changing Aave exposure.
+      if (!CHECK_ONLY && hasPosition && [STRATEGY_ACTION.NO_ACTION, STRATEGY_ACTION.CHECKPOINT_ONLY].includes(strategyAction)) {
+        try {
+          const result = await rebalancer.compoundPosition();
+          if (!result.noAction) console.log(`  -> Fees reinvested in the current NFT: ${result.txHashes[0]}`);
+          await trackAction(actionAlerts, 'success', 'compound', result.noAction ? 'No material amount to compound' : `Compound: ${result.txHashes[0]}`);
+        } catch (error) {
+          console.log(`  Compound deferred: ${(error.reason || error.message || '').slice(0, 100)}`);
+          await trackAction(actionAlerts, 'failure', 'compound', error.reason || error.message);
         }
       }
 

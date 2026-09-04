@@ -294,12 +294,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     // ===== FONCTIONS DE CONFIGURATION (gouvernance via Vault owner) =====
 
-    /// @notice One-time reciprocal link to this pool's immutable Delta Neutral strategy engine.
+    /// @notice Binds the immutable DN engine; governance may rotate its protocol module and operator.
     function setStrategyEngine(address engine, address protocolBot) external onlyVaultOwner {
-        if (
-            address(strategyEngine) != address(0) || engine.code.length == 0 || protocolBot.code.length == 0
-                || protocolBotAddress != address(0)
-        ) revert E40();
+        if (address(strategyEngine) != address(0) && engine != address(strategyEngine)) revert E40();
+        // The typed identity/profile reads below also reject addresses without contract code.
         address botOperator = IProtocolBotIdentity(protocolBot).botAddress();
         if (botOperator == address(0)) revert E40();
         IRangeStrategyEngine candidate = IRangeStrategyEngine(engine);
@@ -309,6 +307,9 @@ contract RangeManager is Ownable, ReentrancyGuard {
                 || candidate.hedgeManager() != IMultiUserVault(vault).hedgeManager()
         ) revert E40();
         strategyEngine = candidate;
+        authorizedExecutors[protocolBotAddress] = false;
+        authorizedExecutors[protocolBotOperator] = false;
+        authorizedExecutors[protocolBot] = true;
         protocolBotAddress = protocolBot;
         protocolBotOperator = botOperator;
         emit StrategyEngineSet(engine, protocolBot);
@@ -1100,7 +1101,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     function setInitMultiSwapTvl(uint256 _initMultiSwapTvl) external onlyVaultOwner {
         require(_initMultiSwapTvl > 0 && _initMultiSwapTvl <= 1_000_000, "E97");
-        require(IMultiUserVault(vault).dnMaxDepositUsd() <= _initMultiSwapTvl * 10 * 1e8, "E97");
+        require(IMultiUserVault(vault).dnMaxDepositUsd() <= _initMultiSwapTvl * 1e9, "E97");
         emit InitMultiSwapTvlUpdated(initMultiSwapTvl, _initMultiSwapTvl);
         initMultiSwapTvl = _initMultiSwapTvl;
     }

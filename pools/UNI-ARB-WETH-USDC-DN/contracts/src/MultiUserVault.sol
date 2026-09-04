@@ -16,6 +16,7 @@ interface IRangeManagerExtended {
     function setSafeAddress(address _safe) external;
     function setAuthorizedExecutor(address _executor, bool _authorized) external;
     function strategyEngine() external view returns (address);
+    function setStrategyEngine(address engine, address protocolBot) external;
 }
 
 interface IAaveHedgeSettlement {
@@ -678,11 +679,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             tokenIn,
             tokenOut,
             plannedDepositValue * 2
-        ) {} catch Error(string memory) {
-            revert E73();
-        } catch Panic(uint256) {
-            revert E73();
-        } catch (bytes memory) {
+        ) {} catch {
             revert E73();
         }
         // 4. VERROU (un withdraw concurrent revert E32)
@@ -1321,7 +1318,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (dustFloorUsd == 0) revert E18();
         if (refundDelay < 3600 || refundDelay > 30 days) revert E18();
         if (maxDepositUsd < minDepositUSD) revert E18();
-        uint256 maxByChunks = uint256(rangeManager.initMultiSwapTvl()) * 10 * 1e8;
+        uint256 maxByChunks = uint256(rangeManager.initMultiSwapTvl()) * 1e9;
         if (maxByChunks > 0 && maxDepositUsd > maxByChunks) revert E18();
         dnPostCheckMaxDriftBps = postCheckMaxDriftBps;
         dnDustFloorUsd = dustFloorUsd;
@@ -1330,10 +1327,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit DnDepositParamsConfigured(postCheckMaxDriftBps, dustFloorUsd, maxDepositUsd, refundDelay);
     }
 
+    /// @notice Atomically rotates the operational module and RangeManager identity, preserving the engine.
+    /// @dev Safe governance in Phase 1; the same entry point belongs to the Timelock in Phase 2.
     function setBotModule(address _module) external onlyOwner {
         if (_module == address(0)) revert E19();
         address oldModule = botModule;
         botModule = _module;
+        IRangeManagerExtended rm = IRangeManagerExtended(address(rangeManager));
+        address engine = rm.strategyEngine();
+        if (engine != address(0)) rm.setStrategyEngine(engine, _module);
         emit BotModuleUpdated(oldModule, _module);
     }
 
