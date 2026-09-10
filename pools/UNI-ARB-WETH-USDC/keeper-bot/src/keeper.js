@@ -205,6 +205,7 @@ async function main() {
   if (!CHECK_ONLY) {
     wallet = new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY, provider);
     rebalancer = new Rebalancer(rangeManager, vault, strategyEngine, wallet, rpcPool, secureBotModule);
+    rebalancer.pauseControllerAddress = contracts.pauseController?.target;
     const recoveryState = actionAlerts.state.depositRefundRecovery;
     actionAlerts.state.depositRefundRecovery = recoveryState && typeof recoveryState === 'object' && !Array.isArray(recoveryState) ? recoveryState : {};
     rebalancer.depositRefundRecovery = actionAlerts.state.depositRefundRecovery;

@@ -78,6 +78,7 @@ class Rebalancer {
     this.wallet = wallet;
     this.rpcPool = rpcPool;
     this.secureBotModule = secureBotModule;
+    this.pauseControllerAddress = null;
     this.beforeProgressiveStep = typeof beforeProgressiveStep === 'function' ? beforeProgressiveStep : null;
   }
 
@@ -158,7 +159,7 @@ class Rebalancer {
   }
 
   async processDeposit() {
-    const options = { rpcPool: this.rpcPool, vaultAddress: this.vault.target,
+    const options = { rpcPool: this.rpcPool, vaultAddress: this.vault.target, pauseControllerAddress: this.pauseControllerAddress,
       strategyEngine: this.strategyEngine, isDn: true, walletForProvider: p => this.wallet.connect(p) };
     this.depositRefundRecovery ||= {};
     return processDepositWithRecovery({ state: this.depositRefundRecovery,

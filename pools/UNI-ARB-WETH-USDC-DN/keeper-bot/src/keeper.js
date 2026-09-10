@@ -431,6 +431,7 @@ async function main() {
       secureBotModule,
       async () => runHfSafetyLane({ rpcPool, hedgeManager, wallet, actionAlerts })
     );
+    rebalancer.pauseControllerAddress = contracts.pauseController?.target;
     const recoveryState = actionAlerts.state.depositRefundRecovery;
     actionAlerts.state.depositRefundRecovery = recoveryState && typeof recoveryState === 'object' && !Array.isArray(recoveryState) ? recoveryState : {};
     rebalancer.depositRefundRecovery = actionAlerts.state.depositRefundRecovery;

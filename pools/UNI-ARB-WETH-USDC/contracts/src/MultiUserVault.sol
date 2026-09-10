@@ -623,6 +623,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (hasPosition) {
             IRangeStrategyEngine.Decision memory decision =
                 IRangeStrategyEngine(IRangeManagerExtended(address(rangeManager)).strategyEngine()).previewDecision();
+            // Risk guards apply even when the strategy decision is deliberately marked stale.
+            require(decision.reason != IRangeStrategyEngine.ReasonCode.ORACLE_GUARD, "E48");
             require(!(decision.dataFresh && decision.action == IRangeStrategyEngine.Action.RANGE_REBALANCE), "E48");
         }
         rangeManager.validateDepositSwapPlan(pd.amount0, pd.amount1, swapAmountsIn, minAmountsOut, tokenIn, tokenOut);

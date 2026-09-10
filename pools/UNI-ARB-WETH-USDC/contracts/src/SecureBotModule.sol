@@ -191,6 +191,10 @@ contract SecureBotModule {
         if (positions.length != 1) return 0;
         rm.refreshPriceCache();
         RangeOperations.PriceCache memory cache = _progressiveCache();
+        // A STABLE depeg pauses investment, not ordinary checkpoint-stale maintenance.
+        if (IRangeStrategyEngine(strategyEngine).previewDecision().reason == IRangeStrategyEngine.ReasonCode.ORACLE_GUARD) {
+            revert ProgressiveMarketGuard();
+        }
         (,,,,, int24 lower, int24 upper,,,,,) = rm.positionManager().positions(positions[0]);
         if (cache.poolTick <= lower || cache.poolTick >= upper) return 0;
         IProgressiveVault(vault).syncFeesForDeposits();

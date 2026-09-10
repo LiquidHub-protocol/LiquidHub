@@ -60,12 +60,12 @@ test('recovery snapshots decode real ABI responses at one block and enforce each
     'function getNextPendingDeposit() view returns(address,uint256,uint256,uint256,bool)',
     'function depositRefundDelay() view returns(uint256)', 'function dnDepositRefundDelay() view returns(uint256)',
     'function initialPositionEstablished() view returns(bool)', 'function isRebalancing() view returns(bool)',
-    'function pauseController() view returns(address)', 'function inflowsPaused() view returns(bool)',
+    'function inflowsPaused() view returns(bool)',
   ]);
   for (const isDn of [false, true]) {
     const values = { getNextPendingDeposit: [user, 100n, 0n, 1n, true], depositRefundDelay: [21600n],
       dnDepositRefundDelay: [21600n], initialPositionEstablished: [true], isRebalancing: [false],
-      pauseController: [pauseAddress], inflowsPaused: [false] };
+      inflowsPaused: [false] };
     let action = 0, due = false, dataFresh = true, now = 22000;
     const calls = [];
     const provider = { getBlock: async () => ({ number: 123, timestamp: now }), call: async tx => {
@@ -83,7 +83,7 @@ test('recovery snapshots decode real ABI responses at one block and enforce each
     const rpcPool = Object.assign(Object.create(RPCPool.prototype), {
       providers: [{ provider, chainVerified: true }], getProvider: () => provider,
     });
-    const read = () => readRecoverySnapshot({ rpcPool, vaultAddress, strategyEngine, isDn });
+    const read = () => readRecoverySnapshot({ rpcPool, vaultAddress, pauseControllerAddress: pauseAddress, strategyEngine, isDn });
     assert.equal((await read()).eligible, true);
     assert.ok(calls.includes(isDn ? 'dnDepositRefundDelay' : 'depositRefundDelay'));
     for (action of [2, 3, 4, 5]) assert.equal((await read()).eligible, false);

@@ -7,7 +7,6 @@ const VAULT_RECOVERY_ABI = [
   'function dnDepositRefundDelay() view returns(uint256)',
   'function initialPositionEstablished() view returns(bool)',
   'function isRebalancing() view returns(bool)',
-  'function pauseController() view returns(address)',
   'function refundStaleDeposit(address depositor)',
 ];
 const PAUSE_ABI = ['function inflowsPaused() view returns(bool)'];
@@ -19,7 +18,7 @@ function markDepositSimulationError(error) {
   return error;
 }
 
-async function readRecoverySnapshot({ rpcPool, vaultAddress, strategyEngine, isDn }) {
+async function readRecoverySnapshot({ rpcPool, vaultAddress, pauseControllerAddress, strategyEngine, isDn }) {
   return rpcPool.executeWithRetry(async provider => {
     const block = await provider.getBlock('latest');
     const at = { blockTag: block.number };
@@ -32,11 +31,11 @@ async function readRecoverySnapshot({ rpcPool, vaultAddress, strategyEngine, isD
     const snapshot = { key, user: head.user, now: Number(block.timestamp), eligible: false };
     // Ordinary young deposits do not need additional maintenance/governance reads.
     if (!head.exists || BigInt(delay) <= 0n || BigInt(block.timestamp) < BigInt(head.timestamp) + BigInt(delay)) return snapshot;
-    const [initialized, locked, pauseAddress, decision, due] = await Promise.all([
-      vault.initialPositionEstablished(at), vault.isRebalancing(at), vault.pauseController(at),
+    const [initialized, locked, paused, decision, due] = await Promise.all([
+      vault.initialPositionEstablished(at), vault.isRebalancing(at),
+      new Contract(pauseControllerAddress, PAUSE_ABI, provider).inflowsPaused(at),
       engine.previewDecision(at), engine.checkpointDue(at),
     ]);
-    const paused = await new Contract(pauseAddress, PAUSE_ABI, provider).inflowsPaused(at);
     snapshot.eligible = Boolean(initialized && !locked && !paused && decision.dataFresh && !due
       && [0, 1].includes(Number(decision.action)));
     return snapshot;

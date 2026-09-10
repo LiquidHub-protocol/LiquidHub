@@ -75,6 +75,7 @@ class Rebalancer {
     this.wallet = wallet;
     this.rpcPool = rpcPool;
     this.secureBotModule = secureBotModule;
+    this.pauseControllerAddress = null;
   }
 
   async executeRebalance(tokenId, expectedDecisionHash) {
@@ -163,7 +164,7 @@ class Rebalancer {
    * to meet/exceed the floor.
    */
   async processDeposit() {
-    const options = { rpcPool: this.rpcPool, vaultAddress: this.vault.target,
+    const options = { rpcPool: this.rpcPool, vaultAddress: this.vault.target, pauseControllerAddress: this.pauseControllerAddress,
       strategyEngine: this.strategyEngine, isDn: false, walletForProvider: p => this.wallet.connect(p) };
     this.depositRefundRecovery ||= {};
     return processDepositWithRecovery({ state: this.depositRefundRecovery,
