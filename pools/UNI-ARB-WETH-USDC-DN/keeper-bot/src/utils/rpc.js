@@ -873,14 +873,16 @@ class RPCPool {
     const provider = this.getProvider();
     await this._ensureSignerState(provider);
     return await this._withSignerLock(provider, async () => {
-      const prepareBundle = async () => {
-        const signingNonce = await this._signingNonce();
+      const prepareBundle = async (replacementNonce) => {
+        // A replacement keeps the nonce authenticated by the signed journal.
+        // New transactions still require the independent pending-nonce quorum.
+        const signingNonce = replacementNonce ?? await this._signingNonce();
         return await this.executeWithRetry(async (currentProvider) => {
         const prepared = await prepareFn(currentProvider);
         if (!prepared?.wallet || !prepared?.request) {
           throw new Error(`${label}: prepareFn must return { wallet, request }`);
         }
-        const populated = await prepared.wallet.populateTransaction(prepared.request);
+        const populated = await prepared.wallet.populateTransaction({ ...prepared.request, nonce: signingNonce });
         populated.nonce = signingNonce;
         const feeCapExempt = this._applyFeeCapPolicy(populated, label, bypassFeeCap === true);
         return { provider: currentProvider, prepared, populated, feeCapExempt };
@@ -900,7 +902,7 @@ class RPCPool {
           if (settled) {
             this._clearPersistedSignedTx(pending.txHash);
           } else {
-            preparedBundle = await prepareBundle();
+            preparedBundle = await prepareBundle(pending.nonce);
             return await this._replacePendingWithCriticalRepair(
               pending, preparedBundle, label, maxRetries
             );

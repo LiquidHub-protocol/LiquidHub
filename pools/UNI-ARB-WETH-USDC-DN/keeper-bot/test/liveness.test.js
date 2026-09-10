@@ -532,7 +532,12 @@ test('persisted HF repair can be replaced above the normal fee cap', async (t) =
   assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
 });
 
-test('critical HF repair preempts an ordinary pending nonce above the normal fee cap', async (t) => {
+for (const [name, nonce, pendingNonces] of [
+  ['one RPC', 6, [7]],
+  ['divergent mempools', 6, [7, 6, null]],
+  ['nonce zero', 0, [1, 0, null]],
+]) {
+ test(`critical HF repair replaces the journal nonce with ${name}`, async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-hf-preemption-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const signingWallet = ethers.Wallet.createRandom();
@@ -542,61 +547,66 @@ test('critical HF repair preempts an ordinary pending nonce above the normal fee
   pool.emergencyMaxGasPriceWei = 200n;
   const repairTarget = '0x00000000000000000000000000000000000000a1';
   pool.hfRepairTargetAddress = repairTarget.toLowerCase();
-  const provider = {
-    getTransactionCount: async () => 7,
-    getTransactionReceipt: async () => null,
-  };
-  pool.providers = [{ provider, healthy: true, chainVerified: true, chainMismatch: false }];
+  const nonceReads = [];
+  const entries = pendingNonces.map(pendingNonce => ({
+    healthy: true, chainVerified: true, chainMismatch: false,
+    provider: {
+      getTransactionCount: async (_signer, tag) => {
+        nonceReads.push(tag);
+        if (pendingNonce === null) throw new Error('RPC offline');
+        return tag === 'pending' ? pendingNonce : nonce;
+      },
+      getTransactionReceipt: async () => null,
+    },
+  }));
+  const provider = entries[0].provider;
+  pool.providers = entries;
   pool.pendingTxFile = path.join(dir, 'pending.json');
   pool.getProvider = () => provider;
   pool._ensureSignerState = async () => {};
-  pool._authenticatedProviderEntries = async () => [{ provider }];
-  pool._latestSignerNonce = async () => 6;
+  pool._authenticatedProviderEntries = async () => entries;
   pool.withTimeout = async (fn) => await fn();
   pool.executeWithRetry = async (fn) => await fn(provider);
 
   const ordinaryRaw = await signingWallet.signTransaction({
     chainId: 42161,
-    nonce: 6,
+    nonce,
     gasLimit: 100_000n,
     gasPrice: 1n,
     to: '0x0000000000000000000000000000000000000002',
     data: '0x12345678',
   });
   const ordinaryHash = ethers.keccak256(ordinaryRaw);
-  await withSignerContext(pool, () => pool._persistSignedTx(ordinaryRaw, ordinaryHash, 'rebalance', 6));
+  await withSignerContext(pool, () => pool._persistSignedTx(ordinaryRaw, ordinaryHash, 'rebalance', nonce));
 
   let replacementRaw;
   pool._broadcastSignedTransaction = async (raw) => {
     replacementRaw = raw;
     return { status: 1, hash: ethers.keccak256(raw) };
   };
-  const preparedWallet = {
-    address: signingWallet.address,
-    populateTransaction: async (request) => ({
-      ...request,
-      chainId: 42161,
-      nonce: 7,
-      gasLimit: 500_000n,
-      gasPrice: 100n,
-      value: 0n,
-    }),
-    signTransaction: async (request) => await signingWallet.signTransaction(request),
-  };
+  // Real ethers population must not perform a hidden pending-nonce lookup.
+  const preparedWallet = signingWallet.connect({
+    getNetwork: async () => ({ chainId: 42161n }),
+    getFeeData: async () => ({ gasPrice: 100n }),
+    getTransactionCount: async () => { throw new Error('implicit pending nonce lookup'); },
+  });
 
   const receipt = await pool.executeSignedTxWithRetry(async () => ({
     wallet: preparedWallet,
-    request: { to: repairTarget, data: '0x30cbb735', value: 0n },
+    request: { to: repairTarget, data: '0x30cbb735', value: 0n, type: 0, gasLimit: 500_000n, gasPrice: 100n },
   }), 'hfRepair', 1, { bypassFeeCap: true });
 
   const replacement = ethers.Transaction.from(replacementRaw);
   assert.equal(receipt.status, 1);
-  assert.equal(replacement.nonce, 6);
+  assert.equal(replacement.nonce, nonce);
+  assert.ok(nonceReads.includes('latest'));
+  assert.ok(!nonceReads.includes('pending'));
   assert.equal(replacement.to, ethers.getAddress(repairTarget));
   assert.equal(replacement.data, '0x30cbb735');
   assert.ok(replacement.gasPrice > pool.maxGasPriceWei);
   assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
 });
+}
 
 test('signed transaction failover prepares and signs once, then rebroadcasts the same raw tx', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'keeper-shared-signer-'));
