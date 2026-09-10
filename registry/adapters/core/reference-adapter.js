@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: MIT
-
 'use strict';
 
 const { ethers } = require('ethers');
@@ -61,16 +59,16 @@ function createPositionId(chainId, vault, user) {
     return `liquidhub:${normalizedChainId}:${ethers.getAddress(vault).toLowerCase()}:${ethers.getAddress(user).toLowerCase()}`;
 }
 
-async function readPosition(provider, user, record, chainId) {
+async function readPosition(provider, user, record, chainId, blockTag) {
     const interfaceVersion = requireSupportedInterfaceVersion(record.interfaceVersion);
     const vault = new ethers.Contract(record.vault, VAULT_ABI, provider);
-    const userInfo = await vault.userInfo(user);
+    const userInfo = await vault.userInfo(user, { blockTag });
     const shares = BigInt(userInfo.shares);
     if (shares === 0n) return null;
 
     const [totalShares, nav] = await Promise.all([
-        vault.totalShares(),
-        vault.getCurrentPortfolioValue(),
+        vault.totalShares({ blockTag }),
+        vault.getCurrentPortfolioValue({ blockTag }),
     ]);
 
     const valueUsdRaw = calculateUserValue(nav, shares, totalShares);
@@ -102,10 +100,13 @@ async function getLiquidHubPositions({ provider, user, registryAddress, pageSize
         throw new Error(`pageSize must be between 1 and ${MAX_PAGE_SIZE}`);
     }
 
+    // Discovery and valuation share one snapshot even when the chain advances between calls.
+    const blockTag = await provider.getBlockNumber();
+    if (!Number.isSafeInteger(blockTag) || blockTag < 0) throw new Error('Invalid snapshot block number');
     const registry = new ethers.Contract(normalizedRegistry, REGISTRY_ABI, provider);
     const [chainId, countRaw, network] = await Promise.all([
-        registry.deploymentChainId(),
-        registry.vaultCount(),
+        registry.deploymentChainId({ blockTag }),
+        registry.vaultCount({ blockTag }),
         provider.getNetwork(),
     ]);
     const verifiedChainId = requireMatchingChain(chainId, network.chainId);
@@ -115,10 +116,10 @@ async function getLiquidHubPositions({ provider, user, registryAddress, pageSize
     const positions = [];
     const failures = [];
     for (let offset = 0; offset < count; offset += pageSize) {
-        const records = await registry.getVaults(offset, Math.min(pageSize, count - offset));
+        const records = await registry.getVaults(offset, Math.min(pageSize, count - offset), { blockTag });
         const activeRecords = records.filter((record) => record.active);
         const settled = await Promise.allSettled(
-            activeRecords.map((record) => readPosition(provider, normalizedUser, record, verifiedChainId)),
+            activeRecords.map((record) => readPosition(provider, normalizedUser, record, verifiedChainId, blockTag)),
         );
         settled.forEach((result, index) => {
             if (result.status === 'fulfilled') {
@@ -132,7 +133,7 @@ async function getLiquidHubPositions({ provider, user, registryAddress, pageSize
         });
     }
 
-    return { chainId: verifiedChainId, positions, failures };
+    return { chainId: verifiedChainId, blockNumber: blockTag, positions, failures };
 }
 
 module.exports = {
