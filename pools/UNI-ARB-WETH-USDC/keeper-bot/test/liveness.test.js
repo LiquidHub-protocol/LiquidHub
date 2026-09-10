@@ -964,3 +964,39 @@ test('deposit is deferred when the final on-chain instruction requires a rebalan
   assert.equal(feeSyncCount, 0);
   assert.equal(signedTxCount, 0);
 });
+
+for (const rejection of [null, 'minOut<floor', 'E24']) {
+  test(`standard keeper atomic deposit avoids fee sync and refreshes only a rejected price plan: ${rejection}`, async () => {
+    const connectable = value => Object.assign(value, { connect() { return this; } });
+    const provider = { estimateGas: async () => 100_000n, getBlock: async () => ({ gasLimit: 30_000_000n }) };
+    const wallet = connectable({ address: '0x1111111111111111111111111111111111111111' });
+    const calls = { sync: 0, refresh: 0, simulations: 0, sent: [] };
+    let amount = 1_000_000_000_000_000_000n;
+    const cache = { valid: true, price0: 2000_00000000n, price1: 100000000n };
+    const rm = connectable({ priceCache: async () => cache, initMultiSwapTvl: async () => 10000n,
+      config: async () => ({ token0Decimals: 18, token1Decimals: 6, maxSlippageBps: 100 }) });
+    const vault = connectable({
+      getDepositSwapParams: async () => [true, amount],
+      processDepositPermissionless: {
+        staticCall: async () => { if (++calls.simulations === 1 && rejection) throw new Error(rejection); },
+        populateTransaction: async (...args) => ({ args }),
+      },
+    });
+    const rpc = { executeWithRetry: fn => fn(provider), executeSignedTxWithRetry: async (prepare, label) => {
+      calls.sent.push({ ...await prepare(provider), label }); return { hash: '0xconfirmed' };
+    } };
+    const r = new Rebalancer(rm, vault, connectable({ previewDecision: async () => ({ action: 0 }) }), wallet, rpc);
+    r._syncFeesForActionPlan = async () => { calls.sync++; };
+    r._refreshPriceCacheForAction = async () => { calls.refresh++; amount *= 2n; return cache; };
+    const result = await r.processDeposit();
+    assert.equal(result.success, rejection !== 'E24');
+    assert.equal(calls.sync, 0, 'fee collection remains in the atomic deposit');
+    assert.equal(calls.refresh, rejection === 'minOut<floor' ? 1 : 0);
+    assert.equal(calls.sent.length, rejection === 'E24' ? 0 : 1);
+    if (result.success) {
+      assert.equal(calls.sent[0].request.args[0][0], amount);
+      assert.equal(calls.sent[0].request.args[1][0], rejection ? 3960_000000n : 1980_000000n);
+      assert.equal(calls.sent[0].request.gasLimit, 120_000n, 'gas bounds remain active');
+    }
+  });
+}

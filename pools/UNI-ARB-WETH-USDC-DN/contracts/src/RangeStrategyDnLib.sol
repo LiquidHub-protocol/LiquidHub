@@ -57,6 +57,7 @@ interface IDnAaveStrategyState {
         view
         returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 healthFactor, uint256 availableBorrowsBase);
     function getWethDebt() external view returns (uint256);
+    function inventoryNormalizationPending() external view returns (bool);
     function getStrategyReserveData()
         external
         view
@@ -133,25 +134,21 @@ library RangeStrategyDnLib {
             : effectiveShort < int256(target)
                 ? uint256(int256(target) - effectiveShort)
                 : uint256(effectiveShort - int256(target));
-        bool pendingInventoryOnly = allowInventoryContinuation && effectiveShort < int256(target)
+        bool pendingInventoryOnly = enforceThresholds && allowInventoryContinuation && effectiveShort < int256(target)
             && int256(debt) > effectiveShort;
-        if (enforceThresholds) {
+        // Finishing a recorded chunk sequence never authorizes borrowing, even if
+        // the last chunk also satisfies the ordinary/critical hedge thresholds.
+        inventoryOnly = pendingInventoryOnly;
+        // Recorded continuations only consume inventory; ordinary/critical
+        // thresholds apply to every fresh debt adjustment, never to this continuation.
+        if (enforceThresholds && !pendingInventoryOnly) {
             IDnAaveStrategyState hedge = IDnAaveStrategyState(address(this));
             uint256 drift = target == 0 ? type(uint256).max : difference * BPS / target;
-            if (drift < hedge.adjustHedgeBps()) {
-                if (!pendingInventoryOnly) revert HedgeCheck(44);
-                inventoryOnly = true;
-            }
+            if (drift < hedge.adjustHedgeBps()) revert HedgeCheck(44);
             if (
                 block.timestamp < uint256(hedge.lastHedgeAdjustAt()) + hedge.hedgeAdjustCooldown()
                     && drift < hedge.criticalHedgeBps()
-            ) {
-                // A previous critical leg may have consumed only one capped chunk of free token0.
-                // During the inherited cooldown, continue only that recorded inventory conversion.
-                // The caller receives inventoryOnly=true and therefore cannot borrow in this call.
-                if (!pendingInventoryOnly) revert HedgeCheck(41);
-                inventoryOnly = true;
-            }
+            ) revert HedgeCheck(41);
         }
         if (!inventoryRepay && effectiveShort >= int256(target)) {
             return (debt, effectiveShort, false, 0);
@@ -166,11 +163,13 @@ library RangeStrategyDnLib {
         if (!(valid && price0 > 0 && price1 > 0 && sqrtP > 0)) revert InvalidNegativeHedgeSwap();
 
         address token1 = context.usdc();
-        uint256 amount0 = _min(_min(difference, idle), _inventoryCap(rangeManager, price0, context.volatileDecimals()));
+        uint8 decimals0 = context.volatileDecimals();
+        uint256 inventoryNeeded = _min(difference, idle);
+        uint256 amount0 = _min(inventoryNeeded, _inventoryCap(rangeManager, price0, decimals0));
         if (amount0 == 0) revert InvalidNegativeHedgeSwap();
         // A zero-target inventory step is followed by a range decision, with no new
         // borrowing, bounty or cooldown even when the net long has been eliminated.
-        inventoryOnly = target == 0 || inventoryOnly || amount0 < _min(difference, idle);
+        inventoryOnly = target == 0 || inventoryOnly || amount0 < inventoryNeeded;
         if (inventoryRepay) {
             // A capped repayment from HM inventory removes matching assets and debt:
             // no swap, no new delta, no extra debt. It makes a large residual inventory
@@ -184,13 +183,8 @@ library RangeStrategyDnLib {
         if (amount0 > idleHm) {
             IDnRangeManagerState(rangeManager).sendTokenForHedge(token0, amount0 - idleHm, address(this));
         }
-        uint256 theoretical = Math.mulDiv(
-            amount0,
-            uint256(price0) * (10 ** context.stableDecimals()),
-            uint256(price1) * (10 ** context.volatileDecimals())
-        );
         uint256 slippageBps = context.swapSlippageBps();
-        uint256 minOut = Math.mulDiv(theoretical, BPS - slippageBps, BPS);
+        uint256 minOut = _inventoryMinOut(amount0, price0, price1, decimals0, context.stableDecimals(), slippageBps);
         if (minOut == 0) revert InvalidNegativeHedgeSwap();
         uint256 rawLimit = (uint256(sqrtP) * (token0 < token1 ? 20000 - slippageBps : 20000 + slippageBps)) / 20000;
         uint160 sqrtLimit = rawLimit < MIN_SQRT_PRICE_LIMIT_X96
@@ -219,7 +213,17 @@ library RangeStrategyDnLib {
         (debt, effectiveShort,) = _effectiveShort(context.variableDebtWeth(), token0, rangeManager, dustFloor);
         if (effectiveShort != beforeShort + int256(amount0)) revert InvalidNegativeHedgeSwap();
         normalized0 = amount0;
-        emit HedgeInventoryNormalized(amount0, amount1, amount0 == _min(difference, idle));
+        emit HedgeInventoryNormalized(amount0, amount1, amount0 == inventoryNeeded);
+    }
+
+    function _inventoryMinOut(
+        uint256 amount0, uint128 price0, uint128 price1, uint8 decimals0, uint8 decimals1, uint256 slippageBps
+    ) private pure returns (uint256) {
+        return Math.mulDiv(
+            Math.mulDiv(amount0, uint256(price0) * (10 ** decimals1), uint256(price1) * (10 ** decimals0)),
+            BPS - slippageBps,
+            BPS
+        );
     }
 
     function _inventoryCap(address rm, uint128 price0, uint8 decimals0) private view returns (uint256) {
@@ -244,6 +248,7 @@ library RangeStrategyDnLib {
     struct Context {
         bool configured;
         bool depositPending;
+        bool inventoryNormalizationPending;
         uint256 collateralBase;
         uint256 debtBase;
         uint256 healthFactorBps;
@@ -387,6 +392,7 @@ library RangeStrategyDnLib {
         ) return context;
 
         context.debtToken0 = hedge.getWethDebt();
+        context.inventoryNormalizationPending = hedge.inventoryNormalizationPending();
         uint256 dust = hedge.donationDustToken0();
         uint256 idleHm = IERC20(token0).balanceOf(hedgeManager);
         uint256 idleRm = IERC20(token0).balanceOf(rangeManager);
@@ -760,8 +766,9 @@ library RangeStrategyDnLib {
         return current;
     }
 
+    // Test-facing projection helper; production callers use hedgeControl.
     function hedgeOnlyStatus(Context memory context, Position memory position, RiskConfig memory risk, int24 liveTick)
-        external
+        internal
         pure
         returns (uint256 driftBps, uint256 exposureBps, bool adjustmentFeasible)
     {
@@ -816,10 +823,15 @@ library RangeStrategyDnLib {
         control.critical =
             control.adjustmentFeasible && exposureLargeEnough && control.driftBps >= context.criticalHedgeBps;
         bool cooldownElapsed = block.timestamp >= uint256(context.lastAdjustmentAt) + context.cooldownSeconds;
-        bool normalEligible = control.adjustmentFeasible && exposureLargeEnough && control.normalConfirmed
-            && control.driftBps >= context.adjustThresholdBps && cooldownElapsed
+        // _nextHedgeSignal only confirms a feasible, material, above-threshold hedge.
+        bool normalEligible = control.normalConfirmed && cooldownElapsed
             && (context.depositPending || _hedgeOnlyRangeStable(position, liveTick, risk.hedgeOnlyMinEdgeBps));
-        control.eligible = control.critical || normalEligible;
+        bool inventoryContinuation = context.inventoryNormalizationPending && direction == 1
+            && control.adjustmentFeasible && context.effectiveShortToken0 < int256(context.debtToken0);
+        // The manager records the sequence and enforces an inventory-only capped
+        // conversion. Ordinary hysteresis/cooldown must not strand its final chunks.
+        if (inventoryContinuation) control.direction = direction;
+        control.eligible = control.critical || normalEligible || inventoryContinuation;
     }
 
     function _nextHedgeSignal(
@@ -1028,7 +1040,7 @@ library RangeStrategyDnLib {
     }
 
     function hedgeOnlyRangeStable(Position memory position, int24 liveTick, uint16 minimumEdgeBps)
-        external
+        internal
         pure
         returns (bool)
     {
@@ -1095,7 +1107,13 @@ library RangeStrategyDnLib {
             uint256 needed = _min(difference, uint256(int256(context.debtToken0) - effectiveShort));
             uint256 amount0 = _min(needed, context.maxInventorySwapToken0);
             if (amount0 == 0 || (!allowInventoryStep && amount0 < needed)) return projected;
-            inventoryRemaining = amount0 < needed;
+            // Match the executor's smallest representable output. A near-aligned
+            // target must not schedule an inventory swap whose minOut rounds to zero.
+            if (
+                _inventoryMinOut(amount0, context.price0, context.price1, context.token0Decimals,
+                    context.token1Decimals, context.swapSlippageBps) == 0
+            ) return projected;
+            inventoryRemaining = amount0 < needed || (allowInventoryStep && context.inventoryNormalizationPending);
             effectiveShort += int256(amount0);
             idleStableBase += amount0 * uint256(context.price0) / units * (BPS - context.swapSlippageBps) / BPS;
         }

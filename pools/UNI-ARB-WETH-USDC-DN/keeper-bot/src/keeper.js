@@ -78,11 +78,11 @@ async function readContract(rpcPool, contract, method, ...args) {
 }
 
 async function readLiveHfSafetyState(rpcPool, hedgeManager) {
-  return await rpcPool.executeConsensusRead(async (provider) => {
+  return await rpcPool.executeSnapshotConsensusRead(async (provider, blockTag) => {
     const hm = hedgeManager.connect(provider);
-    const [poolAddress, triggerBps] = await Promise.all([hm.pool(), hm.hfRepairTriggerBps()]);
+    const [poolAddress, triggerBps] = await Promise.all([hm.pool({ blockTag }), hm.hfRepairTriggerBps({ blockTag })]);
     const aavePool = new ethers.Contract(poolAddress, AAVE_POOL_ABI, provider);
-    const account = await aavePool.getUserAccountData(hedgeManager.target);
+    const account = await aavePool.getUserAccountData(hedgeManager.target, { blockTag });
     const debtBase = BigInt(account.totalDebtBase ?? account[1]);
     const healthFactor = BigInt(account.healthFactor ?? account[5]);
     const trigger = BigInt(triggerBps);

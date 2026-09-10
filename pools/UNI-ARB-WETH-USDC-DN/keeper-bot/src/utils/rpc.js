@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { acquireSignerFileLock, assertSignerFileLock, isSignerLockOwnerAlive } = require('./signer-file-lock');
+const { readSnapshotConsensus } = require('./rpc-snapshot-consensus');
 
 const RPC_READ_TIMEOUT_MS = 20_000;
 const RPC_TX_TIMEOUT_MS = 90_000;
@@ -498,6 +499,18 @@ class RPCPool {
     const error = new Error(`${label}: RPC read quorum ${quorum}/${this.providers.length} unavailable or inconsistent`);
     error.code = 'RPC_READ_QUORUM_UNAVAILABLE';
     throw error;
+  }
+
+  async executeSnapshotConsensusRead(fn, keyOf, label = 'keeper critical snapshot') {
+    return readSnapshotConsensus({
+      entries: await this._authenticatedProviderEntries(),
+      read: fn,
+      keyOf,
+      withTimeout: (read) => this.withTimeout(read, RPC_READ_TIMEOUT_MS, label),
+      allowSingle: true,
+      label,
+      errorCode: 'RPC_READ_QUORUM_UNAVAILABLE',
+    });
   }
 
   async _latestSignerNonce() {

@@ -171,7 +171,7 @@ class Rebalancer {
         return { success: false, deferred: true, error: 'rebalance required before deposit', txHashes: [] };
       }
 
-      await this._syncFeesForActionPlan('deposit');
+      // The standard vault collects fees within the simulated atomic deposit.
       let plan;
       try {
         plan = await this._buildDepositPlan(await this._readPriceCache());

@@ -184,7 +184,7 @@ test('HF safety lane runs before ordinary topology and derives the Aave pool on-
   const main = source.slice(source.indexOf('async function main()'));
   assert.ok(main.indexOf('await runHfSafetyLane(') >= 0);
   assert.ok(main.indexOf('await runHfSafetyLane(') < main.indexOf('await assertKeeperTopology('));
-  assert.match(source, /async function readLiveHfSafetyState[\s\S]{0,500}hm\.pool\(\)/);
+  assert.match(source, /async function readLiveHfSafetyState[\s\S]{0,500}hm\.pool\(\{ blockTag \}\)/);
   assert.match(source, /async function assertHfRepairTopology[\s\S]{0,700}hm\.hfRepairTriggerBps\(\)/);
   const safetyTopology = source.slice(
     source.indexOf('async function assertHfRepairTopology'),
