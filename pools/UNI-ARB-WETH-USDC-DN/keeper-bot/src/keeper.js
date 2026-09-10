@@ -431,6 +431,9 @@ async function main() {
       secureBotModule,
       async () => runHfSafetyLane({ rpcPool, hedgeManager, wallet, actionAlerts })
     );
+    const recoveryState = actionAlerts.state.depositRefundRecovery;
+    actionAlerts.state.depositRefundRecovery = recoveryState && typeof recoveryState === 'object' && !Array.isArray(recoveryState) ? recoveryState : {};
+    rebalancer.depositRefundRecovery = actionAlerts.state.depositRefundRecovery;
     console.log(`Keeper wallet: ${wallet.address}\n`);
   }
 
@@ -669,7 +672,10 @@ async function main() {
             await checkBountyFunding('deposit', 'deposit', treasury, treasuryAddr, usdc, rpcPool);
             console.log(`  -> ${pending.toString()} deposit(s) pending, processing one on-chain...`);
             const result = await rebalancer.processDeposit();
-            if (result.success) {
+            if (result.refunded) {
+              console.log(`  -> Persistently blocked deposit refunded: ${result.txHash}`);
+              await trackAction(actionAlerts, 'success', 'deposit', 'Stale head refunded to its depositor');
+            } else if (result.success) {
               console.log(`  -> Deposit processed (${result.txHashes.length} tx)`);
               await trackAction(actionAlerts, 'success', 'deposit', `Deposit processed: ${result.txHashes[0]}`);
             } else if (!result.deferred) {

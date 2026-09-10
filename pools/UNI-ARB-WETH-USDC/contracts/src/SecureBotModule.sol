@@ -335,12 +335,14 @@ contract SecureBotModule {
         emit ProgressiveRebalanceRefreshed(expectedDecisionHash, progressiveTickLower, progressiveTickUpper, msg.sender);
     }
 
+    error ProgressiveMarketGuard();
+
     function continueProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
         _requireCurrentModule();
         require(progressiveRebalanceStatus == 2 && IProgressiveVault(vault).isRebalancing(), "No progressive");
-        _requireCurrentProgressivePlan();
         progressiveRebalanceStatus = 3;
         IRangeManagerBotState(rangeManager).refreshPriceCache();
+        _requireCurrentProgressivePlan();
         RangeOperations.OptimalSwapParams memory plan = _progressiveSwapParams();
         require(plan.swapNeeded && amountIn > 0 && amountIn <= plan.amountIn, "Invalid chunk");
         _consumeProgressiveSwapBudget(plan.zeroForOne, amountIn);
@@ -370,10 +372,10 @@ contract SecureBotModule {
     function finalizeProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
         _requireCurrentModule();
         require(progressiveRebalanceStatus == 2 && IProgressiveVault(vault).isRebalancing(), "No progressive");
-        _requireCurrentProgressivePlan();
         progressiveRebalanceStatus = 3;
+        IRangeManagerBotState(rangeManager).refreshPriceCache();
+        _requireCurrentProgressivePlan();
         if (amountIn > 0) {
-            IRangeManagerBotState(rangeManager).refreshPriceCache();
             RangeOperations.OptimalSwapParams memory plan = _progressiveSwapParams();
             require(plan.swapNeeded && amountIn <= plan.amountIn, "Invalid chunk");
             _consumeProgressiveSwapBudget(plan.zeroForOne, amountIn);
@@ -401,7 +403,11 @@ contract SecureBotModule {
 
     function _requireCurrentProgressivePlan() private view {
         if (block.timestamp > progressivePlanValidUntil) revert ProgressivePlanExpired();
-        if (IRangeStrategyEngine(strategyEngine).previewDecision().epoch != progressivePlanEpoch) {
+        IRangeStrategyEngine.Decision memory decision = IRangeStrategyEngine(strategyEngine).previewDecision();
+        // The absent NFT legitimately makes dataFresh false after the burn. Only
+        // the live market/oracle guard (including STABLE depeg) blocks continuation.
+        if (decision.reason == IRangeStrategyEngine.ReasonCode.ORACLE_GUARD) revert ProgressiveMarketGuard();
+        if (decision.epoch != progressivePlanEpoch) {
             revert ProgressivePlanStale();
         }
     }

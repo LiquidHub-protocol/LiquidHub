@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 
+const { markDepositSimulationError, processDepositWithRecovery, readRecoverySnapshot, sendDepositRefund } = require('./utils/deposit-refund-recovery');
+
 const USD_SCALE = 100_000_000n;
 const PARTIAL_FILL_SELECTOR = '0xd964f528';
 
@@ -156,6 +158,16 @@ class Rebalancer {
   }
 
   async processDeposit() {
+    const options = { rpcPool: this.rpcPool, vaultAddress: this.vault.target,
+      strategyEngine: this.strategyEngine, isDn: true, walletForProvider: p => this.wallet.connect(p) };
+    this.depositRefundRecovery ||= {};
+    return processDepositWithRecovery({ state: this.depositRefundRecovery,
+      readSnapshot: () => readRecoverySnapshot(options), attempt: () => this._attemptDeposit(),
+      simulate: async () => this._simulateDeposit(await this._buildDepositPlan(await this._readPriceCache())),
+      sendRefund: (user, guard) => sendDepositRefund(options, user, guard) });
+  }
+
+  async _attemptDeposit() {
     console.log('\n=== Processing queued deposit (permissionless) ===');
     try {
       const decision = await this.rpcPool.executeWithRetry(async (provider) => {
@@ -202,6 +214,7 @@ class Rebalancer {
       const message = error.message || '';
       return {
         success: false,
+        simulationReverted: error.depositSimulationReverted === true,
         stateMayHaveChanged: message.includes('broadcast tx:') || message.includes('signed broadcast tx:'),
         error: message,
         txHashes: [],
@@ -610,7 +623,7 @@ class Rebalancer {
   }
 
   async _simulateDeposit(plan) {
-    await this.rpcPool.executeWithRetry(async (provider) => {
+    try { await this.rpcPool.executeWithRetry(async (provider) => {
       const vault = this.vault.connect(this.wallet.connect(provider));
       return await vault.processDepositPermissionless.staticCall(
         plan.swapAmounts,
@@ -619,6 +632,7 @@ class Rebalancer {
         plan.tokenOut
       );
     });
+    } catch (error) { throw markDepositSimulationError(error); }
   }
 
   _logPlan(plan) {
