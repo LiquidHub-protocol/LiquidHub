@@ -156,6 +156,9 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     StrategyConfig public strategyConfig;
     DecisionMode public override decisionMode;
     uint16 public learningInfluenceBps;
+    // One increment per owner call: a uint256 revision cannot wrap in a feasible chain lifetime.
+    uint256 private _configurationRevision = 1;
+    uint256 private _decisionConfigurationRevision;
     uint64 private _lastCheckpointEpoch;
     uint64 internal _outOfRangeSince;
     address private immutable _strategyVault;
@@ -288,17 +291,19 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     }
 
     function checkpointDue() public view override returns (bool) {
-        return uint64(block.timestamp / strategyConfig.epochSeconds) > _lastCheckpointEpoch;
+        return _configurationRevision != _decisionConfigurationRevision
+            || uint64(block.timestamp / strategyConfig.epochSeconds) > _lastCheckpointEpoch;
     }
 
     function checkpointMarketState() external override nonReentrant returns (Decision memory decision) {
         StrategyConfig memory cfg = strategyConfig;
         uint64 epoch = uint64(block.timestamp / cfg.epochSeconds);
-        if (epoch <= _lastCheckpointEpoch) revert CheckpointNotDue();
+        if (!checkpointDue()) revert CheckpointNotDue();
+        bool configurationOnly = epoch == _lastCheckpointEpoch && marketState.checkpointTimestamp != 0;
 
         IRangeManagerStrategy rm = IRangeManagerStrategy(rangeManager);
         if (
-            rm.isProtocolBotCaller(msg.sender)
+            !configurationOnly && rm.isProtocolBotCaller(msg.sender)
                 && block.timestamp < uint256(epoch) * cfg.epochSeconds + MAIN_BOT_KEEPER_DELAY
         ) revert KeeperWindowActive();
         rm.refreshPriceCache();
@@ -307,45 +312,59 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
 
         (int24 tacticalTick, int24 strategicTick) =
             _canonicalTwaps(pool, epoch, cfg.epochSeconds, cfg.tacticalHorizonSeconds, cfg.strategicHorizonSeconds);
-        uint256 feeGrowth0 = IUniswapV3Pool(pool).feeGrowthGlobal0X128();
-        uint256 feeGrowth1 = IUniswapV3Pool(pool).feeGrowthGlobal1X128();
+        uint256 feeGrowth0 =
+            configurationOnly ? marketState.feeGrowthGlobal0X128 : IUniswapV3Pool(pool).feeGrowthGlobal0X128();
+        uint256 feeGrowth1 =
+            configurationOnly ? marketState.feeGrowthGlobal1X128 : IUniswapV3Pool(pool).feeGrowthGlobal1X128();
         uint64 previousTimestamp = marketState.checkpointTimestamp;
         int24 previousCanonicalTick = marketState.canonicalTick;
         uint64 elapsed = previousTimestamp == 0 ? 0 : uint64(block.timestamp) - previousTimestamp;
         int24 realizedMove = previousTimestamp == 0 ? int24(0) : _subTicks(tacticalTick, previousCanonicalTick);
         uint24 absoluteMove = _absTick(realizedMove);
         (, uint8 token0Decimals, uint8 token1Decimals,,,,,) = rm.config();
-        uint16 observedFees = RangeStrategyDnLib.observedFeeRateBps(
-            RangeStrategyDnLib.FeeRateInput({
-                feeGrowth0: feeGrowth0,
-                feeGrowth1: feeGrowth1,
-                previousGrowth0: marketState.feeGrowthGlobal0X128,
-                previousGrowth1: marketState.feeGrowthGlobal1X128,
-                elapsed: elapsed,
-                liveTick: liveTick,
-                price0: price0,
-                price1: price1,
-                token0Decimals: token0Decimals,
-                token1Decimals: token1Decimals,
-                epochSeconds: cfg.epochSeconds,
-                fallbackRangeDownTicks: cfg.fallbackRangeDownTicks,
-                fallbackRangeUpTicks: cfg.fallbackRangeUpTicks,
-                tickSpacing: _strategyTickSpacing
-            })
-        );
+        uint16 observedFees = configurationOnly
+            ? marketState.observedFeeRateBps
+            : RangeStrategyDnLib.observedFeeRateBps(
+                RangeStrategyDnLib.FeeRateInput({
+                    feeGrowth0: feeGrowth0,
+                    feeGrowth1: feeGrowth1,
+                    previousGrowth0: marketState.feeGrowthGlobal0X128,
+                    previousGrowth1: marketState.feeGrowthGlobal1X128,
+                    elapsed: elapsed,
+                    liveTick: liveTick,
+                    price0: price0,
+                    price1: price1,
+                    token0Decimals: token0Decimals,
+                    token1Decimals: token1Decimals,
+                    epochSeconds: cfg.epochSeconds,
+                    fallbackRangeDownTicks: cfg.fallbackRangeDownTicks,
+                    fallbackRangeUpTicks: cfg.fallbackRangeUpTicks,
+                    tickSpacing: _strategyTickSpacing
+                })
+            );
 
-        bool learningUpdated = previousTimestamp != 0 && decisionMode == DecisionMode.HYBRID;
+        bool learningUpdated = !configurationOnly && previousTimestamp != 0 && decisionMode == DecisionMode.HYBRID;
         if (learningUpdated) _updateExpertWeights(realizedMove, absoluteMove, observedFees);
 
-        uint24 fastVol = _ewma(marketState.fastVolatilityTicks, absoluteMove, 5000);
-        uint24 slowVol = _ewma(marketState.slowVolatilityTicks, absoluteMove, 2000);
-        uint24 upside = _ewma(marketState.upsideSemivarianceTicks, realizedMove > 0 ? absoluteMove : 0, 3000);
-        uint24 downside = _ewma(marketState.downsideSemivarianceTicks, realizedMove < 0 ? absoluteMove : 0, 3000);
+        uint24 fastVol = configurationOnly
+            ? marketState.fastVolatilityTicks
+            : _ewma(marketState.fastVolatilityTicks, absoluteMove, 5000);
+        uint24 slowVol = configurationOnly
+            ? marketState.slowVolatilityTicks
+            : _ewma(marketState.slowVolatilityTicks, absoluteMove, 2000);
+        uint24 upside = configurationOnly
+            ? marketState.upsideSemivarianceTicks
+            : _ewma(marketState.upsideSemivarianceTicks, realizedMove > 0 ? absoluteMove : 0, 3000);
+        uint24 downside = configurationOnly
+            ? marketState.downsideSemivarianceTicks
+            : _ewma(marketState.downsideSemivarianceTicks, realizedMove < 0 ? absoluteMove : 0, 3000);
         uint16 slowFees = uint16(_ewma(marketState.forecastFeeRateBps, observedFees, 2000));
 
-        _setNextPredictions(
-            realizedMove, tacticalTick, strategicTick, fastVol, slowVol, upside, downside, observedFees, slowFees
-        );
+        if (!configurationOnly) {
+            _setNextPredictions(
+                realizedMove, tacticalTick, strategicTick, fastVol, slowVol, upside, downside, observedFees, slowFees
+            );
+        }
         (int24 forecastTrend, uint24 forecastVol, uint16 forecastFees, uint16 uncertainty) = RangeOperations
             .combineStrategyForecasts(
             _trendPredictions,
@@ -359,7 +378,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
 
         marketState = MarketState({
             epoch: epoch,
-            checkpointTimestamp: uint64(block.timestamp),
+            checkpointTimestamp: configurationOnly ? previousTimestamp : uint64(block.timestamp),
             canonicalTick: tacticalTick,
             tacticalTwapTick: tacticalTick,
             strategicTwapTick: strategicTick,
@@ -376,6 +395,9 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             feeGrowthGlobal1X128: feeGrowth1
         });
         _lastCheckpointEpoch = epoch;
+        // Configuration refreshes reuse the epoch's observations and weights,
+        // without another learning sample, timestamp extension or keeper bounty.
+        _decisionConfigurationRevision = _configurationRevision;
         _telemetry.spotTick = liveTick;
         bool rangeExitConfirmed = _updateOutOfRangeState(liveTick, tacticalTick);
 
@@ -384,7 +406,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         _canonicalDecision = decision;
         _telemetry = Telemetry({
             epoch: epoch,
-            checkpointTimestamp: uint64(block.timestamp),
+            checkpointTimestamp: configurationOnly ? previousTimestamp : uint64(block.timestamp),
             spotTick: liveTick,
             tacticalTwapTick: tacticalTick,
             strategicTwapTick: strategicTick,
@@ -424,7 +446,9 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             decision.decisionHash
         );
 
-        try IStrategyCheckpointTreasury(treasury).payStrategyCheckpointBounty(msg.sender, epoch) {} catch {}
+        if (!configurationOnly) {
+            try IStrategyCheckpointTreasury(treasury).payStrategyCheckpointBounty(msg.sender, epoch) {} catch {}
+        }
     }
 
     function _setNextPredictions(
@@ -472,6 +496,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         PositionState memory position = _positionState(liveTick);
         RangeStrategyDnLib.Context memory dn = _dnContext();
         decision = _canonicalDecision;
+        // A saved progressive target is bound to this canonical hash too.
+        if (_configurationRevision != _decisionConfigurationRevision) decision.decisionHash = bytes32(0);
         if (_hfCritical(dn)) return _hfRepairDecision(decision, liveTick, position, dn);
         bool expectedPosition = decision.currentTickLower < decision.currentTickUpper;
         bool positionChanged = position.exists != expectedPosition
@@ -748,7 +774,14 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         returns (Decision memory, EvaluationSummary memory)
     {
         decision.decisionHash = keccak256(
-            abi.encode(block.chainid, address(this), strategyVersion, decision, marketState.checkpointTimestamp)
+            abi.encode(
+                block.chainid,
+                address(this),
+                strategyVersion,
+                _configurationRevision,
+                decision,
+                marketState.checkpointTimestamp
+            )
         );
         return (decision, summary);
     }
@@ -899,12 +932,18 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     }
 
     function setDecisionMode(DecisionMode mode) external onlyOwner {
+        unchecked {
+            ++_configurationRevision;
+        }
         decisionMode = mode;
         emit DecisionModeUpdated(mode);
     }
 
     function setLearningInfluence(uint16 influenceBps) external onlyOwner {
         if (influenceBps > maxLearningInfluenceBps) revert InvalidConfiguration();
+        unchecked {
+            ++_configurationRevision;
+        }
         learningInfluenceBps = influenceBps;
         emit LearningInfluenceUpdated(influenceBps);
     }
@@ -920,6 +959,9 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             maxSkewBps > 5000 || tailRiskBps < 100 || tailRiskBps > 5000 || minEdgeBps == 0 || minEdgeBps > 2000
                 || maxCenterMoveBps > BPS || maxWidthChangeBps > BPS
         ) revert InvalidConfiguration();
+        unchecked {
+            ++_configurationRevision;
+        }
         strategyConfig.maxSkewBps = maxSkewBps;
         strategyConfig.tailRiskBps = tailRiskBps;
         strategyConfig.minEdgeBps = minEdgeBps;
@@ -937,6 +979,9 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             minHalf < minimum || maxHalf <= minHalf || maxHalf > 5000 || fallbackUp < minHalf || fallbackUp > maxHalf
                 || fallbackDown < minHalf || fallbackDown > maxHalf || !_hasAlignedHalfWidth(minHalf, maxHalf)
         ) revert InvalidConfiguration();
+        unchecked {
+            ++_configurationRevision;
+        }
         strategyConfig.fallbackRangeUpTicks = fallbackUp;
         strategyConfig.fallbackRangeDownTicks = fallbackDown;
         strategyConfig.minHalfRangeTicks = minHalf;
@@ -948,6 +993,9 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         if (hedgeOnlyMinEdgeBps == 0 || hedgeOnlyMinEdgeBps > 5000 || minHedgeDeltaBps == 0 || minHedgeDeltaBps > 2000)
         {
             revert InvalidConfiguration();
+        }
+        unchecked {
+            ++_configurationRevision;
         }
         strategyConfig.dnHedgeOnlyMinEdgeBps = hedgeOnlyMinEdgeBps;
         strategyConfig.dnMinHedgeDeltaBps = minHedgeDeltaBps;

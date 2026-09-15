@@ -192,7 +192,10 @@ contract SecureBotModule {
         rm.refreshPriceCache();
         RangeOperations.PriceCache memory cache = _progressiveCache();
         // A STABLE depeg pauses investment, not ordinary checkpoint-stale maintenance.
-        if (IRangeStrategyEngine(strategyEngine).previewDecision().reason == IRangeStrategyEngine.ReasonCode.ORACLE_GUARD) {
+        if (
+            IRangeStrategyEngine(strategyEngine).previewDecision().reason
+                == IRangeStrategyEngine.ReasonCode.ORACLE_GUARD
+        ) {
             revert ProgressiveMarketGuard();
         }
         (,,,,, int24 lower, int24 upper,,,,,) = rm.positionManager().positions(positions[0]);
@@ -322,7 +325,7 @@ contract SecureBotModule {
         IRangeStrategyEngine.Decision memory decision =
             IRangeStrategyEngine(strategyEngine).validateDecision(expectedDecisionHash);
         require(decision.reason == IRangeStrategyEngine.ReasonCode.INITIAL_MINT_REQUIRED, "Invalid recovery");
-        require(newCycle || safeRecovery || decision.epoch > progressivePlanEpoch, "Plan epoch");
+        require(newCycle || safeRecovery || decision.decisionHash != progressiveDecisionHash, "Plan epoch");
         RangeOperations.PriceCache memory cache = _progressiveCache();
         require(
             cache.poolTick > decision.targetTickLower && cache.poolTick < decision.targetTickUpper, "Invalid recovery"
@@ -409,9 +412,9 @@ contract SecureBotModule {
         if (block.timestamp > progressivePlanValidUntil) revert ProgressivePlanExpired();
         IRangeStrategyEngine.Decision memory decision = IRangeStrategyEngine(strategyEngine).previewDecision();
         // The absent NFT legitimately makes dataFresh false after the burn. Only
-        // the live market/oracle guard (including STABLE depeg) blocks continuation.
+        // market/oracle guards and a changed canonical hash block continuation.
         if (decision.reason == IRangeStrategyEngine.ReasonCode.ORACLE_GUARD) revert ProgressiveMarketGuard();
-        if (decision.epoch != progressivePlanEpoch) {
+        if (decision.decisionHash != progressiveDecisionHash) {
             revert ProgressivePlanStale();
         }
     }

@@ -448,15 +448,15 @@ class Rebalancer {
     const readState = () => this.rpcPool.executeWithRetry(async (provider) => {
       const module = this._requireProgressiveModule().connect(provider);
       const engine = this.strategyEngine.connect(provider);
-      const [status, locked, positions, planEpoch, decision, checkpointDue] = await Promise.all([
+      const [status, locked, positions, decision, checkpointDue, planHash] = await Promise.all([
         module.progressiveRebalanceStatus(),
         this.vault.connect(provider).isRebalancing(),
         this.rangeManager.connect(provider).getOwnerPositions(),
-        module.progressivePlanEpoch(),
         engine.previewDecision(),
         engine.checkpointDue(),
+        module.progressiveDecisionHash(),
       ]);
-      return { status: Number(status), locked, positions, planEpoch, decision, checkpointDue };
+      return { status: Number(status), locked, positions, decision, checkpointDue, planHash };
     });
     let state = await readState();
     if (![0, 2].includes(state.status) || !state.locked || state.positions.length !== 0) return false;
@@ -482,7 +482,7 @@ class Rebalancer {
     }
     if (!state.locked || state.positions.length !== 0 || ![0, 2].includes(state.status)) return false;
     if (!state.decision.dataFresh || Number(state.decision.reason) !== 1) return false;
-    if (state.status === 2 && BigInt(state.decision.epoch) <= BigInt(state.planEpoch)) return false;
+    if (state.status === 2 && state.decision.decisionHash === state.planHash) return false;
     await this.rpcPool.executeWithRetry(async (provider) => {
       return this._requireProgressiveModule().connect(provider).refreshProgressiveRebalance.staticCall(state.decision.decisionHash, {
         from: this.wallet.address,

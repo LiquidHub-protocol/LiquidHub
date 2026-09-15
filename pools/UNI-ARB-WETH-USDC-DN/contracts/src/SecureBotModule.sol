@@ -358,7 +358,7 @@ contract SecureBotModule {
         if (decision.reason != IRangeStrategyEngine.ReasonCode.INITIAL_MINT_REQUIRED) {
             revert InvalidProgressiveRecovery();
         }
-        if (!(newCycle || safeRecovery || decision.epoch > progressivePlanEpoch)) {
+        if (!(newCycle || safeRecovery || decision.decisionHash != progressiveDecisionHash)) {
             revert ProgressiveEpochNotAdvanced();
         }
         RangeOperations.PriceCache memory cache = _progressiveCache();
@@ -454,7 +454,8 @@ contract SecureBotModule {
 
     function _requireCurrentProgressivePlan() private view {
         if (block.timestamp > progressivePlanValidUntil) revert ProgressivePlanExpired();
-        if (IRangeStrategyEngine(strategyEngine).previewDecision().epoch != progressivePlanEpoch) {
+        IRangeStrategyEngine.Decision memory decision = IRangeStrategyEngine(strategyEngine).previewDecision();
+        if (decision.decisionHash != progressiveDecisionHash) {
             revert ProgressivePlanStale();
         }
     }

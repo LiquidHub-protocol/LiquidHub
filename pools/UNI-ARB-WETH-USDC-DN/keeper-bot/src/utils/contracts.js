@@ -109,6 +109,7 @@ const PAUSE_CONTROLLER_ABI = [
 
 const SECURE_BOT_MODULE_ABI = [
   "function refreshProgressiveRebalance(bytes32 expectedDecisionHash) external",
+  "function progressiveDecisionHash() external view returns (bytes32)",
   "function progressivePlanEpoch() external view returns (uint64)",
   "function progressiveCycleBudgetUsdE8() external view returns (uint256)",
   "function compound() external returns (uint256 investedUsdE8)",

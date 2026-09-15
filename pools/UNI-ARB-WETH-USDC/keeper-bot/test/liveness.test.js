@@ -54,6 +54,7 @@ function progressiveFixture(overrides = {}) {
   r.secureBotModule = connectable({
     progressiveRebalanceStatus: async () => state.status,
     progressivePlanEpoch: async () => state.planEpoch,
+    progressiveDecisionHash: async () => state.planHash || 'canonical-hash',
     getProgressiveSwapParams: async () => {
       state.plans++;
       return { swapNeeded: true, zeroForOne: false, amountIn: state.amount };
@@ -79,6 +80,7 @@ function progressiveFixture(overrides = {}) {
       state.status = 2;
       state.locked = true;
       state.planEpoch = 1n;
+      state.planHash = 'canonical-hash';
     } else {
       assert.equal(method, 'finalizeProgressiveRebalance');
       if (state.failures > 0 || state.persistentChunkError) {
@@ -116,6 +118,7 @@ test('progressive cache refreshes once and refuses a persistently invalid oracle
 for (const scenario of [
   { name: 'start', status: 0, locked: false, planEpoch: 1n, first: 'beginProgressiveRebalance' },
   { name: 'resume', status: 2, locked: true, planEpoch: 1n, first: 'finalizeProgressiveRebalance' },
+  { name: 'retarget after configuration change', status: 2, locked: true, planEpoch: 1n, planHash: 'previous-policy', first: 'refreshProgressiveRebalance' },
   { name: 'adopt after module rotation', status: 0, locked: true, planEpoch: 0n, first: 'refreshProgressiveRebalance' },
 ]) {
   test('real keeper RPC permits progressive ' + scenario.name + ' through completion', async () => {
