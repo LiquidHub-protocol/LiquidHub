@@ -285,7 +285,7 @@ async function executeHedgeIfReady({
         actionAlerts,
         'critical',
         'hfRepairPostCheck',
-        `HF impossible à vérifier après la transaction confirmée ${receipt.hash}: ${postCheckError.message}. Contrôle Safe immédiat requis.`
+        `HF impossible à vérifier après la transaction confirmée ${receipt.hash}: ${postCheckError.message}. Vérifier les RPC immédiatement; le keeper relira le HF au prochain contrôle. Recours Safe uniquement si un blocage de la réparation est confirmé.`
       );
       console.log(`  🚨 ${label}: HF post-transaction impossible à vérifier`);
       return false;
@@ -293,14 +293,14 @@ async function executeHedgeIfReady({
     const hfBps = postRepair.hf / 100_000_000_000_000n;
     if (postRepair.debtBase > 0n && hfBps < postRepair.triggerBps) {
       const hfText = (Number(postRepair.hf) / 1e18).toFixed(3);
-      const safeEscalation = hfBps <= 12_500n
-        ? ' HF sous 1,25: alerte Safe renforcée et intervention immédiate.'
-        : ' Vérifier immédiatement une intervention Safe si aucune nouvelle réparation ne peut être confirmée.';
+      const urgency = hfBps <= 12_500n ? ' Alerte renforcée: HF sous 1,25.' : '';
+      const repairGuidance = ' Les réparations automatiques restent prioritaires aux contrôles suivants. ' +
+        'Vérifier les tentatives immédiatement; recours Safe uniquement si la réparation est bloquée ou échoue.';
       await trackAction(
         actionAlerts,
         'critical',
         'hfRepairPostCheck',
-        `HF ${hfText} reste sous le seuil ${(Number(postRepair.triggerBps) / 10_000).toFixed(2)} après ${receipt.hash}.${safeEscalation}`
+        `HF ${hfText} reste sous le seuil ${(Number(postRepair.triggerBps) / 10_000).toFixed(2)} après ${receipt.hash}.${urgency}${repairGuidance}`
       );
       console.log(`  🚨 ${label}: HF ${hfText} reste sous le seuil après confirmation`);
       return false;
@@ -312,7 +312,7 @@ async function executeHedgeIfReady({
     let stillRequired = true;
     try {
       await rpcPool.executeWithRetry(async (provider) => {
-        await hedgeManager.connect(provider).adjustHedge.staticCall();
+        await hedgeManager.connect(provider)[method].staticCall();
       });
     } catch (recheckError) {
       stillRequired = classifyHedgeSimulationError(recheckError, rpcPool).kind !== 'no-action';

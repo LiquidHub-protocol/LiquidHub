@@ -24,11 +24,11 @@ All steps are independent. Note: processing a deposit **opens the AAVE hedge ato
 
 ### Hedge adjustment (`adjustHedge`, 100% on-chain)
 
-`adjustHedge()` is **permissionless** and pilots on the **net effective short** (`effectiveShort = debt − idle token0`) versus the on-chain target. It corrects both directions without keeper-provided sizing. Ordinary drift requires same-direction confirmation over the tactical horizon, a minimum portfolio exposure and the four-hour on-chain cooldown; fading signals clear below the hysteresis boundary, and an eligible correction may be grouped with an imminent range action. Critical drift bypasses confirmation, grouping and cooldown. An urgent repair is enabled only below `HF_REPAIR_TRIGGER_BPS`, also bypasses those ordinary controls for safety and restores toward `HF_REPAIR_TARGET_BPS`. It earns a bounty only when at least `HF_REPAIR_BOUNTY_MIN_USD` of AAVE debt was actually repaid; smaller repairs still execute without a bounty.
+`adjustHedge()` is **permissionless** and pilots on the **net effective short** (`effectiveShort = debt − idle token0`) versus the on-chain target. It corrects both directions without keeper-provided sizing. Ordinary drift requires same-direction confirmation over the tactical horizon, a minimum portfolio exposure and the four-hour on-chain cooldown; fading signals clear below the hysteresis boundary, and an eligible correction may be grouped with an imminent range action. Critical drift bypasses confirmation, grouping and cooldown. An urgent repair is enabled only below `HF_REPAIR_TRIGGER_BPS`, also bypasses those ordinary controls for safety and sizes repayment toward the minimum HF (`HF_REPAIR_TARGET_BPS`) plus the operating margin (`HEDGE_OPERATIONAL_HF_BUFFER_BPS`), with a small rounding buffer. Current deployment defaults are 1.50 + 0.50, or approximately 2.00; the deployed on-chain settings remain authoritative. It earns a bounty only when at least `HF_REPAIR_BOUNTY_MIN_USD` of AAVE debt was actually repaid; smaller repairs still execute without a bounty.
 
-**USDC reserve management** is integrated into the same call: when the health factor is above the governance target (`HF_REPAIR_TARGET_BPS`), `adjustHedge()` releases the surplus AAVE collateral and keeps it as USDC **on the HedgeManager itself** (never sent off-contract), so the reserve used for future adjustments is replenished on-chain without any separate keeper action.
+**USDC reserve management** is integrated into the same call: when the health factor exceeds the governed minimum plus operating margin, `adjustHedge()` releases the surplus AAVE collateral and keeps it as USDC **on the HedgeManager itself** (never sent off-contract), so the reserve used for future adjustments is replenished on-chain without any separate keeper action.
 
-Each cycle the keeper simulates the exact canonical call before sending: `repairHealthFactor()` for `HF_REPAIR`, otherwise `adjustHedge()`. The dedicated repair selector reverts instead of falling through to a normal hedge if the HF was repaired by another keeper first. The contract enforces sizing and all safety checks atomically. After a confirmed transaction, the keeper rereads the live HF: remaining below 1.40 raises an immediate local critical incident, reinforced below 1.25 for Safe intervention. Community keeper alerts remain local-only; protocol Telegram credentials are never distributed.
+Each cycle the keeper simulates the exact canonical call before sending: `repairHealthFactor()` for `HF_REPAIR`, otherwise `adjustHedge()`. The dedicated repair selector reverts instead of falling through to a normal hedge if the HF was repaired by another keeper first. The contract enforces sizing and all safety checks atomically. After a confirmed transaction, the keeper rereads the live HF. If it remains below the on-chain repair trigger, ordinary actions stay deferred and repair is attempted again on subsequent checks. A useful direct repayment can be preserved when the remaining flash-assisted step fails, but only when debt decreases and HF improves. Lower HF alert levels (including 1.25 and 1.15 in protocol monitoring) never require a manual handover or disable repair. Operators investigate failed or blocked repairs immediately; the Safe is an exceptional recovery tool for those diagnosed failures. After a failed send, the keeper re-simulates the same selected method, so an ineligible ordinary hedge cannot incorrectly clear a still-needed HF repair. Community keeper alerts remain local-only; protocol Telegram credentials are never distributed.
 
 `checkpointMarketState()`, `rebalance()` and `adjustHedge()` are permissionless. Any address can call them when the
 contracts agree; no keeper allowlist or role is required.
@@ -66,9 +66,10 @@ All Exposed keeper variables apply, with `STRATEGY_PROFILE=DELTA_NEUTRAL`, inclu
 |---|---|---|
 | `AAVE_HEDGE_MANAGER_ADDRESS` | AaveHedgeManager contract address | -- |
 | `AAVE_HEALTH_WARN` | Health factor warning threshold, usually near `HF_REPAIR_TARGET_BPS` | `1.50` |
-| `AAVE_HEALTH_DELEVERAGE` | Health factor critical/deleverage threshold | `1.25` |
-| `AAVE_HEALTH_EMERGENCY` | Health factor emergency threshold | `1.15` |
-| `HF_REPAIR_TARGET_BPS` | On-chain HF restoration target | `15000` |
+| `AAVE_HEALTH_DELEVERAGE` | Reinforced monitoring alert; no manual handover | `1.25` |
+| `AAVE_HEALTH_EMERGENCY` | Maximum-urgency monitoring alert; repair stays automatic | `1.15` |
+| `HF_REPAIR_TARGET_BPS` | Minimum HF used by on-chain checks | `15000` |
+| `HEDGE_OPERATIONAL_HF_BUFFER_BPS` | Operating margin added to the minimum for repayment sizing | `5000` |
 | `HF_REPAIR_TRIGGER_BPS` | On-chain urgent repair trigger | `14000` |
 
 ### RPC Trust Model

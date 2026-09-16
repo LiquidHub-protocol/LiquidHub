@@ -196,6 +196,91 @@ test('HF safety lane runs before ordinary topology and derives the Aave pool on-
   assert.doesNotMatch(safetyTopology, /VAULT_ADDRESS|RANGEMANAGER_ADDRESS|strategyEngine/);
 });
 
+function keeperHfFixture(startingHfBps) {
+  const source = fsSync.readFileSync(path.join(__dirname, '../src/keeper.js'), 'utf8');
+  const section = (start, end) => {
+    const from = source.indexOf(start);
+    const to = source.indexOf(end, from);
+    assert.ok(from >= 0 && to > from);
+    return source.slice(from, to);
+  };
+  const state = { hfBps: startingHfBps, debt: 1000n, attempts: 0, repairSimulations: 0, ordinarySimulations: 0 };
+  const incidents = [];
+  const chainEthers = {
+    ...ethers,
+    Contract: class {
+      async getUserAccountData() {
+        return { totalDebtBase: state.debt, healthFactor: state.hfBps * 100_000_000_000_000n };
+      }
+    },
+  };
+  // Execute the production safety lane, post-check and error classification;
+  // only external chain reads, signing and transaction outcomes are simulated.
+  const { runHfSafetyLane } = new Function('ethers', 'console', `
+    const CHECK_ONLY = false;
+    const AAVE_POOL_ABI = [];
+    const HEDGE_ERROR_IFACE = new ethers.Interface(['error HedgeCheck(uint8 code)']);
+    const HEDGE_NO_ACTION_CODES = new Set([41, 42, 44]);
+    ${section('function hedgeCheckCode(', 'function needsPriceCacheRefresh(')}
+    ${section('async function readLiveHfSafetyState(', 'async function assertHfRepairTopology(')}
+    ${section('async function trackAction(', 'function persistedActionName(')}
+    ${section('async function executeHedgeIfReady(', 'async function main(')}
+    return { runHfSafetyLane };
+  `)(chainEthers, { log() {} });
+  const provider = {};
+  const wallet = { connect: () => wallet };
+  const hedgeManager = {
+    target: '0x1111111111111111111111111111111111111111',
+    connect() { return this; },
+    pool: async () => '0x2222222222222222222222222222222222222222',
+    hfRepairTriggerBps: async () => 14000n,
+    repairHealthFactor: {
+      staticCall: async () => { state.repairSimulations++; },
+      populateTransaction: async () => ({ to: 'hedge-manager', data: 'repairHealthFactor' }),
+    },
+    adjustHedge: { staticCall: async () => {
+      state.ordinarySimulations++;
+      throw { revert: { name: 'HedgeCheck', args: [42] } };
+    } },
+  };
+  const rpcPool = {
+    executeSnapshotConsensusRead: async (fn) => fn(provider, 123),
+    executeWithRetry: async (fn) => fn(provider),
+    isProviderError: () => false,
+    executeSignedTxWithRetry: async (fn, label, retries, options) => {
+      assert.equal(label, 'hfRepair');
+      assert.equal(options.bypassFeeCap, true);
+      const payload = await fn(provider);
+      assert.equal(payload.request.data, 'repairHealthFactor');
+      state.attempts++;
+      if (state.attempts === 1) throw new Error('Temporary repair failure');
+      state.hfBps = state.attempts === 2 ? startingHfBps + 20n : 20000n;
+      state.debt -= 50n;
+      return confirmedReceipt(`0x${state.attempts}`);
+    },
+  };
+  const actionAlerts = Object.fromEntries(['failure', 'success', 'critical'].map((kind) => [
+    kind, async (...args) => incidents.push({ kind, args }),
+  ]));
+  return { state, incidents, run: () => runHfSafetyLane({ rpcPool, hedgeManager, wallet, actionAlerts }) };
+}
+
+for (const startingHfBps of [13900n, 12500n, 11500n, 10500n]) {
+  test(`keeper HF ${Number(startingHfBps) / 10000}: repair failure and partial recovery keep automatic repair eligible`, async () => {
+    const { state, incidents, run } = keeperHfFixture(startingHfBps);
+    await assert.rejects(run(), /HF remains below the on-chain repair trigger/);
+    assert.equal(state.repairSimulations, 2, 'a failed repair is rechecked with its own selector');
+    assert.equal(state.ordinarySimulations, 0, 'ordinary hedge eligibility cannot clear a failed HF repair');
+    assert.equal(incidents.at(-1).kind, 'failure');
+    await assert.rejects(run(), /HF remains below the on-chain repair trigger/);
+    assert.equal(incidents.at(-1).kind, 'critical', 'a partial repayment remains an incident until HF is restored');
+    assert.match(incidents.at(-1).args[1], /Les réparations automatiques restent prioritaires/);
+    assert.deepEqual(await run(), { required: true, repaired: true });
+    assert.deepEqual(await run(), { required: false, repaired: false });
+    assert.equal(state.attempts, 3, 'recovered HF suppresses duplicate transactions');
+  });
+}
+
 test('RPC timeout releases a silent provider call', async () => {
   const pool = Object.create(RPCPool.prototype);
   await assert.rejects(
@@ -1013,12 +1098,14 @@ test('critical keeper alert is immediate, persisted and deduplicated', async (t)
   assert.match(messages[0], /CRITICAL hfRepairPostCheck/);
 });
 
-test('confirmed hedge transactions require an on-chain HF post-check and Safe escalation', () => {
+test('confirmed hedge transactions require an on-chain HF post-check without a manual handover', () => {
   const keeper = fsSync.readFileSync(path.join(__dirname, '..', 'src', 'keeper.js'), 'utf8');
   assert.match(keeper, /hfRepairTriggerBps\(\)/);
   assert.match(keeper, /hfRepairPostCheck/);
   assert.match(keeper, /hfBps <= 12_500n/);
   assert.match(keeper, /HF impossible à vérifier après la transaction confirmée/);
+  assert.match(keeper, /Les réparations automatiques restent prioritaires aux contrôles suivants/);
+  assert.doesNotMatch(keeper, /Contrôle Safe immédiat requis|alerte Safe renforcée et intervention immédiate/);
 });
 
 function readJavaScriptTree(dir) {
