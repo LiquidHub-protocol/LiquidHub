@@ -12,9 +12,29 @@ const VAULT_RECOVERY_ABI = [
 const PAUSE_ABI = ['function inflowsPaused() view returns(bool)'];
 const MIN_FAILURE_SECONDS = 600;
 
+function isConfirmedEvmRevert(error) {
+  if (error?.code !== 'CALL_EXCEPTION' || !['call', 'estimateGas'].includes(error.action)) return false;
+  // ethers also wraps JSON-RPC infrastructure errors in CALL_EXCEPTION. Its
+  // generated message (including "missing revert data") is not EVM evidence.
+  const rpcError = error.info?.error;
+  const rpcMessage = typeof rpcError?.message === 'string' ? rpcError.message : '';
+  const explicitRevert = /^(?:execution reverted\b|VM Exception while processing transaction:\s*revert\b)/i.test(rpcMessage.trim());
+  if (!explicitRevert && rpcError && (
+    [-32700, -32600, -32601, -32602, -32603, -32002, -32005, 429, 500, 502, 503, 504].includes(Number(rpcError.code))
+    || /\b(?:internal (?:server )?error|timeout|timed out|rate limit|too many requests|unavailable)\b/i.test(rpcMessage)
+  )) return false;
+  if (typeof error.data === 'string' && /^0x(?:[0-9a-f]{2})+$/i.test(error.data)) return true;
+  // An empty Solidity revert remains usable when the RPC explicitly reports it.
+  return (error.data == null || error.data === '0x')
+    && Boolean(rpcError && (Number(rpcError.code) === 3 || explicitRevert));
+}
+
 function markDepositSimulationError(error) {
   // Only an actual deposit eth_call revert is evidence; not RPC, gas or broadcast errors.
-  if (error?.code === 'CALL_EXCEPTION' && error?.action === 'call') error.depositSimulationReverted = true;
+  if (error && typeof error === 'object') {
+    delete error.depositSimulationReverted;
+    if (error.action === 'call' && isConfirmedEvmRevert(error)) error.depositSimulationReverted = true;
+  }
   return error;
 }
 
@@ -44,8 +64,9 @@ async function readRecoverySnapshot({ rpcPool, vaultAddress, pauseControllerAddr
 
 async function processDepositWithRecovery(options) {
   const { state, attempt, simulate, readSnapshot, sendRefund } = options;
-  const reset = () => { delete state.key; delete state.first; delete state.last; delete state.failures; };
-  if (state.key && (![state.first, state.last, state.failures].every(Number.isSafeInteger)
+  const reset = () => { delete state.key; delete state.first; delete state.last; delete state.failures; delete state.proofVersion; };
+  // Counters saved before explicit EVM classification are not proof of reverts.
+  if (state.key && (state.proofVersion !== 1 || ![state.first, state.last, state.failures].every(Number.isSafeInteger)
     || state.first < 0 || state.last < state.first || state.failures < 1)) reset();
   let before = null;
   try { before = await readSnapshot(); } catch { /* Monitoring must not prevent a normal deposit. */ }
@@ -60,7 +81,7 @@ async function processDepositWithRecovery(options) {
   try { after = await readSnapshot(); } catch { reset(); return original(); }
   if (!after.eligible || after.key !== before.key) { reset(); return original(); }
   if (state.key !== after.key || after.now < state.last) {
-    reset(); Object.assign(state, { key: after.key, first: after.now, last: after.now, failures: 1 });
+    reset(); Object.assign(state, { key: after.key, first: after.now, last: after.now, failures: 1, proofVersion: 1 });
   } else if (after.now - state.last >= 60) {
     state.last = after.now; state.failures++;
   }
@@ -108,4 +129,4 @@ async function sendDepositRefund({ rpcPool, walletForProvider, vaultAddress }, u
   }, 'refundStaleDeposit');
 }
 
-module.exports = { markDepositSimulationError, processDepositWithRecovery, readRecoverySnapshot, sendDepositRefund };
+module.exports = { isConfirmedEvmRevert, markDepositSimulationError, processDepositWithRecovery, readRecoverySnapshot, sendDepositRefund };

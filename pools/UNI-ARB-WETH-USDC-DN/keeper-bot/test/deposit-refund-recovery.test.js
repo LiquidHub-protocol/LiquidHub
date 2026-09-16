@@ -6,7 +6,7 @@ const { markDepositSimulationError, processDepositWithRecovery, readRecoverySnap
 function fixture() {
   const state = {}, snapshot = { key: 'alice:1:100:0', user: 'alice', now: 22000, eligible: true };
   let mode = 'revert', sent = 0, attempted = 0;
-  const revert = () => markDepositSimulationError(Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION', action: 'call' }));
+  const revert = () => markDepositSimulationError(Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION', action: 'call', data: '0x12345678' }));
   const options = { state, readSnapshot: async () => ({ ...snapshot }),
     attempt: async () => { attempted++; if (mode === 'ok') return { success: true }; if (mode === 'rpc') throw new Error('RPC unavailable'); throw revert(); },
     simulate: async () => { if (mode === 'revert') throw revert(); },
@@ -132,4 +132,86 @@ test('persisted evidence survives restart; corrupt evidence starts a new observa
   f.snapshot.now += 600; assert.equal((await f.run()).refunded, true);
   const g = fixture(); Object.assign(g.state, { key: g.snapshot.key, first: 1, last: 2, failures: '99' });
   await g.run(); assert.equal(g.sent(), 0); assert.equal(g.state.failures, 1); assert.equal(g.state.first, g.snapshot.now);
+});
+
+
+function rpcFailure(rpcError, method = 'eth_call') {
+  const { JsonRpcProvider } = require('ethers');
+  const provider = new JsonRpcProvider('http://127.0.0.1:1', 42161, { staticNetwork: true });
+  try {
+    return provider.getRpcError({ jsonrpc: '2.0', id: 1, method, params: [{ to: '0x' + '11'.repeat(20), data: '0x12345678' }, 'latest'] }, { error: rpcError });
+  } finally { provider.destroy(); }
+}
+
+for (const rpcError of [
+  { code: -32603, message: 'internal error' },
+  { code: -32005, message: 'rate limit exceeded' },
+  { code: -32002, message: 'request timed out' },
+  { code: 429, message: 'too many requests' },
+  { code: -32603, message: 'internal error', data: '0x12345678' },
+]) test('ethers-wrapped RPC failure cannot accumulate refund evidence: ' + rpcError.message + '/' + (rpcError.data || 'empty'), async () => {
+  const f = fixture();
+  f.options.attempt = async () => { throw markDepositSimulationError(rpcFailure(rpcError)); };
+  f.options.simulate = f.options.attempt;
+  for (let n = 0; n < 4; n++) { f.snapshot.now += 600; await f.run(); }
+  assert.equal(f.sent(), 0); assert.deepEqual(f.state, {});
+  const stale = rpcFailure(rpcError); stale.depositSimulationReverted = true;
+  assert.equal(markDepositSimulationError(stale).depositSimulationReverted, undefined);
+});
+
+for (const rpcError of [
+  { code: 3, message: 'execution reverted', data: '0x12345678' },
+  { code: 3, message: 'execution reverted', data: '0x' },
+  { code: -32000, message: 'execution reverted' },
+  { code: -32000, message: 'VM Exception while processing transaction: revert', data: '0x' },
+  { code: 3, message: 'execution reverted: rate limit', data: '0x12345678' },
+]) test('confirmed EVM revert remains eligible, including empty revert: ' + rpcError.code + '/' + rpcError.message + '/' + rpcError.data, async () => {
+  const f = fixture();
+  f.options.attempt = async () => { throw markDepositSimulationError(rpcFailure(rpcError)); };
+  f.options.simulate = f.options.attempt;
+  await f.run(); f.snapshot.now += 60; await f.run(); f.snapshot.now += 540;
+  assert.equal((await f.run()).refunded, true); assert.equal(f.sent(), 1);
+  assert.equal(markDepositSimulationError(rpcFailure(rpcError, 'eth_estimateGas')).depositSimulationReverted, undefined);
+});
+
+test('a bare CALL_EXCEPTION and malformed revert data do not establish an EVM revert', () => {
+  for (const data of [undefined, null, '', '0x', '0x123', '0xzz', {}]) {
+    const error = { code: 'CALL_EXCEPTION', action: 'call', data, message: 'missing revert data' };
+    assert.equal(markDepositSimulationError(error).depositSimulationReverted, undefined);
+  }
+});
+
+test('final guard refuses an RPC error after genuine prior reverts', async () => {
+  const f = fixture(); await f.run(); f.snapshot.now += 60; await f.run(); f.snapshot.now += 540;
+  f.options.simulate = async () => { throw markDepositSimulationError(rpcFailure({ code: -32603, message: 'internal error' })); };
+  assert.ok((await f.run()).error); assert.equal(f.sent(), 0); assert.deepEqual(f.state, {});
+});
+
+test('old persisted counters without classified EVM evidence restart their observation period', async () => {
+  const f = fixture();
+  Object.assign(f.state, { key: f.snapshot.key, first: 1, last: 2, failures: 20 });
+  await f.run();
+  assert.equal(f.sent(), 0); assert.equal(f.state.failures, 1);
+  assert.equal(f.state.first, f.snapshot.now); assert.equal(f.state.proofVersion, 1);
+});
+
+
+test('keeper retries an ethers-wrapped infrastructure failure on its own next RPC', async () => {
+  const { RPCPool } = require('../src/utils/rpc');
+  for (const genuine of [false, true]) {
+    const error = rpcFailure(genuine ? { code: 3, message: 'execution reverted', data: '0x' }
+      : { code: -32603, message: 'internal error' });
+    const entries = [0, 1].map(id => ({ provider: { id }, chainVerified: true }));
+    let index = 0;
+    const rpc = Object.assign(Object.create(RPCPool.prototype), {
+      providers: entries, getProvider: () => entries[index].provider, withTimeout: fn => fn(),
+      markUnhealthy: (p, advance) => { assert.equal(p, entries[index].provider); assert.equal(advance, true); index++; },
+    });
+    const calls = [];
+    const execute = () => rpc.executeWithRetry(async p => {
+      calls.push(p.id); if (p.id === 0) throw error; return 'processable';
+    }, 2);
+    if (genuine) { await assert.rejects(execute(), e => e.code === 'CALL_EXCEPTION'); assert.deepEqual(calls, [0]); }
+    else { assert.equal(await execute(), 'processable'); assert.deepEqual(calls, [0, 1]); }
+  }
 });

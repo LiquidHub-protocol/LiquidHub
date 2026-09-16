@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { acquireSignerFileLock, assertSignerFileLock, isSignerLockOwnerAlive } = require('./signer-file-lock');
+const { isConfirmedEvmRevert } = require('./deposit-refund-recovery');
 
 const RPC_READ_TIMEOUT_MS = 20_000;
 const RPC_TX_TIMEOUT_MS = 90_000;
@@ -387,6 +388,7 @@ class RPCPool {
   }
 
   isProviderError(error) {
+    if (error?.code === 'CALL_EXCEPTION') return !isConfirmedEvmRevert(error);
     const msg = `${error?.shortMessage || ''} ${error?.message || ''}`.toLowerCase();
     const code = `${error?.code || ''}`.toUpperCase();
     if (
