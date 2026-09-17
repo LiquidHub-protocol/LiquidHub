@@ -15,15 +15,20 @@ It holds protocol commission revenue only: user deposit principal never passes t
 Main responsibilities:
 
 - hold frontend swap fees received through Velora `partnerAddress`
-- convert configured non-USDC fee tokens to the chain USDC through owner-only, oracle-bounded Velora Augustus calldata
+- convert configured non-USDC fee tokens to the chain USDC through oracle-bounded Velora Augustus calldata, callable by the owner and, in Phase 2, the existing rescue Safe
 - bridge USDC permissionlessly to the governed Phase 2 destination through Stargate
 - pay the existing permissionless Bridge Bounty when on-chain cooldown and minimum-ratio conditions are met
 
 Conversion and bridging are intentionally separate: a public keeper cannot choose the sale timing, token amount,
-route or slippage for Treasury-held non-USDC revenue. Safe governance in Phase 1, then Timelock governance in
-Phase 2, supplies fresh Velora calldata; the contract pins the Augustus target and independently enforces exact
-input spending, its oracle minimum and receipt of canonical USDC by the Treasury. Keepers can only bridge the
-available USDC to the destination fixed on-chain.
+route or slippage for Treasury-held non-USDC revenue. The owner can supply fresh Velora calldata in both phases;
+once Phase 2 disables admin withdrawals, the existing rescue Safe can also perform these conversions. Configuration
+remains owner-only. The contract pins the Augustus target and independently enforces exact input spending, its
+oracle minimum and receipt of canonical USDC by the Treasury. Keepers can only bridge the available USDC to the
+destination fixed on-chain.
+
+The rescue Safe cannot withdraw ETH or ERC20 tokens through the rescue functions while a conversion feed is
+configured for that asset. These assets must follow the conversion flow; USDC retains its separate withdrawal
+and distribution controls.
 
 The private Safe tooling that prepares these governance transactions explicitly requests a zero partner fee, so
 consolidating already-earned protocol revenue does not charge Liquid Hub's frontend commission a second time.

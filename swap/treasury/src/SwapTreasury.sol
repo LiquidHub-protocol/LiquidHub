@@ -159,14 +159,15 @@ contract SwapTreasury is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Convert one configured Velora commission token to canonical USDC.
-    /// @dev The owner supplies Augustus calldata built for this Treasury as payer and beneficiary.
+    /// @dev The owner, or the existing rescue Safe in Phase 2, supplies fresh Augustus calldata
+    ///      built for this Treasury as payer and beneficiary. Configuration stays owner-only.
     ///      Exact input spending and the oracle-bounded USDC balance delta are enforced on-chain.
     function swapToUSDC(address tokenIn, uint256 amountIn, uint256 minAmountOut, bytes calldata veloraCalldata)
         external
-        onlyOwner
         nonReentrant
         returns (uint256 amountOut)
     {
+        require(msg.sender == owner() || (!adminWithdrawEnabled && msg.sender == rescueSafe), "Unauthorized");
         amountOut = _swapToUSDC(tokenIn, amountIn, minAmountOut, veloraCalldata);
     }
 
@@ -237,13 +238,14 @@ contract SwapTreasury is Ownable2Step, ReentrancyGuard {
     function rescueToken(address tokenAddr, address to, uint256 amount) external onlyRescueSafe nonReentrant {
         require(to != address(0), "Invalid recipient");
         require(tokenAddr != address(usdc), "Use adminWithdraw for USDC");
-        require(address(swapFeeds[tokenAddr]) == address(0), "Use bridge flow");
+        require(address(swapFeeds[tokenAddr]) == address(0), "Use swap flow");
         IERC20(tokenAddr).safeTransfer(to, amount);
         emit TokenRescued(tokenAddr, to, amount);
     }
 
     function rescueETH(address payable to, uint256 amount) external onlyRescueSafe nonReentrant {
         require(to != address(0), "Invalid recipient");
+        require(address(swapFeeds[NATIVE_TOKEN]) == address(0), "Use swap flow");
         (bool ok,) = to.call{value: amount}("");
         require(ok, "ETH transfer failed");
         emit ETHRescued(to, amount);
