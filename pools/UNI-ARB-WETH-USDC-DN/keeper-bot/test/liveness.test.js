@@ -517,7 +517,6 @@ test('fee-cap bypass is restricted to the configured HF repair calldata', () => 
   const target = '0x00000000000000000000000000000000000000a1';
   pool.hfRepairTargetAddress = target.toLowerCase();
   pool.maxGasPriceWei = ethers.parseUnits('0.1', 'gwei');
-  pool.emergencyMaxGasPriceWei = ethers.parseUnits('2', 'gwei');
   const expensiveRepair = {
     to: target,
     data: '0x30cbb735',
@@ -527,10 +526,7 @@ test('fee-cap bypass is restricted to the configured HF repair calldata', () => 
   };
 
   assert.equal(pool._applyFeeCapPolicy(expensiveRepair, 'hfRepair', true), true);
-  assert.throws(
-    () => pool._applyFeeCapPolicy({ ...expensiveRepair, maxFeePerGas: ethers.parseUnits('3', 'gwei') }, 'hfRepair', true),
-    /emergency gas fee exceeds/
-  );
+  assert.equal(pool._applyFeeCapPolicy({ ...expensiveRepair, maxFeePerGas: ethers.parseUnits('30', 'gwei') }, 'hfRepair', true), true);
   assert.throws(
     () => pool._applyFeeCapPolicy({ ...expensiveRepair, data: '0x12345678' }, 'hfRepair', true),
     /restricted to configured repairHealthFactor/

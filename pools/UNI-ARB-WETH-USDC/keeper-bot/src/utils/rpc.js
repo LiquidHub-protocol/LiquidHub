@@ -95,8 +95,6 @@ class RPCPool {
       : null;
     this.signerAddress = this.signerWallet?.address.toLowerCase() || null;
     this.maxGasPriceWei = readPositiveGweiEnv('KEEPER_MAX_GAS_PRICE_GWEI');
-    this.emergencyMaxGasPriceWei = this.maxGasPriceWei ? this.maxGasPriceWei * 2n : null;
-    this.emergencyMaxGasLimit = 4_000_000n;
     const configuredHfRepairTarget = String(process.env.AAVE_HEDGE_MANAGER_ADDRESS || '').trim();
     if (configuredHfRepairTarget && !ethers.isAddress(configuredHfRepairTarget)) {
       throw new Error('AAVE_HEDGE_MANAGER_ADDRESS must be a valid address');
@@ -597,23 +595,14 @@ class RPCPool {
   }
 
   _assertEmergencyFeeCap(transaction, label) {
-    const emergencyMaxGasPriceWei = this.emergencyMaxGasPriceWei
-      || (this.maxGasPriceWei ? this.maxGasPriceWei * 2n : null);
-    const emergencyMaxGasLimit = this.emergencyMaxGasLimit || 4_000_000n;
-    if (!emergencyMaxGasPriceWei) {
-      throw new Error('KEEPER_MAX_GAS_PRICE_GWEI is required for the emergency fee ceiling');
-    }
+    // Only the exact configured repairHealthFactor() call reaches this path.
+    // An arbitrary local gas ceiling must not prevent a critical HF repair.
     const gasLimit = BigInt(transaction?.gasLimit || 0n);
-    if (gasLimit === 0n || gasLimit > emergencyMaxGasLimit) {
-      throw new Error(`${label}: emergency gasLimit ${gasLimit} exceeds ${emergencyMaxGasLimit}`);
-    }
+    if (gasLimit === 0n) throw new Error(`${label}: emergency gasLimit is missing`);
     const feeFields = [transaction?.gasPrice, transaction?.maxFeePerGas, transaction?.maxPriorityFeePerGas]
       .filter((value) => value !== null && value !== undefined);
-    if (feeFields.length === 0 || feeFields.some((value) => BigInt(value) > emergencyMaxGasPriceWei)) {
-      throw new Error(
-        `${label}: emergency gas fee exceeds ${ethers.formatUnits(emergencyMaxGasPriceWei, 'gwei')} gwei`
-      );
-    }
+    if (feeFields.length === 0 || feeFields.some((value) => BigInt(value) <= 0n))
+      throw new Error(`${label}: emergency gas fee is missing`);
   }
 
   _isConfiguredHfRepairTransaction(transaction) {
@@ -632,7 +621,7 @@ class RPCPool {
       throw new Error(`${label}: fee-cap exemption is restricted to configured repairHealthFactor()`);
     }
     this._assertEmergencyFeeCap(transaction, label);
-    console.warn(`${label}: critical HF_REPAIR uses a finite emergency gas ceiling`);
+    console.warn(`${label}: critical HF_REPAIR bypasses the ordinary gas ceiling`);
     return true;
   }
 
@@ -698,7 +687,7 @@ class RPCPool {
         throw new Error(`${pending.label}: invalid persisted HF_REPAIR fee-cap exemption`);
       }
       this._assertEmergencyFeeCap(request, `${pending.label} replacement`);
-      console.warn(`${pending.label} replacement: critical HF_REPAIR uses the emergency gas ceiling`);
+      console.warn(`${pending.label} replacement: critical HF_REPAIR bypasses the ordinary gas ceiling`);
     } else {
       this._assertFeeCap(request, `${pending.label} replacement`);
     }

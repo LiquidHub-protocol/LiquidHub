@@ -518,6 +518,7 @@ class Rebalancer {
     if (status !== 0 && status !== 2) throw new Error(`unexpected progressive DN rebalance state: ${status}`);
 
     let staleRetries = 0;
+    let hfRepairRetries = 0;
     while (!completedElsewhere) {
       if (this.beforeProgressiveStep) await this.beforeProgressiveStep();
       await this._maybeRefreshProgressiveTarget(txHashes);
@@ -571,6 +572,7 @@ class Rebalancer {
         } catch (error) {
           const text = this._errorText(error).toLowerCase();
           if (text.includes('hf repair') && this.beforeProgressiveStep) {
+            if (++hfRepairRetries > 2) throw error;
             await this.beforeProgressiveStep();
             refreshRequested = true;
             break;
@@ -597,6 +599,7 @@ class Rebalancer {
         throw new Error('unable to produce an executable progressive DN chunk');
       }
       staleRetries = 0;
+      hfRepairRetries = 0;
       receipts.push(receipt);
       txHashes.push(receipt.hash || receipt.transactionHash);
       swapsExecuted += 1;
