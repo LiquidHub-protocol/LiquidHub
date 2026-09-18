@@ -473,9 +473,9 @@ contract AaveHedgeManager is ReentrancyGuard {
     function _doRepayDebt(uint256 repayAmountWeth) private {
         if (repayAmountWeth == 0) revert HedgeCheck(27);
 
-        pool.repay(address(weth), repayAmountWeth, 2, address(this));
+        uint256 repaidWeth = pool.repay(address(weth), repayAmountWeth, 2, address(this));
 
-        emit RepayDebt(repayAmountWeth);
+        emit RepayDebt(repaidWeth);
     }
 
     // ===== ADJUST HEDGE (permissionless) =====
