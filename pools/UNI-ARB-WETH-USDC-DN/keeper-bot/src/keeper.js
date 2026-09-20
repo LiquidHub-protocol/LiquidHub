@@ -101,17 +101,34 @@ async function readLiveHfSafetyState(rpcPool, hedgeManager) {
 
 async function assertHfRepairTopology(rpcPool, hedgeManager) {
   const expectedHedgeManager = process.env.AAVE_HEDGE_MANAGER_ADDRESS;
+  const expectedVault = process.env.VAULT_ADDRESS;
+  const expectedRange = process.env.RANGEMANAGER_ADDRESS;
+  if (![expectedVault, expectedRange].every(ethers.isAddress)) throw new Error('HF safety topology: configured vault/range missing');
   const topology = await rpcPool.executeConsensusRead(async (provider) => {
     const hm = hedgeManager.connect(provider);
-    const [hedgeCode, poolAddress, triggerBps] = await Promise.all([
+    const [hedgeCode, poolAddress, triggerBps, vaultAddress, rangeAddress] = await Promise.all([
       provider.getCode(expectedHedgeManager),
       hm.pool(),
-      hm.hfRepairTriggerBps(),
+      hm.hfRepairTriggerBps(), hm.vault(), hm.rangeManager(),
     ]);
+    const vault = new ethers.Contract(vaultAddress, ["function hedgeManager() view returns (address)", "function rangeManager() view returns (address)"], provider);
+    const range = new ethers.Contract(rangeAddress, ["function vault() view returns (address)"], provider);
+    const [vaultHedge, vaultRange, rangeVault, vaultCode, rangeCode] = await Promise.all([
+      vault.hedgeManager(), vault.rangeManager(), range.vault(), provider.getCode(vaultAddress), provider.getCode(rangeAddress),
+    ]);
+    if (vaultAddress.toLowerCase() !== expectedVault.toLowerCase()
+      || rangeAddress.toLowerCase() !== expectedRange.toLowerCase()
+      || vaultCode === "0x" || rangeCode === "0x"
+      || vaultHedge.toLowerCase() !== expectedHedgeManager.toLowerCase()
+      || vaultRange.toLowerCase() !== rangeAddress.toLowerCase()
+      || rangeVault.toLowerCase() !== vaultAddress.toLowerCase()) {
+      throw new Error("HF safety topology: non-reciprocal hedge/vault/range bindings");
+    }
     const poolCode = await provider.getCode(poolAddress);
-    return { hedgeCode, poolCode, poolAddress, triggerBps };
+    return { hedgeCode, poolCode, poolAddress, triggerBps, vaultAddress, rangeAddress };
   }, (state) => [
     state.hedgeCode, state.poolCode, String(state.poolAddress).toLowerCase(), state.triggerBps,
+    String(state.vaultAddress).toLowerCase(), String(state.rangeAddress).toLowerCase(),
   ].map(String).join(':'), 'HF safety topology');
   if (topology.hedgeCode === '0x') throw new Error('HF safety topology: AaveHedgeManager has no runtime code');
   if (!ethers.isAddress(topology.poolAddress) || topology.poolCode === '0x') {
@@ -249,6 +266,12 @@ async function executeHedgeIfReady({
   hfRepairOnly = false,
 }) {
   const method = hfRepairOnly ? 'repairHealthFactor' : 'adjustHedge';
+  // An emergency decision comes from common-block HF consensus. A lone simulation
+  // cannot veto it; the contract still enforces oracle, slippage and HF postconditions.
+  if (hfRepairOnly) {
+    const safety = await readLiveHfSafetyState(rpcPool, hedgeManager);
+    if (!safety.repairRequired) return false;
+  } else {
   try {
     await rpcPool.executeWithRetry(async (provider) => {
       await hedgeManager.connect(provider)[method].staticCall();
@@ -264,6 +287,8 @@ async function executeHedgeIfReady({
       await trackAction(actionAlerts, 'failure', 'adjustHedge', error.reason || error.message);
     }
     return false;
+  }
+
   }
 
   if (beforeSend) await beforeSend();
@@ -311,11 +336,16 @@ async function executeHedgeIfReady({
   } catch (error) {
     let stillRequired = true;
     try {
-      await rpcPool.executeWithRetry(async (provider) => {
-        await hedgeManager.connect(provider)[method].staticCall();
-      });
+      if (hfRepairOnly) {
+        stillRequired = (await readLiveHfSafetyState(rpcPool, hedgeManager)).repairRequired;
+      } else {
+        await rpcPool.executeWithRetry(async provider => {
+          await hedgeManager.connect(provider)[method].staticCall();
+        });
+      }
     } catch (recheckError) {
-      stillRequired = classifyHedgeSimulationError(recheckError, rpcPool).kind !== 'no-action';
+      // Failure to re-read emergency HF must never be classified as no action.
+      stillRequired = hfRepairOnly || classifyHedgeSimulationError(recheckError, rpcPool).kind !== 'no-action';
     }
     if (stillRequired) {
       await trackAction(actionAlerts, 'failure', 'adjustHedge', error.reason || error.message);

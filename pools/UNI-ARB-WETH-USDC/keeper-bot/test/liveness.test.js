@@ -259,11 +259,13 @@ test('signed nonce and broadcast paths never consult a rejected wrong-chain endp
     { provider: correct, healthy: true, errorCount: 0, chainVerified: true, chainMismatch: false },
   ];
 
+  assert.equal(await pool._latestSignerNonce(), null, 'wrong-chain peers do not lower configured quorum');
+  pool.providers.push({ ...pool.providers[1], provider: { ...correct } });
   assert.equal(await pool._latestSignerNonce(), 7);
   const receipt = await withSignerContext(pool, () => pool._broadcastSignedTransaction('0x1234', '0xabcd', 'rebalance', 0, 1));
 
   assert.equal(receipt.status, 1);
-  assert.equal(correctBroadcasts, 1);
+  assert.equal(correctBroadcasts, 2);
   assert.equal(wrongChainCalls, 0);
 });
 
@@ -304,6 +306,7 @@ function configureSignerState(pool, { dir, wallet, poolName = 'POOL' }) {
 
 test('nonce reconciliation requires agreement and ignores one high outlier', async () => {
   const pool = Object.create(RPCPool.prototype);
+  pool.providers = [{}, {}, {}];
   pool.signerAddress = '0x0000000000000000000000000000000000000011';
   pool.withTimeout = async (fn) => await fn();
   pool._authenticatedProviderEntries = async () => [7, 7, 999].map((nonce) => ({
@@ -312,15 +315,16 @@ test('nonce reconciliation requires agreement and ignores one high outlier', asy
   assert.equal(await pool._latestSignerNonce(), 7);
 });
 
-test('nonce reconciliation uses one surviving RPC but rejects live disagreement', async () => {
+test('nonce reconciliation requires configured quorum despite an unavailable RPC', async () => {
   const pool = Object.create(RPCPool.prototype);
+  pool.providers = [{}, {}, {}];
   pool.signerAddress = '0x0000000000000000000000000000000000000011';
   pool.withTimeout = async (fn) => await fn();
   pool._authenticatedProviderEntries = async () => [
     { provider: { getTransactionCount: async () => 7 } },
     { provider: { getTransactionCount: async () => { throw new Error('offline'); } } },
   ];
-  assert.equal(await pool._latestSignerNonce(), 7);
+  assert.equal(await pool._latestSignerNonce(), null);
 
   pool._authenticatedProviderEntries = async () => [7, 8].map((nonce) => ({
     provider: { getTransactionCount: async () => nonce },
@@ -338,7 +342,10 @@ test('signing nonce keeps one-RPC liveness but rejects two live disagreements', 
     { provider: { getTransactionCount: async () => { throw new Error('offline'); } } },
   ];
   pool._authenticatedProviderEntries = async () => entries;
+  await assert.rejects(pool._signingNonce(), { code: 'RPC_SIGNING_NONCE_QUORUM_UNAVAILABLE' });
+  pool.providers = [{}];
   assert.equal(await pool._signingNonce(), 7);
+  pool.providers = [{}, {}];
 
   entries = [7, 8].map((nonce) => ({ provider: { getTransactionCount: async () => nonce } }));
   await assert.rejects(() => pool._signingNonce(), { code: 'RPC_SIGNING_NONCE_QUORUM_UNAVAILABLE' });
@@ -353,7 +360,10 @@ test('critical reads and receipts keep one-RPC liveness but reject live disagree
     { provider: { read: async () => { throw new Error('offline'); } } },
   ];
   pool._authenticatedProviderEntries = async () => entries;
-  assert.equal(await pool.executeConsensusRead((provider) => provider.read(), String, 'test read'), 'canonical');
+  await assert.rejects(pool.executeConsensusRead((provider) => provider.read(), String, 'test read'), { code: 'RPC_READ_QUORUM_UNAVAILABLE' });
+  pool.providers = [{}];
+  assert.equal(await pool.executeConsensusRead((provider) => provider.read(), String, 'single configured read'), 'canonical');
+  pool.providers = [{}, {}];
 
   entries = ['canonical', 'forked'].map((value) => ({ provider: { read: async () => value } }));
   await assert.rejects(
@@ -367,7 +377,11 @@ test('critical reads and receipts keep one-RPC liveness but reject live disagree
     { provider: { getTransactionReceipt: async () => survivingReceipt } },
     { provider: { getTransactionReceipt: async () => { throw new Error('offline'); } } },
   ];
-  assert.deepEqual(await pool._readReceiptQuorum(entries, txHash, 'test receipt'), survivingReceipt);
+  assert.equal(await pool._readReceiptQuorum(entries, txHash, 'test receipt'), null);
+  pool.providers = [{}];
+  assert.deepEqual(await pool._readReceiptQuorum(entries.slice(0, 1), txHash, 'single configured RPC'), survivingReceipt);
+  pool.providers = [{}, {}];
+  assert.deepEqual(await pool._readReceiptQuorum([entries[0], entries[0]], txHash, 'two matching RPCs'), survivingReceipt);
 
   const conflictingBlockHash = `0x${'cd'.repeat(32)}`;
   entries[1] = {
@@ -1003,3 +1017,22 @@ for (const rejection of [null, 'minOut<floor', 'E24']) {
     }
   });
 }
+
+
+test('RPC error text cannot erase the journal; a corroborated mined revert can', async () => {
+  const pool=Object.create(RPCPool.prototype);let cleared=0;
+  pool.providers=[];
+  pool._readPendingSignedTx=()=>({nonce:0,txHash:'0x1234',rawTx:'0x00',label:'fixture'});
+  pool._authenticatedProviderEntries=async()=>[];
+  pool._readReceiptQuorum=async()=>null;
+  pool._latestSignerNonce=async()=>0;
+  pool._clearPersistedSignedTx=()=>{cleared++;};
+  pool._broadcastSignedTransaction=async()=>{throw Error('untrusted RPC: failed on-chain');};
+  await assert.rejects(pool._reconcilePendingSignedTxLocked(),/failed on-chain/);
+  assert.equal(cleared,0);
+  let reads=0;
+  pool._readReceiptQuorum=async()=>++reads===1?null:{status:0};
+  pool._broadcastSignedTransaction=RPCPool.prototype._broadcastSignedTransaction;
+  const result=await pool._reconcilePendingSignedTxLocked();
+  assert.equal(result.status,'failed');assert.equal(cleared,1);
+});

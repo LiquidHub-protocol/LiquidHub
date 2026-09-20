@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 
 const { ethers } = require('ethers');
+
+// Only a locally corroborated receipt can classify a transaction as mined.
+// RPC-controlled error text must never authorize removal of the recovery journal.
+class ConfirmedTransactionRevert extends Error {}
+
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -485,9 +490,8 @@ class RPCPool {
       }
     }));
     const successfulObservations = observations.filter(Boolean);
-    // Preserve the supported one-RPC mode when every other independently configured
-    // endpoint is unavailable, while still rejecting any live disagreement.
-    const quorum = successfulObservations.length === 1 ? 1 : 2;
+    // A configured multi-provider deployment never degrades to one source.
+    const quorum = this._receiptQuorumSize();
     const groups = new Map();
     for (const observation of successfulObservations) {
       const group = groups.get(observation.key) || { count: 0, value: observation.value };
@@ -511,18 +515,16 @@ class RPCPool {
       ).catch(() => null);
       if (nonce !== null) counts.set(nonce, (counts.get(nonce) || 0) + 1);
     }
-    const successfulResponses = [...counts.values()].reduce((total, count) => total + count, 0);
-    // One surviving authenticated RPC is no weaker than the keeper's supported single-RPC mode.
-    // As soon as two or more answer, agreement remains mandatory and divergent nonces fail closed.
-    const quorum = successfulResponses === 1 ? 1 : 2;
+    const quorum = this._receiptQuorumSize();
     const confirmed = [...counts.entries()]
       .filter(([, count]) => count >= quorum)
       .map(([nonce]) => nonce);
     return confirmed.length > 0 ? Math.max(...confirmed) : null;
   }
 
-  _receiptQuorumSize(validReceiptCount) {
-    return validReceiptCount === 1 ? 1 : 2;
+  _receiptQuorumSize() {
+    // Silence is not confirmation. Only an explicitly single-provider keeper uses quorum one.
+    return this.providers.length === 1 ? 1 : 2;
   }
 
   async _readReceiptQuorum(entries, txHash, label) {
@@ -532,21 +534,19 @@ class RPCPool {
       `${label} receipt quorum`
     ).catch(() => null)));
     const groups = new Map();
-    let validReceiptCount = 0;
     for (const receipt of receipts) {
       if (!receipt) continue;
       const hash = String(receipt.hash || receipt.transactionHash || '').toLowerCase();
       const blockHash = String(receipt.blockHash || '').toLowerCase();
       const blockNumber = Number(receipt.blockNumber);
       if (hash !== String(txHash).toLowerCase() || !Number.isSafeInteger(blockNumber)) continue;
-      if (!/^0x[0-9a-f]{64}$/.test(blockHash)) continue;
-      validReceiptCount++;
+      if (!/^0x[0-9a-f]{64}$/.test(blockHash) || blockNumber < 0 || ![0, 1].includes(receipt.status)) continue;
       const key = `${hash}:${blockHash}:${blockNumber}:${Number(receipt.status)}`;
       const group = groups.get(key) || { count: 0, receipt };
       group.count++;
       groups.set(key, group);
     }
-    const quorum = this._receiptQuorumSize(validReceiptCount);
+    const quorum = this._receiptQuorumSize();
     const confirmed = [...groups.values()].filter((group) => group.count >= quorum);
     return confirmed.length === 1 ? confirmed[0].receipt : null;
   }
@@ -565,10 +565,7 @@ class RPCPool {
         counts.set(value, (counts.get(value) || 0) + 1);
       }
     }
-    const successfulResponses = [...counts.values()].reduce((total, count) => total + count, 0);
-    // One surviving authenticated RPC is equivalent to the explicitly supported
-    // single-RPC deployment. Two live but divergent RPCs still fail closed.
-    const quorum = successfulResponses === 1 ? 1 : 2;
+    const quorum = this._receiptQuorumSize();
     const confirmed = [...counts.entries()].filter(([, count]) => count >= quorum).map(([nonce]) => nonce);
     if (confirmed.length !== 1) {
       const error = new Error(`Keeper signing nonce quorum ${quorum}/${this.providers.length} unavailable`);
@@ -745,7 +742,7 @@ class RPCPool {
       this._clearPersistedSignedTx(pending.txHash);
       return { status: 'confirmed', receipt, ...pending };
     } catch (error) {
-      if (String(error.message || '').includes('failed on-chain')) {
+      if (error instanceof ConfirmedTransactionRevert) {
         this._clearPersistedSignedTx(pending.txHash);
         return { status: 'failed', receipt: null, error: safeErrorMessage(error), ...pending };
       }
@@ -826,7 +823,7 @@ class RPCPool {
       this._clearPersistedSignedTx(replacementHash);
       return receipt;
     } catch (error) {
-      if (String(error.message || '').includes('failed on-chain')) {
+      if (error instanceof ConfirmedTransactionRevert) {
         this._clearPersistedSignedTx(replacementHash);
       }
       throw error;
@@ -928,7 +925,7 @@ class RPCPool {
         this._clearPersistedSignedTx(txHash);
         return receipt;
       } catch (error) {
-        if (String(error.message || '').includes('failed on-chain')) {
+        if (error instanceof ConfirmedTransactionRevert) {
           this._clearPersistedSignedTx(txHash);
         }
         throw error;
@@ -950,7 +947,7 @@ class RPCPool {
 
     const existing = await this._readReceiptQuorum(entries, txHash, `${label} pre-broadcast`);
     if (existing) {
-      if (existing.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+      if (existing.status !== 1) throw new ConfirmedTransactionRevert(`${label} failed on-chain: ${txHash}`);
       return existing;
     }
 
@@ -976,7 +973,7 @@ class RPCPool {
     for (let round = 0; round < rounds; round++) {
       const receipt = await this._readReceiptQuorum(entries, txHash, `${label} reconciliation`);
       if (receipt) {
-        if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+        if (receipt.status !== 1) throw new ConfirmedTransactionRevert(`${label} failed on-chain: ${txHash}`);
         return receipt;
       }
       if (round + 1 < rounds) await new Promise((resolve) => setTimeout(resolve, 10_000));

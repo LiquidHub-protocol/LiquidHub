@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: MIT
 
 const { ethers } = require('ethers');
+
+// Only a locally corroborated receipt can classify a transaction as mined.
+// RPC-controlled error text must never authorize removal of the recovery journal.
+class ConfirmedTransactionRevert extends Error {}
+
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { acquireSignerFileLock, assertSignerFileLock, isSignerLockOwnerAlive } = require('./signer-file-lock');
 const { isConfirmedEvmRevert } = require('./deposit-refund-recovery');
 const { readSnapshotConsensus } = require('./rpc-snapshot-consensus');
+const { readFeeConsensus, readFeeDataConsensus } = require('./rpc-fee-consensus');
 
 const RPC_READ_TIMEOUT_MS = 20_000;
 const RPC_TX_TIMEOUT_MS = 90_000;
@@ -444,7 +450,7 @@ class RPCPool {
     }
   }
 
-  async executeWithRetry(fn, maxRetries = 3, timeoutMs = RPC_READ_TIMEOUT_MS) {
+  async executeWithRetry(fn, maxRetries = 3, timeoutMs = RPC_READ_TIMEOUT_MS, retryReverts = false) {
     let lastError;
     const attempts = Math.max(maxRetries, this.providers.length);
     for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -460,7 +466,7 @@ class RPCPool {
           console.error(`Keeper RPC excluded: ${safeErrorMessage(error)}`);
           continue;
         }
-        if (!this.isProviderError(error)) throw sanitizeRpcError(error);
+        if (!retryReverts && !this.isProviderError(error)) throw sanitizeRpcError(error);
         this.markUnhealthy(provider, true);
         console.warn(`RPC attempt ${attempt}/${attempts} failed: ${safeErrorMessage(error)}`);
       }
@@ -486,9 +492,8 @@ class RPCPool {
       }
     }));
     const successfulObservations = observations.filter(Boolean);
-    // Preserve the supported one-RPC mode when every other independently configured
-    // endpoint is unavailable, while still rejecting any live disagreement.
-    const quorum = successfulObservations.length === 1 ? 1 : 2;
+    // A configured multi-provider deployment never degrades to one source.
+    const quorum = this._receiptQuorumSize();
     const groups = new Map();
     for (const observation of successfulObservations) {
       const group = groups.get(observation.key) || { count: 0, value: observation.value };
@@ -507,7 +512,7 @@ class RPCPool {
       read: fn,
       keyOf,
       withTimeout: (read) => this.withTimeout(read, RPC_READ_TIMEOUT_MS, label),
-      allowSingle: true,
+      allowSingle: this.providers.length === 1,
       label,
       errorCode: 'RPC_READ_QUORUM_UNAVAILABLE',
     });
@@ -524,18 +529,16 @@ class RPCPool {
       ).catch(() => null);
       if (nonce !== null) counts.set(nonce, (counts.get(nonce) || 0) + 1);
     }
-    const successfulResponses = [...counts.values()].reduce((total, count) => total + count, 0);
-    // One surviving authenticated RPC is no weaker than the keeper's supported single-RPC mode.
-    // As soon as two or more answer, agreement remains mandatory and divergent nonces fail closed.
-    const quorum = successfulResponses === 1 ? 1 : 2;
+    const quorum = this._receiptQuorumSize();
     const confirmed = [...counts.entries()]
       .filter(([, count]) => count >= quorum)
       .map(([nonce]) => nonce);
     return confirmed.length > 0 ? Math.max(...confirmed) : null;
   }
 
-  _receiptQuorumSize(validReceiptCount) {
-    return validReceiptCount === 1 ? 1 : 2;
+  _receiptQuorumSize() {
+    // Silence is not confirmation. Only an explicitly single-provider keeper uses quorum one.
+    return this.providers.length === 1 ? 1 : 2;
   }
 
   async _readReceiptQuorum(entries, txHash, label) {
@@ -545,21 +548,19 @@ class RPCPool {
       `${label} receipt quorum`
     ).catch(() => null)));
     const groups = new Map();
-    let validReceiptCount = 0;
     for (const receipt of receipts) {
       if (!receipt) continue;
       const hash = String(receipt.hash || receipt.transactionHash || '').toLowerCase();
       const blockHash = String(receipt.blockHash || '').toLowerCase();
       const blockNumber = Number(receipt.blockNumber);
       if (hash !== String(txHash).toLowerCase() || !Number.isSafeInteger(blockNumber)) continue;
-      if (!/^0x[0-9a-f]{64}$/.test(blockHash)) continue;
-      validReceiptCount++;
+      if (!/^0x[0-9a-f]{64}$/.test(blockHash) || blockNumber < 0 || ![0, 1].includes(receipt.status)) continue;
       const key = `${hash}:${blockHash}:${blockNumber}:${Number(receipt.status)}`;
       const group = groups.get(key) || { count: 0, receipt };
       group.count++;
       groups.set(key, group);
     }
-    const quorum = this._receiptQuorumSize(validReceiptCount);
+    const quorum = this._receiptQuorumSize();
     const confirmed = [...groups.values()].filter((group) => group.count >= quorum);
     return confirmed.length === 1 ? confirmed[0].receipt : null;
   }
@@ -578,10 +579,7 @@ class RPCPool {
         counts.set(value, (counts.get(value) || 0) + 1);
       }
     }
-    const successfulResponses = [...counts.values()].reduce((total, count) => total + count, 0);
-    // One surviving authenticated RPC is equivalent to the explicitly supported
-    // single-RPC deployment. Two live but divergent RPCs still fail closed.
-    const quorum = successfulResponses === 1 ? 1 : 2;
+    const quorum = this._receiptQuorumSize();
     const confirmed = [...counts.entries()].filter(([, count]) => count >= quorum).map(([nonce]) => nonce);
     if (confirmed.length !== 1) {
       const error = new Error(`Keeper signing nonce quorum ${quorum}/${this.providers.length} unavailable`);
@@ -607,15 +605,22 @@ class RPCPool {
     }
   }
 
+  async _corroboratedFeeData(entries) {
+    return readFeeDataConsensus(entries.map(entry => entry.provider), provider =>
+      this.withTimeout(() => provider.getFeeData(), RPC_READ_TIMEOUT_MS, 'HF fee quorum'), this._receiptQuorumSize());
+  }
+
   _assertEmergencyFeeCap(transaction, label) {
     // Only the exact configured repairHealthFactor() call reaches this path.
     // An arbitrary local gas ceiling must not prevent a critical HF repair.
     const gasLimit = BigInt(transaction?.gasLimit || 0n);
     if (gasLimit === 0n) throw new Error(`${label}: emergency gasLimit is missing`);
-    const feeFields = [transaction?.gasPrice, transaction?.maxFeePerGas, transaction?.maxPriorityFeePerGas]
+    const feeFields = [transaction?.gasPrice, transaction?.maxFeePerGas]
       .filter((value) => value !== null && value !== undefined);
     if (feeFields.length === 0 || feeFields.some((value) => BigInt(value) <= 0n))
       throw new Error(`${label}: emergency gas fee is missing`);
+    if (transaction?.maxPriorityFeePerGas != null && BigInt(transaction.maxPriorityFeePerGas) < 0n)
+      throw new Error(`${label}: invalid priority fee`);
   }
 
   _isConfiguredHfRepairTransaction(transaction) {
@@ -652,8 +657,9 @@ class RPCPool {
     if (!this.signerWallet) throw new Error('KEEPER_PRIVATE_KEY is required to replace a pending transaction');
     const previous = ethers.Transaction.from(pending.rawTx);
     const entries = await this._authenticatedProviderEntries();
-    let feeData = null;
+    let feeData = pending.feeCapExempt === true ? await this._corroboratedFeeData(entries) : null;
     for (const entry of entries) {
+      if (feeData) break;
       feeData = await this.withTimeout(
         () => entry.provider.getFeeData(), RPC_READ_TIMEOUT_MS, 'keeper replacement fee data'
       ).catch(() => null);
@@ -758,7 +764,7 @@ class RPCPool {
       this._clearPersistedSignedTx(pending.txHash);
       return { status: 'confirmed', receipt, ...pending };
     } catch (error) {
-      if (String(error.message || '').includes('failed on-chain')) {
+      if (error instanceof ConfirmedTransactionRevert) {
         this._clearPersistedSignedTx(pending.txHash);
         return { status: 'failed', receipt: null, error: safeErrorMessage(error), ...pending };
       }
@@ -839,7 +845,7 @@ class RPCPool {
       this._clearPersistedSignedTx(replacementHash);
       return receipt;
     } catch (error) {
-      if (String(error.message || '').includes('failed on-chain')) {
+      if (error instanceof ConfirmedTransactionRevert) {
         this._clearPersistedSignedTx(replacementHash);
       }
       throw error;
@@ -873,11 +879,27 @@ class RPCPool {
         if (!prepared?.wallet || !prepared?.request) {
           throw new Error(`${label}: prepareFn must return { wallet, request }`);
         }
-        const populated = await prepared.wallet.populateTransaction({ ...prepared.request, nonce: signingNonce });
+        let request = { ...prepared.request, nonce: signingNonce };
+        if (bypassFeeCap === true) {
+          if (!this._isConfiguredHfRepairTransaction(request)) throw new Error('Invalid HF repair target');
+          const entries = await this._authenticatedProviderEntries();
+          const fee = await this._corroboratedFeeData(entries);
+          const gas = await readFeeConsensus(entries.map(entry => entry.provider), provider =>
+            this.withTimeout(() => provider.estimateGas({
+              to: request.to, data: request.data, value: request.value || 0n, from: this.signerAddress,
+            }), RPC_READ_TIMEOUT_MS, 'HF gas estimate quorum'), this._receiptQuorumSize());
+          delete request.gasPrice;
+          delete request.maxFeePerGas;
+          delete request.maxPriorityFeePerGas;
+          request = { ...request, gasLimit: gas * 120n / 100n, ...(fee.maxFeePerGas != null
+            ? { type: 2, maxFeePerGas: fee.maxFeePerGas, maxPriorityFeePerGas: fee.maxPriorityFeePerGas }
+            : { type: 0, gasPrice: fee.gasPrice }) };
+        }
+        const populated = await prepared.wallet.populateTransaction(request);
         populated.nonce = signingNonce;
         const feeCapExempt = this._applyFeeCapPolicy(populated, label, bypassFeeCap === true);
         return { provider: currentProvider, prepared, populated, feeCapExempt };
-        }, maxRetries, RPC_TX_TIMEOUT_MS);
+        }, maxRetries, RPC_TX_TIMEOUT_MS, bypassFeeCap === true);
       };
 
       let preparedBundle = null;
@@ -943,7 +965,7 @@ class RPCPool {
         this._clearPersistedSignedTx(txHash);
         return receipt;
       } catch (error) {
-        if (String(error.message || '').includes('failed on-chain')) {
+        if (error instanceof ConfirmedTransactionRevert) {
           this._clearPersistedSignedTx(txHash);
         }
         throw error;
@@ -965,7 +987,7 @@ class RPCPool {
 
     const existing = await this._readReceiptQuorum(entries, txHash, `${label} pre-broadcast`);
     if (existing) {
-      if (existing.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+      if (existing.status !== 1) throw new ConfirmedTransactionRevert(`${label} failed on-chain: ${txHash}`);
       return existing;
     }
 
@@ -991,7 +1013,7 @@ class RPCPool {
     for (let round = 0; round < rounds; round++) {
       const receipt = await this._readReceiptQuorum(entries, txHash, `${label} reconciliation`);
       if (receipt) {
-        if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+        if (receipt.status !== 1) throw new ConfirmedTransactionRevert(`${label} failed on-chain: ${txHash}`);
         return receipt;
       }
       if (round + 1 < rounds) await new Promise((resolve) => setTimeout(resolve, 10_000));

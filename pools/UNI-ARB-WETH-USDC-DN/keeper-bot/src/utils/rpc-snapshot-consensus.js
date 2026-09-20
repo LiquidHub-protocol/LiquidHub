@@ -4,7 +4,7 @@
 // timeouts and chain authentication are retained; this helper never sends a tx.
 async function readSnapshotConsensus({
     entries, read, keyOf, withTimeout, authenticate = async () => {},
-    allowSingle = false, label, errorCode,
+    allowSingle = false, label, errorCode, reduceValues, headLag = 1,
 }) {
     if (typeof keyOf !== 'function') throw new Error(`${label}: consensus key function is required`);
     // JsonRpcProvider.getBlock briefly caches identical requests. Header reads must
@@ -31,12 +31,12 @@ async function readSnapshotConsensus({
             });
         } catch { return null; }
     }))).filter(Boolean).sort((a, b) => b.number - a.number);
-    const headQuorum = allowSingle && heads.length === 1 ? 1 : 2;
+    const headQuorum = allowSingle && entries.length === 1 ? 1 : 2;
     if (heads.length >= headQuorum) {
-        // Start just behind the quorum head. A single outlier cannot pick a far
+        // Start at/just behind the quorum head. A single outlier cannot pick a far
         // future/old block. One bounded fallback tolerates a more delayed source.
         const heights = new Set([
-            Math.max(0, heads[headQuorum - 1].number - 1),
+            Math.max(0, heads[headQuorum - 1].number - headLag),
             heads[heads.length - 1].number,
         ]);
         for (const blockTag of heights) {
@@ -54,12 +54,14 @@ async function readSnapshotConsensus({
                     });
                 } catch { return null; }
             }))).filter(Boolean);
-            const quorum = allowSingle && observations.length === 1 ? 1 : 2;
+            const quorum = headQuorum;
             const groups = new Map();
             for (const observation of observations) {
                 const count = (groups.get(observation.key) || 0) + 1;
                 groups.set(observation.key, count);
-                if (count >= quorum) return observation.value;
+                if (count >= quorum) return reduceValues
+                    ? reduceValues(observations.filter(item => item.key === observation.key).map(item => item.value))
+                    : observation.value;
             }
         }
     }

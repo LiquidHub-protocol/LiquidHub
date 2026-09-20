@@ -193,7 +193,9 @@ test('HF safety lane runs before ordinary topology and derives the Aave pool on-
     source.indexOf('async function assertHfRepairTopology'),
     source.indexOf('/**', source.indexOf('async function assertHfRepairTopology'))
   );
-  assert.doesNotMatch(safetyTopology, /VAULT_ADDRESS|RANGEMANAGER_ADDRESS|strategyEngine/);
+  assert.match(safetyTopology, /VAULT_ADDRESS/);
+  assert.match(safetyTopology, /RANGEMANAGER_ADDRESS/);
+  assert.doesNotMatch(safetyTopology, /strategyEngine/);
 });
 
 function keeperHfFixture(startingHfBps) {
@@ -235,7 +237,7 @@ function keeperHfFixture(startingHfBps) {
     pool: async () => '0x2222222222222222222222222222222222222222',
     hfRepairTriggerBps: async () => 14000n,
     repairHealthFactor: {
-      staticCall: async () => { state.repairSimulations++; },
+      staticCall: async () => { state.repairSimulations++; throw { revert: { name: 'HedgeCheck', args: [42] } }; },
       populateTransaction: async () => ({ to: 'hedge-manager', data: 'repairHealthFactor' }),
     },
     adjustHedge: { staticCall: async () => {
@@ -269,7 +271,7 @@ for (const startingHfBps of [13900n, 12500n, 11500n, 10500n]) {
   test(`keeper HF ${Number(startingHfBps) / 10000}: repair failure and partial recovery keep automatic repair eligible`, async () => {
     const { state, incidents, run } = keeperHfFixture(startingHfBps);
     await assert.rejects(run(), /HF remains below the on-chain repair trigger/);
-    assert.equal(state.repairSimulations, 2, 'a failed repair is rechecked with its own selector');
+    assert.equal(state.repairSimulations, 0, 'a lone simulation cannot veto emergency repair');
     assert.equal(state.ordinarySimulations, 0, 'ordinary hedge eligibility cannot clear a failed HF repair');
     assert.equal(incidents.at(-1).kind, 'failure');
     await assert.rejects(run(), /HF remains below the on-chain repair trigger/);
@@ -358,11 +360,13 @@ test('signed nonce and broadcast paths never consult a rejected wrong-chain endp
     { provider: correct, healthy: true, errorCount: 0, chainVerified: true, chainMismatch: false },
   ];
 
+  assert.equal(await pool._latestSignerNonce(), null, 'wrong-chain peers do not lower configured quorum');
+  pool.providers.push({ ...pool.providers[1], provider: { ...correct } });
   assert.equal(await pool._latestSignerNonce(), 7);
   const receipt = await withSignerContext(pool, () => pool._broadcastSignedTransaction('0x1234', '0xabcd', 'rebalance', 0, 1));
 
   assert.equal(receipt.status, 1);
-  assert.equal(correctBroadcasts, 1);
+  assert.equal(correctBroadcasts, 2);
   assert.equal(wrongChainCalls, 0);
 });
 
@@ -403,6 +407,7 @@ function configureSignerState(pool, { dir, wallet, poolName = 'POOL' }) {
 
 test('nonce reconciliation requires agreement and ignores one high outlier', async () => {
   const pool = Object.create(RPCPool.prototype);
+  pool.providers = [{}, {}, {}];
   pool.signerAddress = '0x0000000000000000000000000000000000000011';
   pool.withTimeout = async (fn) => await fn();
   pool._authenticatedProviderEntries = async () => [7, 7, 999].map((nonce) => ({
@@ -411,15 +416,16 @@ test('nonce reconciliation requires agreement and ignores one high outlier', asy
   assert.equal(await pool._latestSignerNonce(), 7);
 });
 
-test('nonce reconciliation uses one surviving RPC but rejects live disagreement', async () => {
+test('nonce reconciliation requires configured quorum despite an unavailable RPC', async () => {
   const pool = Object.create(RPCPool.prototype);
+  pool.providers = [{}, {}, {}];
   pool.signerAddress = '0x0000000000000000000000000000000000000011';
   pool.withTimeout = async (fn) => await fn();
   pool._authenticatedProviderEntries = async () => [
     { provider: { getTransactionCount: async () => 7 } },
     { provider: { getTransactionCount: async () => { throw new Error('offline'); } } },
   ];
-  assert.equal(await pool._latestSignerNonce(), 7);
+  assert.equal(await pool._latestSignerNonce(), null);
 
   pool._authenticatedProviderEntries = async () => [7, 8].map((nonce) => ({
     provider: { getTransactionCount: async () => nonce },
@@ -437,7 +443,10 @@ test('signing nonce keeps one-RPC liveness but rejects two live disagreements', 
     { provider: { getTransactionCount: async () => { throw new Error('offline'); } } },
   ];
   pool._authenticatedProviderEntries = async () => entries;
+  await assert.rejects(pool._signingNonce(), { code: 'RPC_SIGNING_NONCE_QUORUM_UNAVAILABLE' });
+  pool.providers = [{}];
   assert.equal(await pool._signingNonce(), 7);
+  pool.providers = [{}, {}];
 
   entries = [7, 8].map((nonce) => ({ provider: { getTransactionCount: async () => nonce } }));
   await assert.rejects(() => pool._signingNonce(), { code: 'RPC_SIGNING_NONCE_QUORUM_UNAVAILABLE' });
@@ -452,7 +461,10 @@ test('critical reads and receipts keep one-RPC liveness but reject live disagree
     { provider: { read: async () => { throw new Error('offline'); } } },
   ];
   pool._authenticatedProviderEntries = async () => entries;
-  assert.equal(await pool.executeConsensusRead((provider) => provider.read(), String, 'test read'), 'canonical');
+  await assert.rejects(pool.executeConsensusRead((provider) => provider.read(), String, 'test read'), { code: 'RPC_READ_QUORUM_UNAVAILABLE' });
+  pool.providers = [{}];
+  assert.equal(await pool.executeConsensusRead((provider) => provider.read(), String, 'single configured read'), 'canonical');
+  pool.providers = [{}, {}];
 
   entries = ['canonical', 'forked'].map((value) => ({ provider: { read: async () => value } }));
   await assert.rejects(
@@ -466,7 +478,11 @@ test('critical reads and receipts keep one-RPC liveness but reject live disagree
     { provider: { getTransactionReceipt: async () => survivingReceipt } },
     { provider: { getTransactionReceipt: async () => { throw new Error('offline'); } } },
   ];
-  assert.deepEqual(await pool._readReceiptQuorum(entries, txHash, 'test receipt'), survivingReceipt);
+  assert.equal(await pool._readReceiptQuorum(entries, txHash, 'test receipt'), null);
+  pool.providers = [{}];
+  assert.deepEqual(await pool._readReceiptQuorum(entries.slice(0, 1), txHash, 'single configured RPC'), survivingReceipt);
+  pool.providers = [{}, {}];
+  assert.deepEqual(await pool._readReceiptQuorum([entries[0], entries[0]], txHash, 'two matching RPCs'), survivingReceipt);
 
   const conflictingBlockHash = `0x${'cd'.repeat(32)}`;
   entries[1] = {
@@ -635,6 +651,8 @@ for (const [name, nonce, pendingNonces] of [
   const entries = pendingNonces.map(pendingNonce => ({
     healthy: true, chainVerified: true, chainMismatch: false,
     provider: {
+      getFeeData: async () => ({ gasPrice: 100n }),
+      estimateGas: async () => 100000n,
       getTransactionCount: async (_signer, tag) => {
         nonceReads.push(tag);
         if (pendingNonce === null) throw new Error('RPC offline');
@@ -1264,4 +1282,58 @@ test('router fill errors trigger one action-coupled refresh and plan recompute',
   assert.equal(rebalancer._shouldRefreshForPlanError(new Error('SwapChunkAboveCap()')), true);
   const contractsSource = fsSync.readFileSync(path.join(__dirname, '../src/utils/contracts.js'), 'utf8');
   assert.match(contractsSource, /error SwapChunkAboveCap\(\)/);
+});
+
+test('emergency transaction preparation retries a forged EVM revert on the next RPC', async () => {
+  const pool=Object.create(RPCPool.prototype);
+  const bad={},good={};let index=0;
+  pool.providers=[{provider:bad,chainVerified:true},{provider:good,chainVerified:true}];
+  pool.getProvider=()=>pool.providers[index].provider;
+  pool.markUnhealthy=()=>{index=1;};
+  pool.withTimeout=async fn=>fn();
+  const prepare=async provider=>{if(provider===bad)throw Object.assign(Error('execution reverted'),{code:'CALL_EXCEPTION',action:'estimateGas',data:'0x12345678'});return 'prepared';};
+  assert.equal(await pool.executeWithRetry(prepare,2,100,true),'prepared');
+  index=0;
+  await assert.rejects(pool.executeWithRetry(prepare,2,100),/execution reverted/);
+});
+
+test('HF topology binds reciprocal contracts to the configured deployment', async () => {
+  const source=fsSync.readFileSync(path.join(__dirname,'../src/keeper.js'),'utf8');
+  const start=source.indexOf('async function assertHfRepairTopology(');
+  const code=source.slice(start,source.indexOf('/**',start));
+  const addr=n=>`0x${String(n).padStart(40,'0')}`;
+  let wrong=false;
+  const mockEthers={...ethers,Contract:class {
+    constructor(target){this.target=target;}
+    async hedgeManager(){return wrong?addr(99):addr(1);}
+    async rangeManager(){return addr(3);}
+    async vault(){return addr(2);}
+  }};
+  const check=new Function('ethers','process',`${code};return assertHfRepairTopology;`)(mockEthers,{env:{AAVE_HEDGE_MANAGER_ADDRESS:addr(1),VAULT_ADDRESS:addr(2),RANGEMANAGER_ADDRESS:addr(3)}});
+  const provider={getCode:async()=> '0x6001'};
+  const hm={connect(){return this;},pool:async()=>addr(4),hfRepairTriggerBps:async()=>14000n,vault:async()=>addr(2),rangeManager:async()=>addr(3)};
+  const rpc={executeConsensusRead:async fn=>fn(provider)};
+  await check(rpc,hm);
+  const wrongPool={...hm,vault:async()=>addr(88)};
+  await assert.rejects(check(rpc,wrongPool),/non-reciprocal/);
+  wrong=true;await assert.rejects(check(rpc,hm),/non-reciprocal/);
+});
+
+
+test('RPC error text cannot erase the journal; a corroborated mined revert can', async () => {
+  const pool=Object.create(RPCPool.prototype);let cleared=0;
+  pool.providers=[];
+  pool._readPendingSignedTx=()=>({nonce:0,txHash:'0x1234',rawTx:'0x00',label:'fixture'});
+  pool._authenticatedProviderEntries=async()=>[];
+  pool._readReceiptQuorum=async()=>null;
+  pool._latestSignerNonce=async()=>0;
+  pool._clearPersistedSignedTx=()=>{cleared++;};
+  pool._broadcastSignedTransaction=async()=>{throw Error('untrusted RPC: failed on-chain');};
+  await assert.rejects(pool._reconcilePendingSignedTxLocked(),/failed on-chain/);
+  assert.equal(cleared,0);
+  let reads=0;
+  pool._readReceiptQuorum=async()=>++reads===1?null:{status:0};
+  pool._broadcastSignedTransaction=RPCPool.prototype._broadcastSignedTransaction;
+  const result=await pool._reconcilePendingSignedTxLocked();
+  assert.equal(result.status,'failed');assert.equal(cleared,1);
 });
