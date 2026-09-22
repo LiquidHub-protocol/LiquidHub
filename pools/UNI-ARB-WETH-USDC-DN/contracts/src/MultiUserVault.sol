@@ -1343,7 +1343,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 refundDelay
     ) external onlyOwner {
         if (postCheckMaxDriftBps < 50 || postCheckMaxDriftBps > 1000) revert E18();
-        if (dustFloorUsd == 0) revert E18();
+        if (dustFloorUsd == 0 || dustFloorUsd > 50e8) revert E18();
         if (refundDelay < 3600 || refundDelay > 30 days) revert E18();
         if (maxDepositUsd < minDepositUSD) revert E18();
         uint256 maxByChunks = uint256(rangeManager.initMultiSwapTvl()) * 1e9;

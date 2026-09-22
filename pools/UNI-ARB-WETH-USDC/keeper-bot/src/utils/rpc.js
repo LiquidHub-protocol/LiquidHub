@@ -1,3 +1,4 @@
+const { durableWriteFileSync, durableUnlinkSync } = require('./durable-file');
 // SPDX-License-Identifier: MIT
 
 const { ethers } = require('ethers');
@@ -83,7 +84,7 @@ class RPCPool {
       process.env.RPC_BACKUP_2
     ].filter(Boolean))];
 
-    if (urls.length === 0) throw new Error('No RPC URL configured');
+    if (urls.length !== 3) throw new Error('Three distinct RPC endpoints are required');
 
     this.providers = urls.map(url => ({
       url,
@@ -345,8 +346,7 @@ class RPCPool {
       journal.feeCapExempt = true;
       journal.feeCapExemptTarget = String(feeCapExemptTarget || '').toLowerCase();
     }
-    fs.writeFileSync(temp, `${JSON.stringify(journal, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(temp, this.pendingTxFile);
+    durableWriteFileSync(this.pendingTxFile, `${JSON.stringify(journal, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   }
 
   _clearPersistedSignedTx(expectedHash) {
@@ -356,7 +356,7 @@ class RPCPool {
     if (pending.txHash.toLowerCase() !== expectedHash.toLowerCase()) {
       throw new Error(`Refusing to clear unrelated persisted transaction ${pending.txHash}`);
     }
-    fs.unlinkSync(this.pendingTxFile);
+    durableUnlinkSync(this.pendingTxFile);
   }
 
   getProvider() {

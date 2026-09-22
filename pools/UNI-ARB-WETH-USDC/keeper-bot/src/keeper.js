@@ -18,7 +18,8 @@ const {
 const { PersistentActionAlerts } = require('./utils/action-alerts');
 const { Rebalancer } = require('./rebalancer');
 
-const CHECK_INTERVAL_MIN = Number(process.env.CHECK_INTERVAL_MIN || '1');
+const { strictInteger } = require('./utils/strict-integer');
+const CHECK_INTERVAL_MIN = strictInteger(process.env.CHECK_INTERVAL_MIN ?? '1', 'CHECK_INTERVAL_MIN', 1, 1440);
 if (!Number.isFinite(CHECK_INTERVAL_MIN) || CHECK_INTERVAL_MIN <= 0) {
   throw new Error('CHECK_INTERVAL_MIN must be a finite number greater than 0');
 }
