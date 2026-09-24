@@ -393,6 +393,7 @@ class RPCPool {
   }
 
   isProviderError(error) {
+    if (error?.code === 'RPC_FEE_ABOVE_CAP') return true;
     if (error?.code === 'CALL_EXCEPTION') return !isConfirmedEvmRevert(error);
     const msg = `${error?.shortMessage || ''} ${error?.message || ''}`.toLowerCase();
     const code = `${error?.code || ''}`.toUpperCase();
@@ -597,10 +598,10 @@ class RPCPool {
       ['maxPriorityFeePerGas', transaction.maxPriorityFeePerGas],
     ]) {
       if (value !== null && value !== undefined && BigInt(value) > this.maxGasPriceWei) {
-        throw new Error(
+        throw Object.assign(new Error(
           `${label}: provider proposed ${field}=${ethers.formatUnits(value, 'gwei')} gwei, ` +
           `above KEEPER_MAX_GAS_PRICE_GWEI=${ethers.formatUnits(this.maxGasPriceWei, 'gwei')}`
-        );
+        ), { code: 'RPC_FEE_ABOVE_CAP' });
       }
     }
   }
