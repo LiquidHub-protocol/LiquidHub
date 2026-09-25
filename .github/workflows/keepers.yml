@@ -1,0 +1,88 @@
+name: Public keeper validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-keepers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  keepers:
+    name: Keeper JavaScript (${{ matrix.pool }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pool: standard
+            directory: pools/UNI-ARB-WETH-USDC/keeper-bot
+          - pool: delta-neutral
+            directory: pools/UNI-ARB-WETH-USDC-DN/keeper-bot
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.23.2
+      - name: Install locked dependencies without lifecycle scripts
+        working-directory: ${{ matrix.directory }}
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Validate JavaScript syntax
+        env:
+          KEEPER_DIRECTORY: ${{ matrix.directory }}
+        run: |
+          git ls-files -z -- "$KEEPER_DIRECTORY/*.js" | xargs -0 -r -n 1 node --check
+      - name: Run keeper unit tests
+        working-directory: ${{ matrix.directory }}
+        run: npm test
+
+  secret-scan:
+    name: Public secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reject tracked credential and runtime files
+        run: |
+          python3 - <<'PYTHON'
+          import pathlib, subprocess
+          paths = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')
+          forbidden = []
+          for path in filter(None, paths):
+              p = pathlib.PurePosixPath(path)
+              name = p.name
+              env_secret = name == '.env' or (name.startswith('.env.') and not name.endswith(('.example', '.sample'))) or name.endswith('.env')
+              key = p.suffix in ('.pem', '.key', '.p12', '.pfx') or name in ('id_rsa', 'id_ed25519', 'id_ecdsa')
+              runtime = name.startswith(('.keeper-pending-tx-', 'UTC--')) or 'keystore' in p.parts
+              if env_secret or key or runtime or path.endswith('/.aws/credentials') or path == '.aws/credentials':
+                  forbidden.append(path)
+          if forbidden:
+              raise SystemExit('Forbidden credential/runtime paths: ' + ', '.join(forbidden))
+          PYTHON
+      - name: Install checksum-verified Gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.0
+          GITLEAKS_SHA256: 79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/gitleaks.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            --output "${archive}"
+          printf '%s  %s\n' "${GITLEAKS_SHA256}" "${archive}" | sha256sum --check
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}" gitleaks
+          echo "${RUNNER_TEMP}" >> "$GITHUB_PATH"
+      - name: Scan complete Git history
+        run: gitleaks git --config .gitleaks.toml --redact=100 .
