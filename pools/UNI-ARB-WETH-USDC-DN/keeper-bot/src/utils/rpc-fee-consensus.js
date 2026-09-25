@@ -14,10 +14,18 @@ function corroborateNumbers(values, required = 2) {
 }
 
 async function readFeeConsensus(providers, read, required = 2) {
-  const values = await Promise.all(providers.map(async provider => {
-    try { return await read(provider); } catch { return null; }
-  }));
-  return corroborateNumbers(values, required);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const values = await Promise.all(providers.map(async provider => {
+      try { return await read(provider); } catch { return null; }
+    }));
+    try {
+      return corroborateNumbers(values, required);
+    } catch (error) {
+      // A fresh estimate resolves short-lived state races without accepting a
+      // lone quote or imposing an arbitrary HF gas ceiling.
+      if (attempt === 1 || error.message !== 'RPC estimates disagree') throw error;
+    }
+  }
 }
 
 async function readFeeDataConsensus(providers, read, required = 2) {
@@ -25,10 +33,21 @@ async function readFeeDataConsensus(providers, read, required = 2) {
     try { return await read(provider); } catch { return null; }
   }));
   const result = {};
+  // A corroborated legacy gasPrice is an independent safe fallback when only
+  // an EIP-1559 subfield disagrees. Do not let a partial 1559 quote suppress
+  // the HF repair lane; nonce/receipt quorum remains unchanged.
   for (const field of ['gasPrice', 'maxFeePerGas', 'maxPriorityFeePerGas']) {
     const values = observations.filter(Boolean).map(value => value[field]);
-    result[field] = values.filter(value => value != null).length >= required
-      ? corroborateNumbers(values, required) : null;
+    if (values.filter(value => value != null).length < required) {
+      result[field] = null;
+      continue;
+    }
+    try {
+      result[field] = corroborateNumbers(values, required);
+    } catch (error) {
+      if (field === 'gasPrice' || result.gasPrice == null) throw error;
+      result[field] = null;
+    }
   }
   if (result.maxFeePerGas == null || result.maxPriorityFeePerGas == null) {
     result.maxFeePerGas = null;
