@@ -1,5 +1,25 @@
 # Security Model
 
+## Repository security checks
+
+GitHub secret scanning and push protection are enabled for this public repository,
+including generic-pattern and AI-detected secret alerts. Dependabot security updates
+are grouped by ecosystem/directory in `.github/dependabot.yml`; development-dependency
+alerts are retained for review instead of automatically dismissed.
+
+`Public code security` runs CodeQL on JavaScript/TypeScript and GitHub Actions after
+relevant changes reach `main`. It does not run on pull requests or a schedule, avoiding
+duplicate scans. Documentation, HTML, CSS and Solidity-only changes do not trigger it.
+The single Ubuntu job has a ten-minute timeout and does not install dependencies,
+compile TypeScript/Solidity, run Foundry, or contact an RPC. Results are published to
+the repository's **Security and quality → Code scanning** page. This is post-merge
+monitoring, not an additional required pull-request check or a Solidity audit.
+
+Before a major release, maintainers should also run **Actions → Public code security →
+Run workflow** on the release candidate, review its alerts, and confirm the run succeeded.
+Use this manual run to refresh the analysis after a long period without code changes.
+Existing keeper tests and the Gitleaks check remain required before merging.
+
 ## Governance and emergency authority
 
 In Phase 1, the Gnosis Safe multisig is the governance authority under the signer threshold configured directly
