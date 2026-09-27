@@ -80,6 +80,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     error InvalidRecipient();
     error NoPositionToBurn();
     error WithdrawalValueTooLow();
+    error NavUnavailable();
 
     // ===== STRUCTURES =====
 
@@ -847,11 +848,16 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     function getCurrentPortfolioValue() public view returns (uint256) {
         address module = botModule;
-        if (module == address(0)) return 0;
+        if (module == address(0)) {
+            if (totalShares != 0) revert NavUnavailable();
+            return 0;
+        }
         try IBotNav(module).getOracleLpValueUsd() returns (uint256 valueUsd) {
             return valueUsd;
         } catch {
-            return 0;
+            // A failed oracle/module read is not a real $0 portfolio. State
+            // changes already reject it; views must give the same signal.
+            revert NavUnavailable();
         }
     }
 

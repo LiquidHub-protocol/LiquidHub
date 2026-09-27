@@ -48,15 +48,17 @@ test('namespaces position ids by chain to prevent cross-chain collisions', () =>
 });
 
 // Use real ethers ABI encoding/decoding, with a chain advancing on every RPC call.
-function snapshotProvider({ brokenVault = false, brokenPage = false } = {}) {
+function snapshotProvider({ brokenVault = false, brokenPage = false, stalePriceCache = false } = {}) {
     const { REGISTRY_ABI, VAULT_ABI } = require('./reference-adapter');
     const registry = '0x0000000000000000000000000000000000000010';
     const user = '0x0000000000000000000000000000000000000020';
-    const iface = new ethers.Interface([...REGISTRY_ABI, ...VAULT_ABI]);
+    const iface = new ethers.Interface([...REGISTRY_ABI, ...VAULT_ABI,
+        'function priceCache() view returns (uint128 price0, uint128 price1, uint160 sqrtPriceX96, int24 poolTick, uint64 timestamp, bool valid)']);
     let head = 100;
     const reads = [];
     const provider = {
         getBlockNumber: async () => head,
+        getBlock: async (number) => ({ number, timestamp: 1_000_000 }),
         getNetwork: async () => ({ chainId: 42161n }),
         call: async (tx) => {
             const call = iface.parseTransaction(tx);
@@ -82,6 +84,7 @@ function snapshotProvider({ brokenVault = false, brokenPage = false } = {}) {
             }
             if (call.name === 'totalShares') result = [100n];
             if (call.name === 'getCurrentPortfolioValue') result = [1000n * 10n ** 8n];
+            if (call.name === 'priceCache') result = [1n, 1n, 0n, 0, BigInt(stalePriceCache ? 900_000 : 999_000), true];
             return iface.encodeFunctionResult(call.fragment, result);
         },
     };
@@ -91,16 +94,24 @@ test('pins discovery, pagination and all valuations to one block as the provider
     const fixture = snapshotProvider();
     const result = await require('./reference-adapter').getLiquidHubPositions(fixture);
     assert.equal(result.blockNumber, 100);
-    assert.equal(result.positions.length, 2);
+    assert.equal(result.positions.length, 3);
+    assert.equal(result.positions[2].active, false);
     assert.equal(result.positions[0].valueUsdRaw, 250n * 10n ** 8n);
     assert.deepEqual(result.failures, []);
     assert.equal(fixture.reads.filter((read) => read.method === 'getVaults').length, 3);
-    assert.equal(fixture.reads.filter((read) => read.method === 'userInfo').length, 2);
+    assert.equal(fixture.reads.filter((read) => read.method === 'userInfo').length, 3);
+});
+test('suppresses exact USD values when a funded vault price cache is stale', async () => {
+    const result = await require('./reference-adapter').getLiquidHubPositions(snapshotProvider({ stalePriceCache: true }));
+    assert.equal(result.positions.length, 3);
+    assert.equal(result.positions[0].valueUsd, null);
+    assert.equal(result.positions[0].valuationStatus, 'unavailable-or-stale-price-cache');
+    assert.deepEqual(result.failures, []);
 });
 test('keeps per-vault failures explicit, but never returns a silently incomplete discovery', async () => {
     const { getLiquidHubPositions } = require('./reference-adapter');
     const result = await getLiquidHubPositions(snapshotProvider({ brokenVault: true }));
-    assert.equal(result.positions.length, 1);
+    assert.equal(result.positions.length, 2);
     assert.equal(result.failures.length, 1);
     await assert.rejects(getLiquidHubPositions(snapshotProvider({ brokenPage: true })), /historical page unavailable/);
 });
