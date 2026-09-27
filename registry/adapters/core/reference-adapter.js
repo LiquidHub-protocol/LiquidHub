@@ -6,6 +6,7 @@ const NAV_DECIMALS = 8;
 const DEFAULT_PAGE_SIZE = 25;
 const MAX_PAGE_SIZE = 100;
 const SUPPORTED_INTERFACE_VERSION = 1;
+const MAX_NAV_PRICE_AGE_SECONDS = 3600;
 
 const REGISTRY_ABI = [
     'function deploymentChainId() view returns (uint256)',
@@ -18,6 +19,9 @@ const VAULT_ABI = [
     'function totalShares() view returns (uint256)',
     'function getCurrentPortfolioValue() view returns (uint256)',
 ];
+const RANGE_MANAGER_ABI = [
+    'function priceCache() view returns (uint128 price0, uint128 price1, uint160 sqrtPriceX96, int24 poolTick, uint64 timestamp, bool valid)',
+];
 
 function calculateUserValue(nav, shares, totalShares) {
     const navValue = BigInt(nav);
@@ -26,6 +30,17 @@ function calculateUserValue(nav, shares, totalShares) {
     if (userShares === 0n) return 0n;
     if (supply === 0n) throw new Error('Vault has user shares but totalShares is zero');
     return (navValue * userShares) / supply;
+}
+
+function navValuationStatus(shares, nav, cache, nowSeconds) {
+    try {
+        const stamp = Number(cache?.timestamp);
+        if (BigInt(shares) > 0n && (BigInt(nav) <= 0n || !cache?.valid
+            || BigInt(cache.price0 || 0) <= 0n || BigInt(cache.price1 || 0) <= 0n
+            || !Number.isSafeInteger(stamp) || stamp <= 0 || stamp > nowSeconds
+            || nowSeconds - stamp > MAX_NAV_PRICE_AGE_SECONDS)) return 'unavailable-or-stale-price-cache';
+        return 'current';
+    } catch { return 'unavailable-or-stale-price-cache'; }
 }
 
 function decodeRegistryId(value) {
@@ -59,19 +74,20 @@ function createPositionId(chainId, vault, user) {
     return `liquidhub:${normalizedChainId}:${ethers.getAddress(vault).toLowerCase()}:${ethers.getAddress(user).toLowerCase()}`;
 }
 
-async function readPosition(provider, user, record, chainId, blockTag) {
+async function readPosition(provider, user, record, chainId, blockTag, blockTimestamp) {
     const interfaceVersion = requireSupportedInterfaceVersion(record.interfaceVersion);
     const vault = new ethers.Contract(record.vault, VAULT_ABI, provider);
     const userInfo = await vault.userInfo(user, { blockTag });
     const shares = BigInt(userInfo.shares);
     if (shares === 0n) return null;
 
-    const [totalShares, nav] = await Promise.all([
+    const [totalShares, nav, cache] = await Promise.all([
         vault.totalShares({ blockTag }),
         vault.getCurrentPortfolioValue({ blockTag }),
+        new ethers.Contract(record.rangeManager, RANGE_MANAGER_ABI, provider).priceCache({ blockTag }),
     ]);
-
-    const valueUsdRaw = calculateUserValue(nav, shares, totalShares);
+    const valuationStatus = navValuationStatus(shares, nav, cache, blockTimestamp);
+    const valueUsdRaw = valuationStatus === 'current' ? calculateUserValue(nav, shares, totalShares) : null;
     return {
         id: createPositionId(chainId, record.vault, user),
         chainId: BigInt(chainId),
@@ -80,15 +96,18 @@ async function readPosition(provider, user, record, chainId, blockTag) {
         strategy: decodeRegistryId(record.strategyId),
         interfaceVersion,
         vault: record.vault,
+        active: Boolean(record.active),
         rangeManager: record.rangeManager,
         dexPool: record.dexPool,
         token0: record.token0,
         token1: record.token1,
         shares,
         totalShares: BigInt(totalShares),
+        valuationStatus,
+        priceCacheTimestamp: Number(cache.timestamp),
         valueUsdRaw,
         valueUsdDecimals: NAV_DECIMALS,
-        valueUsd: ethers.formatUnits(valueUsdRaw, NAV_DECIMALS),
+        valueUsd: valueUsdRaw === null ? null : ethers.formatUnits(valueUsdRaw, NAV_DECIMALS),
     };
 }
 
@@ -104,11 +123,14 @@ async function getLiquidHubPositions({ provider, user, registryAddress, pageSize
     const blockTag = await provider.getBlockNumber();
     if (!Number.isSafeInteger(blockTag) || blockTag < 0) throw new Error('Invalid snapshot block number');
     const registry = new ethers.Contract(normalizedRegistry, REGISTRY_ABI, provider);
-    const [chainId, countRaw, network] = await Promise.all([
+    const [chainId, countRaw, network, block] = await Promise.all([
         registry.deploymentChainId({ blockTag }),
         registry.vaultCount({ blockTag }),
         provider.getNetwork(),
+        provider.getBlock(blockTag),
     ]);
+    const blockTimestamp = Number(block?.timestamp);
+    if (!Number.isSafeInteger(blockTimestamp) || blockTimestamp <= 0) throw new Error('Snapshot block timestamp unavailable');
     const verifiedChainId = requireMatchingChain(chainId, network.chainId);
     const count = Number(countRaw);
     if (!Number.isSafeInteger(count)) throw new Error('Registry vault count is too large');
@@ -117,9 +139,11 @@ async function getLiquidHubPositions({ provider, user, registryAddress, pageSize
     const failures = [];
     for (let offset = 0; offset < count; offset += pageSize) {
         const records = await registry.getVaults(offset, Math.min(pageSize, count - offset), { blockTag });
-        const activeRecords = records.filter((record) => record.active);
+        // Deactivation stops new discovery for investment; it must not hide
+        // shares already owned by this user or their withdrawal route.
+        const positionRecords = records;
         const settled = await Promise.allSettled(
-            activeRecords.map((record) => readPosition(provider, normalizedUser, record, verifiedChainId, blockTag)),
+            positionRecords.map((record) => readPosition(provider, normalizedUser, record, verifiedChainId, blockTag, blockTimestamp)),
         );
         settled.forEach((result, index) => {
             if (result.status === 'fulfilled') {
@@ -127,7 +151,7 @@ async function getLiquidHubPositions({ provider, user, registryAddress, pageSize
                 return;
             }
             failures.push({
-                vault: activeRecords[index].vault,
+                vault: positionRecords[index].vault,
                 reason: result.reason instanceof Error ? result.reason.message : String(result.reason),
             });
         });
