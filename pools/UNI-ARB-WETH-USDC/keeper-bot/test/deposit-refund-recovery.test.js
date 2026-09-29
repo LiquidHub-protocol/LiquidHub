@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Interface } = require('ethers');
-const { markDepositSimulationError, processDepositWithRecovery, readRecoverySnapshot, sendDepositRefund } = require('../src/utils/deposit-refund-recovery');
+const { markDepositSimulationError, processDepositWithRecovery, readRecoverySnapshot, readBlockedMatureHead, sendDepositRefund } = require('../src/utils/deposit-refund-recovery');
 function fixture() {
   const state = {}, snapshot = { key: 'alice:1:100:0', user: 'alice', now: 22000, eligible: true };
   let mode = 'revert', sent = 0, attempted = 0;
@@ -95,6 +95,28 @@ test('recovery snapshots decode real ABI responses at one block and enforce each
     }
     calls.length = 0; now = 100;
     assert.equal((await read()).eligible, false); assert.equal(calls.length, 2);
+    const readBlocked = () => readBlockedMatureHead({ rpcPool, vaultAddress,
+      pauseControllerAddress: pauseAddress, strategyEngine, isDn });
+    assert.equal(await readBlocked(), null, 'young deposits are never refunded');
+    now = 22000;
+    assert.equal(await readBlocked(), null, 'a healthy admission path is not blocked');
+    for (const key of ['inflowsPaused', 'initialPositionEstablished']) {
+      values[key][0] = !values[key][0];
+      assert.equal((await readBlocked()).user.toLowerCase(), user);
+      values.isRebalancing[0] = true;
+      assert.equal(await readBlocked(), null, 'a rebalance lock prevents a refund');
+      values.isRebalancing[0] = false;
+      values[key][0] = !values[key][0];
+    }
+    dataFresh = false;
+    assert.equal((await readBlocked()).atBlock, 123);
+    dataFresh = true;
+    const originalConnect = strategyEngine.connect;
+    strategyEngine.connect = () => ({ previewDecision: async () => {
+      throw new Error('transport failure');
+    } });
+    await assert.rejects(readBlocked(), /transport failure/);
+    strategyEngine.connect = originalConnect;
   }
 });
 

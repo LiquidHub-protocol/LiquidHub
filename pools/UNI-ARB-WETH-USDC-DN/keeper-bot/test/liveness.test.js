@@ -188,7 +188,7 @@ test('HF safety lane runs before ordinary topology and derives the Aave pool on-
   assert.ok(main.indexOf('await runHfSafetyLane(') >= 0);
   assert.ok(main.indexOf('await runHfSafetyLane(') < main.indexOf('await assertKeeperTopology('));
   assert.match(source, /async function readLiveHfSafetyState[\s\S]{0,500}hm\.pool\(\{ blockTag \}\)/);
-  assert.match(source, /async function assertHfRepairTopology[\s\S]{0,700}hm\.hfRepairTriggerBps\(\)/);
+  assert.match(source, /async function assertHfRepairTopology[\s\S]{0,700}hm\.hfRepairTriggerBps\(\{ blockTag \}\)/);
   const safetyTopology = source.slice(
     source.indexOf('async function assertHfRepairTopology'),
     source.indexOf('/**', source.indexOf('async function assertHfRepairTopology'))
@@ -1114,7 +1114,7 @@ test('critical keeper alert is immediate, persisted and deduplicated', async (t)
 
 test('confirmed hedge transactions require an on-chain HF post-check without a manual handover', () => {
   const keeper = fsSync.readFileSync(path.join(__dirname, '..', 'src', 'keeper.js'), 'utf8');
-  assert.match(keeper, /hfRepairTriggerBps\(\)/);
+  assert.match(keeper, /hfRepairTriggerBps\(\{ blockTag \}\)/);
   assert.match(keeper, /hfRepairPostCheck/);
   assert.match(keeper, /hfBps <= 12_500n/);
   assert.match(keeper, /HF impossible à vérifier après la transaction confirmée/);
@@ -1312,7 +1312,7 @@ test('HF topology binds reciprocal contracts to the configured deployment', asyn
   const check=new Function('ethers','process',`${code};return assertHfRepairTopology;`)(mockEthers,{env:{AAVE_HEDGE_MANAGER_ADDRESS:addr(1),VAULT_ADDRESS:addr(2),RANGEMANAGER_ADDRESS:addr(3)}});
   const provider={getCode:async()=> '0x6001'};
   const hm={connect(){return this;},pool:async()=>addr(4),hfRepairTriggerBps:async()=>14000n,vault:async()=>addr(2),rangeManager:async()=>addr(3)};
-  const rpc={executeConsensusRead:async fn=>fn(provider)};
+  const rpc={executeSnapshotConsensusRead:async fn=>fn(provider,123)};
   await check(rpc,hm);
   const wrongPool={...hm,vault:async()=>addr(88)};
   await assert.rejects(check(rpc,wrongPool),/non-reciprocal/);

@@ -37,7 +37,7 @@ function needsPriceCacheRefresh(priceCache) {
 }
 
 async function logPriceCacheBeforeDecision(rangeManager, rpcPool) {
-  const priceCache = await rpcPool.executeWithRetry(async (provider) => {
+  const priceCache = await rpcPool.executePublicRead(async (provider) => {
     return await rangeManager.connect(provider).priceCache();
   });
   if (!needsPriceCacheRefresh(priceCache)) return false;
@@ -46,7 +46,9 @@ async function logPriceCacheBeforeDecision(rangeManager, rpcPool) {
 }
 
 async function readContract(rpcPool, contract, method, ...args) {
-  return await rpcPool.executeWithRetry(async (provider) => {
+  const read = /^(treasuryAddress|usdc|balanceOf|(?:keeper|strategyCheckpoint|deposit)Bounty(?:Enabled|Amount))$/.test(method)
+    ? rpcPool.executePublicRead.bind(rpcPool) : rpcPool.executeWithRetry.bind(rpcPool);
+  return await read(async (provider) => {
     return await contract.connect(provider)[method](...args);
   });
 }
@@ -239,6 +241,19 @@ async function main() {
         if (CHECK_ONLY) break;
         await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL_MS));
         continue;
+      }
+
+      // An old FIFO head may be refundable while global inflows are paused or
+      // strategy admission is stale. This requires no deposit bounty and must
+      // run before the ordinary decision/deposit gates.
+      if (!CHECK_ONLY) {
+        const refund = await rebalancer.refundBlockedMatureHead();
+        if (refund) {
+          console.log(`  -> Blocked matured deposit refunded: ${refund.txHash}`);
+          await trackAction(actionAlerts, 'success', 'deposit', 'Blocked matured head refunded to depositor');
+          await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL_MS));
+          continue;
+        }
       }
 
       await logPriceCacheBeforeDecision(rangeManager, rpcPool);

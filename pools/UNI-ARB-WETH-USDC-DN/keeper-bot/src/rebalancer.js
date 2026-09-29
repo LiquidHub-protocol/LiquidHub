@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-const { markDepositSimulationError, processDepositWithRecovery, readRecoverySnapshot, sendDepositRefund } = require('./utils/deposit-refund-recovery');
+const { markDepositSimulationError, processDepositWithRecovery, readRecoverySnapshot, readBlockedMatureHead, sendDepositRefund } = require('./utils/deposit-refund-recovery');
 
 const USD_SCALE = 100_000_000n;
 const PARTIAL_FILL_SELECTOR = '0xd964f528';
@@ -156,6 +156,22 @@ class Rebalancer {
       console.error(`Rebalance failed: ${error.message}`);
       return { success: false, error: error.message, txHashes: [] };
     }
+  }
+
+  async refundBlockedMatureHead() {
+    if (!this.pauseControllerAddress) return null;
+    const options = { rpcPool: this.rpcPool, vaultAddress: this.vault.target, pauseControllerAddress: this.pauseControllerAddress,
+      strategyEngine: this.strategyEngine, isDn: true, walletForProvider: p => this.wallet.connect(p) };
+    let blocked;
+    try { blocked = await readBlockedMatureHead(options); }
+    catch (error) { console.warn(`  Mature deposit head check unavailable: ${error.message}`); return null; }
+    if (!blocked) return null;
+    const guard = async () => {
+      const current = await readBlockedMatureHead(options);
+      if (!current || current.key !== blocked.key) throw new Error('Refund head or blockage changed');
+    };
+    const receipt = await sendDepositRefund(options, blocked.user, guard);
+    return { refunded: true, txHash: receipt.hash || receipt.transactionHash };
   }
 
   async processDeposit() {

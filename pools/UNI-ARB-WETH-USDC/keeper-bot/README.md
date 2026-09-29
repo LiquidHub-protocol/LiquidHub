@@ -98,8 +98,9 @@ Edit `.env` with the following variables:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `RPC_URL` | Yes | Primary Arbitrum RPC endpoint |
-| `RPC_BACKUP_1` | No | Backup RPC endpoint |
-| `RPC_BACKUP_2` | No | Second backup RPC endpoint |
+| `RPC_BACKUP_1` | Yes | Distinct backup RPC endpoint |
+| `RPC_BACKUP_2` | Yes | Second distinct backup RPC endpoint |
+| `RPC_URL_PUBLIC`, `RPC_BACKUP_1_PUBLIC`, `RPC_BACKUP_2_PUBLIC` | No | Optional distinct public triplet for ordinary reads; configure all three together. Critical actions continue on the keeper-owned primary triplet. |
 | `KEEPER_PRIVATE_KEY` | Yes* | Private key for the keeper wallet (*not needed for check-only mode) |
 | `KEEPER_MAX_GAS_PRICE_GWEI` | Yes | Local maximum for Exposed/Stable pool actions. A shared, signed DN `repairHealthFactor()` journal retains its exact-call exemption during reconciliation. |
 | `KEEPER_STATE_DIR` | No | Shared local signer-state directory. Defaults to `~/.liquidhub-keeper-state`. |

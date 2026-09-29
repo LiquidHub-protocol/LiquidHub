@@ -4,7 +4,9 @@
 // timeouts and chain authentication are retained; this helper never sends a tx.
 async function readSnapshotConsensus({
     entries, read, keyOf, withTimeout, authenticate = async () => {},
-    allowSingle = false, label, errorCode, reduceValues, headLag = 1,
+    allowSingle = false, allowLastSurvivor = false, configuredSourceCount = entries.length,
+    label, errorCode, reduceValues, headLag = 1,
+    onEntryFailure = () => {}, onEntrySuccess = () => {},
 }) {
     if (typeof keyOf !== 'function') throw new Error(`${label}: consensus key function is required`);
     // JsonRpcProvider.getBlock briefly caches identical requests. Header reads must
@@ -27,11 +29,20 @@ async function readSnapshotConsensus({
             return await withTimeout(async () => {
                 await authenticate(entry);
                 const block = await header(entry.provider, 'latest');
-                return validHeader(block) ? { entry, number: block.number } : null;
+                if (!validHeader(block)) {
+                    onEntryFailure(entry);
+                    return null;
+                }
+                onEntrySuccess(entry);
+                return { entry, number: block.number };
             });
-        } catch { return null; }
+        } catch { onEntryFailure(entry); return null; }
     }))).filter(Boolean).sort((a, b) => b.number - a.number);
-    const headQuorum = allowSingle && entries.length === 1 ? 1 : 2;
+    // Reserved for an explicitly selected emergency action. Never downgrade a
+    // disagreement between two live sources; only a sole authenticated source
+    // may be used, with the same recent-header before/after checks below.
+    const headQuorum = (allowSingle && entries.length === 1)
+        || (allowLastSurvivor && configuredSourceCount >= 3 && heads.length === 1) ? 1 : 2;
     if (heads.length >= headQuorum) {
         // Start at/just behind the quorum head. A single outlier cannot pick a far
         // future/old block. One bounded fallback tolerates a more delayed source.
@@ -44,15 +55,22 @@ async function readSnapshotConsensus({
                 try {
                     return await withTimeout(async () => {
                         const before = await header(entry.provider, blockTag);
-                        if (!validHeader(before, blockTag)) return null;
+                        if (!validHeader(before, blockTag)) {
+                            onEntryFailure(entry);
+                            return null;
+                        }
                         const value = await read(entry.provider, blockTag);
                         const after = await header(entry.provider, blockTag);
-                        if (!validHeader(after, blockTag) || before.hash.toLowerCase() !== after.hash.toLowerCase()) return null;
+                        if (!validHeader(after, blockTag) || before.hash.toLowerCase() !== after.hash.toLowerCase()) {
+                            onEntryFailure(entry);
+                            return null;
+                        }
                         const key = String(keyOf(value));
-                        if (!key) return null;
+                        if (!key) { onEntryFailure(entry); return null; }
+                        onEntrySuccess(entry);
                         return { key: `${before.hash.toLowerCase()}:${key}`, value };
                     });
-                } catch { return null; }
+                } catch { onEntryFailure(entry); return null; }
             }))).filter(Boolean);
             const quorum = headQuorum;
             const groups = new Map();

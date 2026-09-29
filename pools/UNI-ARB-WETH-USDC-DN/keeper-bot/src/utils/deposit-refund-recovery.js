@@ -62,6 +62,38 @@ async function readRecoverySnapshot({ rpcPool, vaultAddress, pauseControllerAddr
   });
 }
 
+// A matured head is refundable when the ordinary admission path is blocked by
+// pause, bootstrap or stale strategy data. Transport errors never count as a
+// stale decision. The Vault is simulated again immediately before signing.
+async function readBlockedMatureHead({ rpcPool, vaultAddress, pauseControllerAddress, strategyEngine, isDn }) {
+  return rpcPool.executeWithRetry(async provider => {
+    const block = await provider.getBlock('latest');
+    const at = { blockTag: block.number };
+    const vault = new Contract(vaultAddress, VAULT_RECOVERY_ABI, provider);
+    const [head, delay] = await Promise.all([
+      vault.getNextPendingDeposit(at), vault[isDn ? 'dnDepositRefundDelay' : 'depositRefundDelay'](at),
+    ]);
+    if (!head.exists || BigInt(delay) <= 0n || BigInt(block.timestamp) < BigInt(head.timestamp) + BigInt(delay)) return null;
+    const key = [head.user.toLowerCase(), head.timestamp, head.amount0, head.amount1].map(String).join(':');
+    const [initialized, locked, paused] = await Promise.all([
+      vault.initialPositionEstablished(at), vault.isRebalancing(at),
+      new Contract(pauseControllerAddress, PAUSE_ABI, provider).inflowsPaused(at),
+    ]);
+    if (locked) return null;
+    let blocked = paused || !initialized;
+    if (!blocked) {
+      try {
+        const decision = await strategyEngine.connect(provider).previewDecision(at);
+        blocked = !decision.dataFresh;
+      } catch (error) {
+        if (!isConfirmedEvmRevert(error)) throw error;
+        blocked = true;
+      }
+    }
+    return blocked ? { key, user: head.user, atBlock: block.number } : null;
+  });
+}
+
 async function processDepositWithRecovery(options) {
   const { state, attempt, simulate, readSnapshot, sendRefund } = options;
   const reset = () => { delete state.key; delete state.first; delete state.last; delete state.failures; delete state.proofVersion; };
@@ -129,4 +161,4 @@ async function sendDepositRefund({ rpcPool, walletForProvider, vaultAddress }, u
   }, 'refundStaleDeposit');
 }
 
-module.exports = { isConfirmedEvmRevert, markDepositSimulationError, processDepositWithRecovery, readRecoverySnapshot, sendDepositRefund };
+module.exports = { isConfirmedEvmRevert, markDepositSimulationError, processDepositWithRecovery, readRecoverySnapshot, readBlockedMatureHead, sendDepositRefund };
