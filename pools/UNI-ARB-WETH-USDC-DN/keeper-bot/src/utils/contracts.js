@@ -344,7 +344,7 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
 async function checkBountyFunding(label, prefix, treasury, treasuryAddr, usdc, rpcPool) {
   if (!treasury || !treasuryAddr || !usdc) return true;
   try {
-    return await rpcPool.executeWithRetry(async (provider) => {
+    return await rpcPool.executePublicRead(async (provider) => {
       const contract = treasury.connect(provider);
       if (!await contract[`${prefix}BountyEnabled`]()) return true;
       const amount = await contract[`${prefix}BountyAmount`]();

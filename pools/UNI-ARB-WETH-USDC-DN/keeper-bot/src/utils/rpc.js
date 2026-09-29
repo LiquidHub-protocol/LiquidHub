@@ -96,13 +96,25 @@ class RPCPool {
       chainVerified: false,
       chainMismatch: false
     }));
+    const publicUrls = [process.env.RPC_URL_PUBLIC, process.env.RPC_BACKUP_1_PUBLIC,
+      process.env.RPC_BACKUP_2_PUBLIC].filter(Boolean);
+    if (publicUrls.length && new Set(publicUrls).size !== 3) {
+      throw new Error('The optional public RPC tier requires three distinct endpoints');
+    }
+    this.publicProviders = publicUrls.map(url => ({ url, provider: new ethers.JsonRpcProvider(url),
+      chainVerified: false, chainMismatch: false }));
     this.currentIndex = 0;
     this.poolName = String(process.env.POOL_NAME || path.basename(process.cwd()));
     this.signerWallet = process.env.KEEPER_PRIVATE_KEY
       ? new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY)
       : null;
     this.signerAddress = this.signerWallet?.address.toLowerCase() || null;
-    this.maxGasPriceWei = readPositiveGweiEnv('KEEPER_MAX_GAS_PRICE_GWEI');
+    try { this.maxGasPriceWei = readPositiveGweiEnv('KEEPER_MAX_GAS_PRICE_GWEI'); }
+    catch (error) {
+      // Only the exact HF repair can run before the ordinary configuration is rejected.
+      this.ordinaryGasConfigError = error;
+      this.maxGasPriceWei = ethers.parseUnits('0.2', 'gwei');
+    }
     const configuredHfRepairTarget = String(process.env.AAVE_HEDGE_MANAGER_ADDRESS || '').trim();
     if (configuredHfRepairTarget && !ethers.isAddress(configuredHfRepairTarget)) {
       throw new Error('AAVE_HEDGE_MANAGER_ADDRESS must be a valid address');
@@ -475,6 +487,21 @@ class RPCPool {
     throw sanitizeRpcError(lastError);
   }
 
+  async executePublicRead(fn, timeoutMs = RPC_READ_TIMEOUT_MS) {
+    if (!this.publicProviders.length) return this.executeWithRetry(fn, 3, timeoutMs);
+    let lastError;
+    for (const entry of this.publicProviders) {
+      try {
+        if (!entry.chainVerified) await this._verifyProviderChain(entry);
+        return await this.withTimeout(() => fn(entry.provider), timeoutMs, 'public keeper read');
+      } catch (error) {
+        lastError = error;
+        if (!this.isProviderError(error) && error.code !== 'RPC_CHAIN_MISMATCH') throw sanitizeRpcError(error);
+      }
+    }
+    throw sanitizeRpcError(lastError || new Error('Public RPC tier unavailable'));
+  }
+
   async executeConsensusRead(fn, keyOf, label = 'keeper critical read') {
     if (typeof keyOf !== 'function') throw new Error(`${label}: consensus key function is required`);
     const entries = await this._authenticatedProviderEntries();
@@ -507,13 +534,15 @@ class RPCPool {
     throw error;
   }
 
-  async executeSnapshotConsensusRead(fn, keyOf, label = 'keeper critical snapshot') {
+  async executeSnapshotConsensusRead(fn, keyOf, label = 'keeper critical snapshot', { hfEmergency = false } = {}) {
     return readSnapshotConsensus({
       entries: await this._authenticatedProviderEntries(),
       read: fn,
       keyOf,
       withTimeout: (read) => this.withTimeout(read, RPC_READ_TIMEOUT_MS, label),
       allowSingle: this.providers.length === 1,
+      allowLastSurvivor: hfEmergency,
+      configuredSourceCount: this.providers.length,
       label,
       errorCode: 'RPC_READ_QUORUM_UNAVAILABLE',
     });
@@ -566,22 +595,28 @@ class RPCPool {
     return confirmed.length === 1 ? confirmed[0].receipt : null;
   }
 
-  async _signingNonce() {
+  async _signingNonce(hfEmergency = false) {
     const entries = await this._authenticatedProviderEntries();
     const counts = new Map();
+    const sole = [];
     for (const entry of entries) {
-      const nonce = await this.withTimeout(
-        () => entry.provider.getTransactionCount(this.signerAddress, 'pending'),
-        RPC_READ_TIMEOUT_MS,
-        'keeper signing nonce quorum'
-      ).catch(() => null);
+      const state = await this.withTimeout(async () => ({
+        pending: await entry.provider.getTransactionCount(this.signerAddress, 'pending'),
+        latest: hfEmergency ? await entry.provider.getTransactionCount(this.signerAddress, 'latest') : null,
+      }), RPC_READ_TIMEOUT_MS, 'keeper signing nonce quorum').catch(() => null);
+      const nonce = state?.pending;
       if (nonce !== null && Number.isSafeInteger(Number(nonce))) {
         const value = Number(nonce);
         counts.set(value, (counts.get(value) || 0) + 1);
+        sole.push(state);
       }
     }
     const quorum = this._receiptQuorumSize();
     const confirmed = [...counts.entries()].filter(([, count]) => count >= quorum).map(([nonce]) => nonce);
+    if (confirmed.length !== 1 && hfEmergency && this.providers.length >= 3 && sole.length === 1
+      && Number(sole[0].latest) === Number(sole[0].pending)) {
+      return Number(sole[0].pending);
+    }
     if (confirmed.length !== 1) {
       const error = new Error(`Keeper signing nonce quorum ${quorum}/${this.providers.length} unavailable`);
       error.code = 'RPC_SIGNING_NONCE_QUORUM_UNAVAILABLE';
@@ -606,9 +641,10 @@ class RPCPool {
     }
   }
 
-  async _corroboratedFeeData(entries) {
+  async _corroboratedFeeData(entries, hfEmergency = false) {
     return readFeeDataConsensus(entries.map(entry => entry.provider), provider =>
-      this.withTimeout(() => provider.getFeeData(), RPC_READ_TIMEOUT_MS, 'HF fee quorum'), this._receiptQuorumSize());
+      this.withTimeout(() => provider.getFeeData(), RPC_READ_TIMEOUT_MS, 'HF fee quorum'),
+      this._receiptQuorumSize(), { hfEmergency, configuredSourceCount: this.providers.length });
   }
 
   _assertEmergencyFeeCap(transaction, label) {
@@ -874,7 +910,7 @@ class RPCPool {
       const prepareBundle = async (replacementNonce) => {
         // A replacement keeps the nonce authenticated by the signed journal.
         // New transactions still require the independent pending-nonce quorum.
-        const signingNonce = replacementNonce ?? await this._signingNonce();
+        const signingNonce = replacementNonce ?? await this._signingNonce(bypassFeeCap === true);
         return await this.executeWithRetry(async (currentProvider) => {
         const prepared = await prepareFn(currentProvider);
         if (!prepared?.wallet || !prepared?.request) {
@@ -884,11 +920,12 @@ class RPCPool {
         if (bypassFeeCap === true) {
           if (!this._isConfiguredHfRepairTransaction(request)) throw new Error('Invalid HF repair target');
           const entries = await this._authenticatedProviderEntries();
-          const fee = await this._corroboratedFeeData(entries);
+          const fee = await this._corroboratedFeeData(entries, true);
           const gas = await readFeeConsensus(entries.map(entry => entry.provider), provider =>
             this.withTimeout(() => provider.estimateGas({
               to: request.to, data: request.data, value: request.value || 0n, from: this.signerAddress,
-            }), RPC_READ_TIMEOUT_MS, 'HF gas estimate quorum'), this._receiptQuorumSize());
+            }), RPC_READ_TIMEOUT_MS, 'HF gas estimate quorum'), this._receiptQuorumSize(),
+            { hfEmergency: true, configuredSourceCount: this.providers.length });
           delete request.gasPrice;
           delete request.maxFeePerGas;
           delete request.maxPriorityFeePerGas;

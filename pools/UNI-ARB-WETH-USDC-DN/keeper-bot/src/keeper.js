@@ -20,10 +20,10 @@ const { PersistentActionAlerts } = require('./utils/action-alerts');
 const { Rebalancer } = require('./rebalancer');
 
 const { strictInteger } = require('./utils/strict-integer');
-const CHECK_INTERVAL_MIN = strictInteger(process.env.CHECK_INTERVAL_MIN ?? '1', 'CHECK_INTERVAL_MIN', 1, 1440);
-if (!Number.isFinite(CHECK_INTERVAL_MIN) || CHECK_INTERVAL_MIN <= 0) {
-  throw new Error('CHECK_INTERVAL_MIN must be a finite number greater than 0');
-}
+let ordinaryIntervalError = null;
+let CHECK_INTERVAL_MIN;
+try { CHECK_INTERVAL_MIN = strictInteger(process.env.CHECK_INTERVAL_MIN, 'CHECK_INTERVAL_MIN', 1, 1440); }
+catch (error) { ordinaryIntervalError = error; CHECK_INTERVAL_MIN = 1; }
 const CHECK_INTERVAL_MS = CHECK_INTERVAL_MIN * 60 * 1000;
 const CHECK_ONLY = process.argv.includes('--check-only');
 const PRICE_CACHE_MAX_AGE_SEC = parseInt(
@@ -64,7 +64,7 @@ function needsPriceCacheRefresh(priceCache) {
 }
 
 async function logPriceCacheBeforeDecision(rangeManager, rpcPool) {
-  const priceCache = await rpcPool.executeWithRetry(async (provider) => {
+  const priceCache = await rpcPool.executePublicRead(async (provider) => {
     return await rangeManager.connect(provider).priceCache();
   });
   if (!needsPriceCacheRefresh(priceCache)) return false;
@@ -73,7 +73,9 @@ async function logPriceCacheBeforeDecision(rangeManager, rpcPool) {
 }
 
 async function readContract(rpcPool, contract, method, ...args) {
-  return await rpcPool.executeWithRetry(async (provider) => {
+  const read = /^(treasuryAddress|usdc|balanceOf|(?:keeper|strategyCheckpoint|hedge|deposit)Bounty(?:Enabled|Amount))$/.test(method)
+    ? rpcPool.executePublicRead.bind(rpcPool) : rpcPool.executeWithRetry.bind(rpcPool);
+  return await read(async (provider) => {
     return await contract.connect(provider)[method](...args);
   });
 }
@@ -97,7 +99,7 @@ async function readLiveHfSafetyState(rpcPool, hedgeManager) {
   }, (state) => [
     state.poolAddress.toLowerCase(), state.debtBase, state.healthFactor,
     state.triggerBps, state.repairRequired,
-  ].map(String).join(':'), 'live HF safety state');
+  ].map(String).join(':'), 'live HF safety state', { hfEmergency: true });
 }
 
 async function assertHfRepairTopology(rpcPool, hedgeManager) {
@@ -105,17 +107,18 @@ async function assertHfRepairTopology(rpcPool, hedgeManager) {
   const expectedVault = process.env.VAULT_ADDRESS;
   const expectedRange = process.env.RANGEMANAGER_ADDRESS;
   if (![expectedVault, expectedRange].every(ethers.isAddress)) throw new Error('HF safety topology: configured vault/range missing');
-  const topology = await rpcPool.executeConsensusRead(async (provider) => {
+  const topology = await rpcPool.executeSnapshotConsensusRead(async (provider, blockTag) => {
     const hm = hedgeManager.connect(provider);
     const [hedgeCode, poolAddress, triggerBps, vaultAddress, rangeAddress] = await Promise.all([
-      provider.getCode(expectedHedgeManager),
-      hm.pool(),
-      hm.hfRepairTriggerBps(), hm.vault(), hm.rangeManager(),
+      provider.getCode(expectedHedgeManager, blockTag),
+      hm.pool({ blockTag }),
+      hm.hfRepairTriggerBps({ blockTag }), hm.vault({ blockTag }), hm.rangeManager({ blockTag }),
     ]);
     const vault = new ethers.Contract(vaultAddress, ["function hedgeManager() view returns (address)", "function rangeManager() view returns (address)"], provider);
     const range = new ethers.Contract(rangeAddress, ["function vault() view returns (address)"], provider);
     const [vaultHedge, vaultRange, rangeVault, vaultCode, rangeCode] = await Promise.all([
-      vault.hedgeManager(), vault.rangeManager(), range.vault(), provider.getCode(vaultAddress), provider.getCode(rangeAddress),
+      vault.hedgeManager({ blockTag }), vault.rangeManager({ blockTag }), range.vault({ blockTag }),
+      provider.getCode(vaultAddress, blockTag), provider.getCode(rangeAddress, blockTag),
     ]);
     if (vaultAddress.toLowerCase() !== expectedVault.toLowerCase()
       || rangeAddress.toLowerCase() !== expectedRange.toLowerCase()
@@ -125,12 +128,12 @@ async function assertHfRepairTopology(rpcPool, hedgeManager) {
       || rangeVault.toLowerCase() !== vaultAddress.toLowerCase()) {
       throw new Error("HF safety topology: non-reciprocal hedge/vault/range bindings");
     }
-    const poolCode = await provider.getCode(poolAddress);
+    const poolCode = await provider.getCode(poolAddress, blockTag);
     return { hedgeCode, poolCode, poolAddress, triggerBps, vaultAddress, rangeAddress };
   }, (state) => [
     state.hedgeCode, state.poolCode, String(state.poolAddress).toLowerCase(), state.triggerBps,
     String(state.vaultAddress).toLowerCase(), String(state.rangeAddress).toLowerCase(),
-  ].map(String).join(':'), 'HF safety topology');
+  ].map(String).join(':'), 'HF safety topology', { hfEmergency: true });
   if (topology.hedgeCode === '0x') throw new Error('HF safety topology: AaveHedgeManager has no runtime code');
   if (!ethers.isAddress(topology.poolAddress) || topology.poolCode === '0x') {
     throw new Error('HF safety topology: on-chain Aave pool has no runtime code');
@@ -394,6 +397,9 @@ async function main() {
   // Startup safety lane comes before the RangeStrategyEngine and ordinary topology. It can also
   // replace an ordinary pending transaction at the keeper nonce through executeSignedTxWithRetry().
   await runHfSafetyLane({ rpcPool, hedgeManager: safetyHedgeManager, wallet });
+  if (ordinaryIntervalError || rpcPool.ordinaryGasConfigError) {
+    throw new Error('Ordinary keeper configuration invalid after HF attempt', { cause: ordinaryIntervalError || rpcPool.ordinaryGasConfigError });
+  }
 
   const required = [
     'RANGEMANAGER_ADDRESS',
@@ -499,6 +505,18 @@ async function main() {
         if (CHECK_ONLY) break;
         await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL_MS));
         continue;
+      }
+
+      // HF and progressive maintenance have priority. Refund a blocked mature
+      // FIFO head independently of the ordinary pause/strategy/bounty gates.
+      if (!CHECK_ONLY) {
+        const refund = await rebalancer.refundBlockedMatureHead();
+        if (refund) {
+          console.log(`  -> Blocked matured deposit refunded: ${refund.txHash}`);
+          await trackAction(actionAlerts, 'success', 'deposit', 'Blocked matured head refunded to depositor');
+          await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL_MS));
+          continue;
+        }
       }
 
       await logPriceCacheBeforeDecision(rangeManager, rpcPool);

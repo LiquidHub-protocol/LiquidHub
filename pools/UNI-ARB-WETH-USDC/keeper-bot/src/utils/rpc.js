@@ -94,6 +94,13 @@ class RPCPool {
       chainVerified: false,
       chainMismatch: false
     }));
+    const publicUrls = [process.env.RPC_URL_PUBLIC, process.env.RPC_BACKUP_1_PUBLIC,
+      process.env.RPC_BACKUP_2_PUBLIC].filter(Boolean);
+    if (publicUrls.length && new Set(publicUrls).size !== 3) {
+      throw new Error('The optional public RPC tier requires three distinct endpoints');
+    }
+    this.publicProviders = publicUrls.map(url => ({ url, provider: new ethers.JsonRpcProvider(url),
+      chainVerified: false, chainMismatch: false }));
     this.currentIndex = 0;
     this.poolName = String(process.env.POOL_NAME || path.basename(process.cwd()));
     this.signerWallet = process.env.KEEPER_PRIVATE_KEY
@@ -471,6 +478,21 @@ class RPCPool {
       }
     }
     throw sanitizeRpcError(lastError);
+  }
+
+  async executePublicRead(fn, timeoutMs = RPC_READ_TIMEOUT_MS) {
+    if (!this.publicProviders.length) return this.executeWithRetry(fn, 3, timeoutMs);
+    let lastError;
+    for (const entry of this.publicProviders) {
+      try {
+        if (!entry.chainVerified) await this._verifyProviderChain(entry);
+        return await this.withTimeout(() => fn(entry.provider), timeoutMs, 'public keeper read');
+      } catch (error) {
+        lastError = error;
+        if (!this.isProviderError(error) && error.code !== 'RPC_CHAIN_MISMATCH') throw sanitizeRpcError(error);
+      }
+    }
+    throw sanitizeRpcError(lastError || new Error('Public RPC tier unavailable'));
   }
 
   async executeConsensusRead(fn, keyOf, label = 'keeper critical read') {

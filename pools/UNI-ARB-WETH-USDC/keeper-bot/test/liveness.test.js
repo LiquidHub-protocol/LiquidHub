@@ -21,6 +21,26 @@ const confirmedReceipt = (hash, blockNumber = 123) => ({
   blockNumber,
 });
 
+test('ordinary keeper reads cascade across public RPCs without spending the premium tier', async () => {
+  const rpc = Object.assign(Object.create(RPCPool.prototype), {
+    publicProviders: [{ provider: { id: 1 }, chainVerified: true },
+      { provider: { id: 2 }, chainVerified: true }, { provider: { id: 3 }, chainVerified: true }],
+    providers: [{ provider: { id: 'premium' }, chainVerified: true }],
+    _verifyProviderChain: async () => {},
+  });
+  const seen = [];
+  const read = provider => {
+    seen.push(provider.id);
+    if (provider.id === 1) throw Object.assign(new Error('RPC unavailable'), { code: 'NETWORK_ERROR' });
+    return provider.id;
+  };
+  assert.equal(await rpc.executePublicRead(read), 2);
+  assert.deepEqual(seen, [1, 2]);
+  for (const entry of rpc.publicProviders) entry.provider.id = 1;
+  await assert.rejects(rpc.executePublicRead(read), /RPC unavailable/);
+  assert.ok(seen.every(id => id !== 'premium'));
+});
+
 // Keep the production RPC retry and progressive orchestration together: replacing
 // executeWithRetry with a one-argument stub used to hide an incompatible call.
 function progressiveFixture(overrides = {}) {
