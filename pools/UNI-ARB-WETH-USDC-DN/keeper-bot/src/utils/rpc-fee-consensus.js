@@ -19,15 +19,22 @@ function freshBlock(block) {
     && Math.abs(Math.floor(Date.now() / 1000) - Number(block.timestamp)) <= 120;
 }
 
-async function matchingFeeBlock(providers, indexes) {
-  if (indexes.some(index => typeof providers[index]?.getBlock !== 'function')) return null;
-  const blocks = await Promise.all(indexes.map(index => providers[index].getBlock('latest').catch(() => null)));
-  if (blocks.length < 2 || !freshBlock(blocks[0])) return null;
-  const agreed = blocks.filter(block => freshBlock(block)
-    && block.hash.toLowerCase() === blocks[0].hash.toLowerCase()
-    && Number(block.number) === Number(blocks[0].number)
-    && BigInt(block.baseFeePerGas || 0n) === BigInt(blocks[0].baseFeePerGas || 0n));
-  return agreed.length >= 2 ? blocks[0] : null;
+async function matchingFeeBlock(providers) {
+  // A provider that cannot quote fees can still corroborate the chain head.
+  // Do not anchor the quorum to the first (possibly divergent) provider.
+  const blocks = await Promise.all(providers.map(provider => typeof provider?.getBlock === 'function'
+    ? provider.getBlock('latest').catch(() => null) : null));
+  for (let index = 0; index < blocks.length; index++) {
+    const block = blocks[index];
+    if (!freshBlock(block)) continue;
+    const indexes = blocks.map((candidate, candidateIndex) => freshBlock(candidate)
+      && candidate.hash.toLowerCase() === block.hash.toLowerCase()
+      && Number(candidate.number) === Number(block.number)
+      && BigInt(candidate.baseFeePerGas || 0n) === BigInt(block.baseFeePerGas || 0n)
+      ? candidateIndex : -1).filter(candidateIndex => candidateIndex >= 0);
+    if (indexes.length >= 2) return { block, indexes };
+  }
+  return null;
 }
 
 function feeFromBaseFee(block, observation) {
@@ -60,10 +67,11 @@ async function readFeeConsensus(providers, read, required = 2,
         }
       }
       if (hfEmergency && error.message === 'RPC estimates disagree' && attempt === 1) {
-        const indexes = values.map((value, index) => value != null ? index : -1).filter(index => index >= 0);
-        const block = await matchingFeeBlock(providers, indexes);
-        const estimate = indexes.reduce((max, index) => BigInt(values[index]) > max ? BigInt(values[index]) : max, 0n);
-        if (block?.gasLimit && estimate > 0n && estimate * 120n / 100n <= BigInt(block.gasLimit)) {
+        const matching = await matchingFeeBlock(providers);
+        const estimate = (matching?.indexes || []).reduce((max, index) => values[index] != null
+          && BigInt(values[index]) > max ? BigInt(values[index]) : max, 0n);
+        if (matching?.block?.gasLimit && estimate > 0n
+            && estimate * 120n / 100n <= BigInt(matching.block.gasLimit)) {
           return estimate;
         }
       }
@@ -101,9 +109,10 @@ async function readFeeDataConsensus(providers, read, required = 2,
   const gasPrice = quote('gasPrice');
   if (gasPrice != null) return { gasPrice, maxFeePerGas: null, maxPriorityFeePerGas: null };
   if (hfEmergency && configuredSourceCount >= 3 && observations.filter(Boolean).length >= 2) {
-    const indexes = observations.map((value, index) => value ? index : -1).filter(index => index >= 0);
-    const block = await matchingFeeBlock(providers, indexes);
-    const fallback = feeFromBaseFee(block, observations[indexes[0]]);
+    const matching = await matchingFeeBlock(providers);
+    const quotedIndex = matching?.indexes.find(index => observations[index]);
+    const fallback = quotedIndex === undefined ? null
+      : feeFromBaseFee(matching.block, observations[quotedIndex]);
     if (fallback) return fallback;
   }
   throw new Error('RPC fee quorum unavailable');

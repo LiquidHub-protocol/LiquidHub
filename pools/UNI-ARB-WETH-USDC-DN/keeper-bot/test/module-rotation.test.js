@@ -101,7 +101,8 @@ test('an unreadable or zero canonical link fails before reading or using a retir
 
 test('the running keeper refreshes the module before progressive state while preserving the DN safety lane', () => {
   const source = fs.readFileSync(path.join(__dirname, '../src/keeper.js'), 'utf8');
-  const loop = source.slice(source.indexOf('while (true)'));
+  // The startup HF-only topology retry loop precedes the ordinary cycle.
+  const loop = source.slice(source.lastIndexOf('while (true)'));
   const refresh = loop.indexOf('secureBotModule = await syncCurrentBotModule(');
   const status = loop.indexOf('const progressiveStatus =');
   assert.ok(refresh >= 0 && refresh < status);

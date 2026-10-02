@@ -814,7 +814,9 @@ contract AaveHedgeManager is ReentrancyGuard {
             budget, amountInMaximum, address(pool), address(aTokenUsdc), liqThresholdBps, targetHfBps
         );
         if (toWithdraw > 0) pool.withdraw(address(usdc), toWithdraw, address(this));
-        if (capped < amountInMaximum || usdc.balanceOf(address(this)) < amountInMaximum) revert HedgeCheck(58);
+        // The oracle bound is an upper limit, not the amount the router must spend.
+        // Aave may safely release less while the exact-output swap still fits the HF budget.
+        if (capped == 0 || usdc.balanceOf(address(this)) < capped) revert HedgeCheck(58);
         if (
             DnDepositLib.aaveExactOutput(
                 address(swapRouter),
@@ -822,7 +824,7 @@ contract AaveHedgeManager is ReentrancyGuard {
                 address(weth),
                 swapPoolFee,
                 flashOwed,
-                amountInMaximum,
+                capped,
                 sqrtPriceLimitX96
             ) != flashOwed
         ) revert HedgeCheck(59);
