@@ -417,8 +417,22 @@ async function main() {
   }
   const contracts = createContracts(provider);
   const { rangeManager, vault, strategyEngine, hedgeManager, pauseController } = contracts;
-  let secureBotModule = await syncCurrentBotModule(rpcPool, rangeManager, contracts.secureBotModule);
-  await assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine, secureBotModule, hedgeManager });
+  let secureBotModule;
+  // Public RPC quorum is required for ordinary keeper actions, never for the
+  // premium HF safety lane. Keep that lane alive while the ordinary tier heals.
+  while (true) {
+    try {
+      secureBotModule = await syncCurrentBotModule(rpcPool, rangeManager, contracts.secureBotModule);
+      await assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngine, secureBotModule, hedgeManager });
+      break;
+    } catch (error) {
+      console.warn(`Ordinary keeper topology unavailable; HF-only retry: ${(error.message || '').slice(0, 120)}`);
+      if (CHECK_ONLY) throw error;
+      try { await runHfSafetyLane({ rpcPool, hedgeManager, wallet }); }
+      catch (hfError) { console.error(`HF safety retry failed: ${(hfError.message || '').slice(0, 120)}`); }
+      await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL_MS));
+    }
+  }
   console.log('Keeper topology: RangeManager/Vault/RangeStrategyEngine/SecureBotModule/AaveHedgeManager/tokens verified\n');
 
   const actionAlerts = new PersistentActionAlerts({
