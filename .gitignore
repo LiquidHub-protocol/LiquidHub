@@ -3,6 +3,7 @@ node_modules/
 *.log
 .keeper-pending-tx-*.json
 .keeper-pending-tx-*.json.lock
+.bridge-keeper-alerts.json
 .DS_Store
 *.code-workspace
 .claude/
@@ -14,4 +15,3 @@ node_modules/
 !pools/**/contracts/src/
 !pools/**/contracts/src/**/*.sol
 trading/
-bridge/

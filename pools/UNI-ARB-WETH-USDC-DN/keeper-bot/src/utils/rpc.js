@@ -534,7 +534,7 @@ class RPCPool {
     throw error;
   }
 
-  async executeSnapshotConsensusRead(fn, keyOf, label = 'keeper critical snapshot', { hfEmergency = false } = {}) {
+  async executeSnapshotConsensusRead(fn, keyOf, label = 'keeper critical snapshot', { hfEmergency = false, emergencyPositive } = {}) {
     return readSnapshotConsensus({
       entries: await this._authenticatedProviderEntries(),
       read: fn,
@@ -542,6 +542,7 @@ class RPCPool {
       withTimeout: (read) => this.withTimeout(read, RPC_READ_TIMEOUT_MS, label),
       allowSingle: this.providers.length === 1,
       allowLastSurvivor: hfEmergency,
+      emergencyPositive,
       configuredSourceCount: this.providers.length,
       label,
       errorCode: 'RPC_READ_QUORUM_UNAVAILABLE',
