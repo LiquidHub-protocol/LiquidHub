@@ -1,0 +1,16 @@
+{
+  "name": "liquidhub-bridge-keeper",
+  "version": "1.0.0",
+  "description": "Liquid Hub bridge keeper — earns USDC bounties by triggering Phase 2 cross-chain fee distribution to stakers",
+  "main": "src/keeper.js",
+  "scripts": {
+    "start": "node src/keeper.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.17.0"
+  },
+  "license": "MIT",
+  "private": true
+}

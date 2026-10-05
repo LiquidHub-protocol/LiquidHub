@@ -5,7 +5,7 @@
 async function readSnapshotConsensus({
     entries, read, keyOf, withTimeout, authenticate = async () => {},
     allowSingle = false, allowLastSurvivor = false, configuredSourceCount = entries.length,
-    label, errorCode, reduceValues, headLag = 1,
+    label, errorCode, reduceValues, headLag = 1, emergencyPositive,
     onEntryFailure = () => {}, onEntrySuccess = () => {},
 }) {
     if (typeof keyOf !== 'function') throw new Error(`${label}: consensus key function is required`);
@@ -43,6 +43,7 @@ async function readSnapshotConsensus({
     // may be used, with the same recent-header before/after checks below.
     const headQuorum = (allowSingle && entries.length === 1)
         || (allowLastSurvivor && configuredSourceCount >= 3 && heads.length === 1) ? 1 : 2;
+    let emergencyObservation = null;
     if (heads.length >= headQuorum) {
         // Start at/just behind the quorum head. A single outlier cannot pick a far
         // future/old block. One bounded fallback tolerates a more delayed source.
@@ -81,8 +82,28 @@ async function readSnapshotConsensus({
                     ? reduceValues(observations.filter(item => item.key === observation.key).map(item => item.value))
                     : observation.value;
             }
+            // Two authenticated premium sources must agree on the block hash,
+            // even when their Aave values disagree. A positive signal can then
+            // trigger only the exact atomic on-chain repair, never an ordinary
+            // hedge or a conclusion that repair is unnecessary.
+            if (emergencyPositive && observations.length >= 2) {
+                const byHash = new Map();
+                for (const observation of observations) {
+                    const hash = observation.key.split(':', 1)[0];
+                    const group = byHash.get(hash) || [];
+                    group.push(observation);
+                    byHash.set(hash, group);
+                }
+                for (const group of byHash.values()) {
+                    if (group.length >= 2) {
+                        const positive = group.find(item => emergencyPositive(item.value));
+                        if (positive) emergencyObservation = positive.value;
+                    }
+                }
+            }
         }
     }
+    if (emergencyObservation) return emergencyObservation;
     const error = new Error(`${label}: recent common-block RPC quorum unavailable or inconsistent`);
     error.code = errorCode;
     throw error;

@@ -256,7 +256,12 @@ async function main() {
         }
       }
 
-      await logPriceCacheBeforeDecision(rangeManager, rpcPool);
+      try {
+        await logPriceCacheBeforeDecision(rangeManager, rpcPool);
+      } catch (error) {
+        // This is only a diagnostic: on-chain action paths refresh the cache.
+        console.warn(`  priceCache diagnostic unavailable: ${error.message}`);
+      }
 
       let strategyState = await readStrategyState(rpcPool, rangeManager, strategyEngine);
       let { positions, decision, checkpointDue } = strategyState;

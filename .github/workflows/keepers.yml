@@ -26,6 +26,8 @@ jobs:
             directory: pools/UNI-ARB-WETH-USDC/keeper-bot
           - pool: delta-neutral
             directory: pools/UNI-ARB-WETH-USDC-DN/keeper-bot
+          - pool: bridge
+            directory: bridge/bridge-keeper
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

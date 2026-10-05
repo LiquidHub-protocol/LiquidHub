@@ -99,7 +99,10 @@ async function readLiveHfSafetyState(rpcPool, hedgeManager) {
   }, (state) => [
     state.poolAddress.toLowerCase(), state.debtBase, state.healthFactor,
     state.triggerBps, state.repairRequired,
-  ].map(String).join(':'), 'live HF safety state', { hfEmergency: true });
+  ].map(String).join(':'), 'live HF safety state', {
+    hfEmergency: true,
+    emergencyPositive: (state) => state.repairRequired === true,
+  });
 }
 
 async function assertHfRepairTopology(rpcPool, hedgeManager) {
@@ -533,7 +536,12 @@ async function main() {
         }
       }
 
-      await logPriceCacheBeforeDecision(rangeManager, rpcPool);
+      try {
+        await logPriceCacheBeforeDecision(rangeManager, rpcPool);
+      } catch (error) {
+        // This is only a diagnostic: on-chain action paths refresh the cache.
+        console.warn(`  priceCache diagnostic unavailable: ${error.message}`);
+      }
 
       let strategyState = await readStrategyState(rpcPool, rangeManager, strategyEngine);
       let { positions, decision, checkpointDue } = strategyState;
