@@ -765,6 +765,7 @@ function loadConfig() {
         // Same-chain distribution has no protocol bounty. Community operators
         // can opt in, while the main bot remains its funded fallback.
         unpaidSameChainDistribution: process.env.ENABLE_UNPAID_SAME_CHAIN_DISTRIBUTION === 'true',
+        sameChainMinUsdc: parseEnvNumber('BRIDGE_MIN_USDC', '50', 0),
         // Treasuries to monitor (read from TREASURIES env var, JSON-encoded).
         // Format: [{ "name": "LP Arbitrum", "address": "0x...", "usdc": "0x...", "chainId": 42161, "rpcUrls": ["https://..."] }, ...]
         treasuries: [],
@@ -1034,7 +1035,7 @@ async function processTreasury(t, cfg) {
     if (!state.bridgeEnabled) {
         if (!cfg.unpaidSameChainDistribution) return { skipped: 'unpaid_same_chain_not_enabled' };
         if (!state.stakingAddress || state.stakingAddress === ethers.ZeroAddress) return { skipped: 'no_staking_destination' };
-        const minimum = ethers.parseUnits('10', state.usdcDecimals);
+        const minimum = ethers.parseUnits(String(cfg.sameChainMinUsdc), state.usdcDecimals);
         if (state.bridgeable < minimum) return { skipped: 'insufficient_balance' };
         const receipt = await rpcPool.sendSigned(walletAddress, async provider => {
             const wallet = new ethers.Wallet(cfg.privateKey, provider);
@@ -1114,12 +1115,21 @@ async function processTreasury(t, cfg) {
             return { error: 'tx_reverted', message: `bridge transaction reverted: ${receipt.hash}` };
         }
         const bountyEarned = decodeBridgeBounty(receipt, treasuryParser, walletAddress);
-        if (bountyEarned > 0n) {
-            console.log(`${tag} ✅  Bounty earned: ${fmt(bountyEarned, state.usdcDecimals)} USDC (block ${receipt.blockNumber})`);
-            return { success: true, bounty: bountyEarned };
+        let guid = null;
+        for (const log of receipt.logs || []) {
+            if (String(log.address).toLowerCase() !== t.address.toLowerCase()) continue;
+            try {
+                const event = treasuryParser.parseLog(log);
+                if (event?.name === 'BridgedToStakers') guid = String(event.args.guid);
+            } catch { /* Another Treasury event. */ }
         }
-        console.log(`${tag} ✅  Bridge OK but no bounty paid (anti-drain conditions not met). Block ${receipt.blockNumber}`);
-        return { success: true, bounty: 0n };
+        if (!guid) throw new Error('Source receipt has no BridgedToStakers GUID; investigate before marking the source transfer');
+        if (bountyEarned > 0n) {
+            console.log(`${tag} Source confirmed, destination delivery pending: ${guid}; bounty ${fmt(bountyEarned, state.usdcDecimals)} USDC (block ${receipt.blockNumber})`);
+            return { success: true, sourceConfirmed: true, destinationConfirmed: false, guid, bounty: bountyEarned };
+        }
+        console.log(`${tag} Source confirmed, destination delivery pending: ${guid}; no bounty paid. Block ${receipt.blockNumber}`);
+        return { success: true, sourceConfirmed: true, destinationConfirmed: false, guid, bounty: 0n };
     }
 
     if (state.bridgeable >= minBridgeAmount) {

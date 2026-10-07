@@ -803,6 +803,19 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             msg.sender != owner() && msg.sender != botModule && msg.sender != address(rangeManager)
                 && msg.sender != emergencySafe
         ) revert E03();
+        if (msg.sender == emergencySafe) {
+            // The DN Vault is close to EIP-170. Query only this public getter
+            // without pulling in a full ABI call path; failure stays closed.
+            address module = botModule;
+            assembly ("memory-safe") {
+                mstore(0x00, shl(224, 0x891d2780)) // progressiveRebalanceStatus()
+                let ok := staticcall(gas(), module, 0x00, 0x04, 0x00, 0x20)
+                if iszero(and(and(ok, eq(returndatasize(), 0x20)), iszero(mload(0x00)))) {
+                    mstore(0x00, shl(224, 0x03df1f63)) // E32()
+                    revert(0x00, 0x04)
+                }
+            }
+        }
         _processingRebalance = false;
         _rebalanceStartedAt = 0;
     }
