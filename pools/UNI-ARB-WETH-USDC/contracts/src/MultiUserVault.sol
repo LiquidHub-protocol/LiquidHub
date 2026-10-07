@@ -65,6 +65,10 @@ interface IBotNav {
         returns (bool);
 }
 
+interface IProgressiveRebalanceStatus {
+    function progressiveRebalanceStatus() external view returns (uint8);
+}
+
 contract MultiUserVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -688,6 +692,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             msg.sender != owner() && msg.sender != botModule && msg.sender != address(rangeManager)
                 && msg.sender != emergencySafe
         ) revert OnlyOperationalExecutor();
+        if (msg.sender == emergencySafe) {
+            require(IProgressiveRebalanceStatus(botModule).progressiveRebalanceStatus() == 0, "Progressive active");
+        }
         _processingRebalance = false;
         _rebalanceStartedAt = 0;
     }
