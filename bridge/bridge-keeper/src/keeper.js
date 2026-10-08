@@ -759,6 +759,8 @@ function loadConfig() {
         // Maximum acceptable Stargate fee (in USD, evaluated against a live native/USD oracle).
         // Defaults to $5 to leave a margin over the typical $1–3 fee.
         maxStargateFeeUsd: parseEnvNumber('MAX_STARGATE_FEE_USD', '5', 0),
+        minBridgeNetUsd: parseEnvNumber('MIN_BRIDGE_NET_USD', '0.10', 0),
+        allowSubsidizedBridge: process.env.ALLOW_SUBSIDIZED_BRIDGE === 'true',
         maxGasPriceWei: readPositiveGweiEnv('KEEPER_MAX_GAS_PRICE_GWEI'),
         nativeOracleMaxAgeSec: parseIntEnv('NATIVE_ORACLE_MAX_AGE_SEC', '7200', 60),
         alertAfterCycles: parseIntEnv('ALERT_AFTER_CYCLES', '3', 1),
@@ -1075,7 +1077,7 @@ async function processTreasury(t, cfg) {
         });
         const fee = { native: BigInt(nativeFee), recv: BigInt(amountReceived) };
         let feeUsd = 0;
-        if (cfg.maxStargateFeeUsd > 0) {
+        if (cfg.maxStargateFeeUsd > 0 || !cfg.allowSubsidizedBridge) {
             const oracleAddress = nativeOracleAddress(t);
             if (!oracleAddress) throw new Error('Native/USD oracle required for cross-chain bridge fee');
             const nativeUsd = await rpcPool.execute((provider) =>
@@ -1100,6 +1102,11 @@ async function processTreasury(t, cfg) {
         if (cfg.maxStargateFeeUsd > 0 && estimate.feeUsd > cfg.maxStargateFeeUsd) {
             console.log(`${tag} ⏭  Stargate fee $${estimate.feeUsd.toFixed(2)} > cap $${cfg.maxStargateFeeUsd}, skipping`);
             return { skipped: 'fee_too_high' };
+        }
+        const bountyUsd = Number(ethers.formatUnits(state.bountyAmount, state.usdcDecimals));
+        if (!cfg.allowSubsidizedBridge && estimate.feeUsd + cfg.minBridgeNetUsd > bountyUsd) {
+            console.log(`${tag} ⏭  Bridge quote exceeds bounty after keeper reserve; voluntary subsidy requires ALLOW_SUBSIDIZED_BRIDGE=true`);
+            return { skipped: 'uneconomic_bridge' };
         }
         const walletBalance = await rpcPool.execute((provider) => provider.getBalance(walletAddress));
         if (walletBalance < estimate.fee.native * 2n) {

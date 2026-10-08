@@ -386,12 +386,12 @@ library RangeStrategyDnLib {
             return context;
         }
         context.hfRepairTriggerBps = hedge.hfRepairTriggerBps();
+        context.debtToken0 = hedge.getWethDebt();
         if (
             context.debtBase > 0 && context.hfRepairTriggerBps > 0
                 && context.healthFactorBps < context.hfRepairTriggerBps
         ) return context;
 
-        context.debtToken0 = hedge.getWethDebt();
         context.inventoryNormalizationPending = hedge.inventoryNormalizationPending();
         uint256 dust = hedge.donationDustToken0();
         uint256 idleHm = IERC20(token0).balanceOf(hedgeManager);

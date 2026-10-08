@@ -269,10 +269,10 @@ contract SecureBotModule {
     function beginProgressiveRebalance(bytes32 expectedDecisionHash) external {
         _requireCurrentModule();
         if (progressiveRebalanceStatus != 0) revert ProgressiveActive();
+        IRangeManagerPostCheck(rangeManager).refreshPriceCache();
         _requireProgressiveHfSafe();
         progressiveRebalanceStatus = 1;
         IProgressiveVault(vault).syncFeesForDeposits();
-        IRangeManagerPostCheck(rangeManager).refreshPriceCache();
         IRangeStrategyEngine.Decision memory decision = IRangeStrategyEngine(strategyEngine).previewDecision();
         if (decision.decisionHash != expectedDecisionHash) {
             revert ProgressiveDecisionMismatch();
@@ -347,12 +347,12 @@ contract SecureBotModule {
         _requireCurrentModule();
         if (progressiveRebalanceStatus != 0 && progressiveRebalanceStatus != 2) revert ProgressiveActive();
         if (!IProgressiveVault(vault).isRebalancing()) revert VaultNotRebalancing();
+        IRangeManagerPostCheck(rangeManager).refreshPriceCache();
         _requireProgressiveHfSafe();
         bool newCycle = progressiveRebalanceStatus == 0;
         progressiveRebalanceStatus = 3;
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
         if (rm.getOwnerPositions().length != 0) revert ProgressivePositionExists();
-        rm.refreshPriceCache();
         IRangeStrategyEngine.Decision memory decision =
             IRangeStrategyEngine(strategyEngine).validateDecision(expectedDecisionHash);
         if (decision.reason != IRangeStrategyEngine.ReasonCode.INITIAL_MINT_REQUIRED) {
@@ -382,10 +382,10 @@ contract SecureBotModule {
         if (progressiveRebalanceStatus != 2 || !IProgressiveVault(vault).isRebalancing()) {
             revert ProgressiveInactive();
         }
+        IRangeManagerPostCheck(rangeManager).refreshPriceCache();
         _requireProgressiveHfSafe();
         _requireCurrentProgressivePlan();
         progressiveRebalanceStatus = 3;
-        IRangeManagerPostCheck(rangeManager).refreshPriceCache();
         RangeOperations.OptimalSwapParams memory plan = _progressiveSwapParams();
         if (!plan.swapNeeded || amountIn == 0 || amountIn > plan.amountIn) revert InvalidProgressiveChunk();
         _consumeProgressiveSwapBudget(plan.zeroForOne, amountIn);
@@ -422,11 +422,11 @@ contract SecureBotModule {
         if (progressiveRebalanceStatus != 2 || !IProgressiveVault(vault).isRebalancing()) {
             revert ProgressiveInactive();
         }
+        IRangeManagerPostCheck(rangeManager).refreshPriceCache();
         _requireProgressiveHfSafe();
         _requireCurrentProgressivePlan();
         progressiveRebalanceStatus = 3;
         if (amountIn > 0) {
-            IRangeManagerPostCheck(rangeManager).refreshPriceCache();
             RangeOperations.OptimalSwapParams memory plan = _progressiveSwapParams();
             if (!plan.swapNeeded || amountIn > plan.amountIn) revert InvalidProgressiveChunk();
             _consumeProgressiveSwapBudget(plan.zeroForOne, amountIn);

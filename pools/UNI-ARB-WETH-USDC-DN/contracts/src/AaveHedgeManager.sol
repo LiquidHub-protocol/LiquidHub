@@ -656,10 +656,12 @@ contract AaveHedgeManager is ReentrancyGuard {
             }
             _flashLoanActive = false;
         }
-        if (!residualDeferred) _requireHfMin();
+        // With zero valued collateral, partial direct repayment lowers the
+        // debt even though Aave's HF remains zero until the debt is cleared.
+        if (!residualDeferred && hfBefore != 0) _requireHfMin();
         (, uint256 debtBaseAfter,,,, uint256 hfAfter) = pool.getUserAccountData(address(this));
-        if (debtBaseAfter >= debtBaseBefore || hfAfter <= hfBefore) revert BadHealthFactor();
-        uint256 debtRepaidBase = debtBaseBefore > debtBaseAfter ? debtBaseBefore - debtBaseAfter : 0;
+        if (debtBaseAfter >= debtBaseBefore || (hfBefore != 0 && hfAfter <= hfBefore)) revert BadHealthFactor();
+        uint256 debtRepaidBase = debtBaseBefore - debtBaseAfter;
         bool bountyEligible = debtRepaidBase >= uint256(hfRepairBountyMinUsd);
         if (bountyEligible && treasuryAddress != address(0)) {
             try IHedgeTreasury(treasuryAddress).payHedgeBounty(keeper) {} catch {}
