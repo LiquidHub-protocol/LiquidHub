@@ -695,7 +695,7 @@ class RPCPool {
     if (!this.signerWallet) throw new Error('KEEPER_PRIVATE_KEY is required to replace a pending transaction');
     const previous = ethers.Transaction.from(pending.rawTx);
     const entries = await this._authenticatedProviderEntries();
-    let feeData = pending.feeCapExempt === true ? await this._corroboratedFeeData(entries) : null;
+    let feeData = pending.feeCapExempt === true ? await this._corroboratedFeeData(entries, true) : null;
     for (const entry of entries) {
       if (feeData) break;
       feeData = await this.withTimeout(

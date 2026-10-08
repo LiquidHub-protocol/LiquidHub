@@ -93,6 +93,14 @@ class Rebalancer {
         await this._simulateRebalance(plan);
       } catch (firstError) {
         plan = null;
+        if (/e90/i.test(this._errorText(firstError)) && await this._ensureProgressivePriceCache()) {
+          const recoveredDecision = await this._readRangeDecision();
+          plan = await this._buildRebalancePlan(await this._readPriceCache(), recoveredDecision.decisionHash);
+          await this._simulateRebalance(plan);
+        }
+        if (plan) {
+          // Oracle recovered; continue with the same canonical plan below.
+        } else {
         const controlResult = this._rebalanceControlResult(firstError);
         if (controlResult) return controlResult;
 
@@ -118,6 +126,7 @@ class Rebalancer {
           const decision = await this._readRangeDecision();
           plan = await this._buildRebalancePlan(refreshed, decision.decisionHash);
           await this._simulateRebalance(plan);
+        }
         }
       }
 

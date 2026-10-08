@@ -205,7 +205,7 @@ library DnDepositLib {
         uint256 costBps = 10000 + uint256(swapSlippageBps) + premiumBps + 5;
         (uint256 collateralBase, uint256 debtBase,, uint256 liveThreshold,, uint256 hf) =
             IAavePoolDep(aavePool).getUserAccountData(address(this));
-        if (debtBase == 0 || collateralBase == 0 || liveThreshold == 0 || hf >= uint256(triggerHfBps) * 1e14) {
+        if (debtBase == 0 || hf >= uint256(triggerHfBps) * 1e14) {
             return (0, 0);
         }
 
@@ -214,6 +214,7 @@ library DnDepositLib {
         if (required <= protectedCollateral) return (0, 0);
 
         uint256 debtBalance = IERC20(debtToken).balanceOf(address(this));
+        if (debtBalance == 0) return (0, 0);
         uint256 directNeeded =
             Math.mulDiv(debtBalance, required - protectedCollateral, bufferedTarget * debtBase, Math.Rounding.Up);
         uint256 roundingBuffer = debtBalance / debtBase + 1;
@@ -229,7 +230,10 @@ library DnDepositLib {
             remainingDebtBalance -= directAmount;
         }
         required = bufferedTarget * remainingDebtBase;
-        if (required <= protectedCollateral || remainingDebtBase == 0) return (directAmount, 0);
+        // Zero collateral still permits an idle repayment, but not a flash leg.
+        if (required <= protectedCollateral || remainingDebtBase == 0 || protectedCollateral == 0) {
+            return (directAmount, 0);
+        }
 
         uint256 collateralCost = Math.mulDiv(uint256(liveThreshold), costBps, 10000, Math.Rounding.Up);
         if (bufferedTarget <= collateralCost) revert InvalidSwapPlan();

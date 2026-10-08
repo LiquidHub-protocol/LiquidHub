@@ -78,9 +78,17 @@ async function readSnapshotConsensus({
             for (const observation of observations) {
                 const count = (groups.get(observation.key) || 0) + 1;
                 groups.set(observation.key, count);
-                if (count >= quorum) return reduceValues
-                    ? reduceValues(observations.filter(item => item.key === observation.key).map(item => item.value))
-                    : observation.value;
+                if (count >= quorum) {
+                    const agreed = reduceValues
+                        ? reduceValues(observations.filter(item => item.key === observation.key).map(item => item.value))
+                        : observation.value;
+                    // One surviving premium may safely request an atomic,
+                    // on-chain guarded HF repair. Its negative answer is not
+                    // sufficient to certify that the position is healthy.
+                    if (allowLastSurvivor && configuredSourceCount >= 3 && quorum === 1
+                        && emergencyPositive && !emergencyPositive(agreed)) continue;
+                    return agreed;
+                }
             }
             // Two authenticated premium sources must agree on the block hash,
             // even when their Aave values disagree. A positive signal can then
