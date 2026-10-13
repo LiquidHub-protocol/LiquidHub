@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./AutonomousErrors.sol";
+import "./AutonomousPoolLib.sol";
+import "./ProtocolSafetyLib.sol";
 
 import "./RangeOperations.sol";
 import "./interfaces/IRangeStrategyEngine.sol";
@@ -95,16 +98,16 @@ contract SecureBotModule {
     address public immutable pauseController;
     address public immutable hedgeManager;
     address public immutable treasury;
-    address public owner;
-    address public pendingOwner;
+    address public immutable owner;
+    function pendingOwner() external pure returns (address) { return address(0); }
 
     // Sécurité renforcée
     mapping(bytes4 => bool) private _allowedFunctions;
     uint256 public dailyLimit;
     uint256 public dailySpent;
     uint256 public lastResetDay;
-    bool public paused;
-    bool public directExecution;
+    ProtocolSafetyLib.PauseState private _pauseState;
+    bool public constant directExecution = true;
     uint8 public progressiveRebalanceStatus;
     int24 public progressiveTickLower;
     int24 public progressiveTickUpper;
@@ -157,10 +160,8 @@ contract SecureBotModule {
         require(
             _safe != address(0) && _botAddress != address(0) && _rangeManager != address(0)
                 && _strategyEngine != address(0) && _strategyEngine.code.length > 0 && _vault != address(0)
-                && _pauseController != address(0) && _hedgeManager != address(0) && _treasury != address(0),
-            "E_ZERO"
-        );
-        require(_dailyLimit > 0 && _dailyLimit <= 1000, "E_LIMIT");
+                && _pauseController != address(0) && _hedgeManager != address(0) && _treasury != address(0), AutonomousCheck(0xa8e86b08));
+        require(_dailyLimit > 0 && _dailyLimit <= 1000, AutonomousCheck(0x30786559));
         safe = _safe;
         botAddress = _botAddress;
         rangeManager = _rangeManager;
@@ -177,7 +178,7 @@ contract SecureBotModule {
         // meme chemin. L'ancien chemin multi-tx burn/swap/mint/add n'est donc pas whitelisté par défaut.
         // Fonctions RangeManager
         // configurePriceFeeds (0x6509c2dd) RETIRÉ (audit V1) : repointage oracles = gouvernance
-        // (Safe Phase 1 / Timelock Phase 2).
+
         // Le bot rafraîchit le cache via refreshPriceCache() (ne change aucune adresse).
         _allowedFunctions[0x0be1c372] = true; // refreshPriceCache()
         _allowedFunctions[CHECKPOINT_SELECTOR] = true;
@@ -212,9 +213,12 @@ contract SecureBotModule {
         // closeAll (0xf6b32008) RETIRÉE (audit V1) : fonction d'URGENCE rare qui envoie TOUT
         // le hedge à un recipient → réservée à la Safe directe (jamais via le bot).
 
-        // Fonctions Treasury (bridge Stargate v2 vers staking contract Phase 2)
-        _allowedFunctions[0xa5599124] = true; // bridgeToStakers(uint256)
-        _allowedFunctions[0x56a12aca] = true; // distributeToStakers(uint256) - bridge treasury same-chain
+        _allowedFunctions[bytes4(keccak256("convertSourceFeeChunk(address,address,uint256)"))] = true;
+        _allowedFunctions[bytes4(keccak256("convertSourceFeesToUSDC(address,address)"))] = true;
+        _allowedFunctions[bytes4(keccak256("convertFeesToUSDC(address)"))] = true;
+        _allowedFunctions[bytes4(keccak256("wrapNativeFees()"))] = true;
+        _allowedFunctions[bytes4(keccak256("bridgeRevenue(uint256)"))] = true; // bridgeRevenue(uint256)
+        _allowedFunctions[bytes4(keccak256("forwardRevenue(uint256)"))] = true; // forwardRevenue(uint256) - bridge treasury same-chain
     }
 
     receive() external payable {}
@@ -224,6 +228,7 @@ contract SecureBotModule {
     /// @notice Collect and reinvest the matched balances on the existing NFT without changing Aave exposure.
     /// @dev Unmatched balances remain available to the next canonical maintenance/deposit; no independent hedge.
     function compound() external returns (uint256 investedUsdE8) {
+        AutonomousPoolLib.requireOperating(pauseController);
         _requireCurrentModule();
         if (progressiveRebalanceStatus != 0 || IProgressiveVault(vault).isRebalancing()) return 0;
         progressiveRebalanceStatus = 3;
@@ -267,6 +272,7 @@ contract SecureBotModule {
 
     /// @notice Permissionless high-TVL path, independent from the hot-bot pause and fully bounded on-chain.
     function beginProgressiveRebalance(bytes32 expectedDecisionHash) external {
+        AutonomousPoolLib.requireOperating(pauseController);
         _requireCurrentModule();
         if (progressiveRebalanceStatus != 0) revert ProgressiveActive();
         IRangeManagerPostCheck(rangeManager).refreshPriceCache();
@@ -299,7 +305,7 @@ contract SecureBotModule {
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
         RangeOperations.OptimalSwapParams memory plan = rm.getOptimalSwapParams();
         (budgetUsdE8, reverseBudgetUsdE8, zeroForOne) = _progressivePlanBudget(plan);
-        require(plan.swapNeeded && budgetUsdE8 - reverseBudgetUsdE8 > rm.initMultiSwapTvl() * 1e8, "Use atomic");
+        require(plan.swapNeeded && budgetUsdE8 - reverseBudgetUsdE8 > rm.initMultiSwapTvl() * 1e8, AutonomousCheck(0xa2c7ce0c));
     }
 
     function _progressiveCache() private view returns (RangeOperations.PriceCache memory cache) {
@@ -340,6 +346,7 @@ contract SecureBotModule {
     /// @dev A later epoch may renew the plan budget, never the total cycle turnover cap. A newly
     ///      governed module may recover an already locked Vault whose old NFT has been burned.
     function refreshProgressiveRebalance(bytes32 expectedDecisionHash) external {
+        AutonomousPoolLib.requireOperating(pauseController);
         _refreshProgressiveRebalance(expectedDecisionHash, false);
     }
 
@@ -378,6 +385,7 @@ contract SecureBotModule {
     }
 
     function continueProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
+        AutonomousPoolLib.requireOperating(pauseController);
         _requireCurrentModule();
         if (progressiveRebalanceStatus != 2 || !IProgressiveVault(vault).isRebalancing()) {
             revert ProgressiveInactive();
@@ -418,6 +426,7 @@ contract SecureBotModule {
     }
 
     function finalizeProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
+        AutonomousPoolLib.requireOperating(pauseController);
         _requireCurrentModule();
         if (progressiveRebalanceStatus != 2 || !IProgressiveVault(vault).isRebalancing()) {
             revert ProgressiveInactive();
@@ -468,11 +477,11 @@ contract SecureBotModule {
         uint256 amountUsdE8 = Math.mulDiv(
             amountIn, zeroForOne ? price0 : price1, 10 ** (zeroForOne ? cfg.token0Decimals : cfg.token1Decimals)
         );
-        require(amountUsdE8 > 0 && amountUsdE8 <= progressiveSwapBudgetUsdE8, "Cycle budget");
-        require(amountUsdE8 <= progressiveCycleBudgetUsdE8, "Turnover budget");
+        require(amountUsdE8 > 0 && amountUsdE8 <= progressiveSwapBudgetUsdE8, AutonomousCheck(0xbfc64720));
+        require(amountUsdE8 <= progressiveCycleBudgetUsdE8, AutonomousCheck(0x9c1914ff));
         progressiveCycleBudgetUsdE8 -= amountUsdE8;
         if (zeroForOne != progressiveInitialZeroForOne) {
-            require(amountUsdE8 <= progressiveReverseBudgetUsdE8, "Reverse budget");
+            require(amountUsdE8 <= progressiveReverseBudgetUsdE8, AutonomousCheck(0xdcf7e188));
             progressiveReverseBudgetUsdE8 -= amountUsdE8;
         }
         progressiveSwapBudgetUsdE8 -= amountUsdE8;
@@ -482,14 +491,20 @@ contract SecureBotModule {
         IProgressiveHedgeGuard hedge = IProgressiveHedgeGuard(hedgeManager);
         (, uint256 debt, uint256 healthFactor,) = hedge.getHedgeData();
         if (debt == 0) return;
-        require(healthFactor >= uint256(hedge.hfRepairTriggerBps()) * 1e14, "HF repair");
+        require(healthFactor >= uint256(hedge.hfRepairTriggerBps()) * 1e14, AutonomousCheck(0xcf45dc37));
     }
 
     /// @notice Safe recovery renews the bounded cycle using the current canonical range.
     /// @dev If balancing is still needed the Vault stays locked and keepers resume the refreshed plan.
     ///      A no-swap recovery remints atomically through the normal finalization path before unlocking.
     function cancelProgressiveRebalance() external {
-        require(msg.sender == safe && progressiveRebalanceStatus == 2, "Only Safe");
+        require(msg.sender == owner && progressiveRebalanceStatus == 2, AutonomousCheck(0x78a71317));
+        if (IRecoveryPause(pauseController).exitOnly()) {
+            require(IRangeManagerPostCheck(rangeManager).getOwnerPositions().length == 0, "Close positions first");
+            bytes32 stopped = progressiveDecisionHash; _clearProgressiveRebalance();
+            IProgressiveVault(vault).endRebalance(); emit ProgressiveRebalanceCancelled(stopped, msg.sender); return;
+        }
+        ProtocolSafetyLib.requireEmergency(vault);
         IProgressiveStrategy engine = IProgressiveStrategy(strategyEngine);
         if (engine.checkpointDue()) engine.checkpointMarketState();
         bytes32 decisionHash = IRangeStrategyEngine(strategyEngine).previewDecision().decisionHash;
@@ -505,7 +520,7 @@ contract SecureBotModule {
     }
 
     function _requireCurrentModule() private view {
-        require(IRangeManagerPostCheck(rangeManager).protocolBotAddress() == address(this), "Retired module");
+        require(IRangeManagerPostCheck(rangeManager).protocolBotAddress() == address(this), AutonomousCheck(0xe840bfef));
     }
 
     /// @notice LP/free RangeManager NAV reconstructed at the Chainlink token ratio (USD, 8 decimals).
@@ -514,7 +529,7 @@ contract SecureBotModule {
     function getOracleLpValueUsd() external view returns (uint256 valueUsd) {
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
         (uint128 price0, uint128 price1,,, uint64 timestamp, bool valid) = rm.priceCache();
-        require(price0 > 0 && price1 > 0 && (valid || timestamp == uint64(block.timestamp)), "E_NAV");
+        require(price0 > 0 && price1 > 0 && (valid || timestamp == uint64(block.timestamp)), AutonomousCheck(0x17270318));
         RangeOperations.RangeConfig memory cfg = rm.config();
         uint160 oracleSqrt = _oracleSqrtPrice(price0, price1, cfg.token0Decimals, cfg.token1Decimals);
         (uint256 balance0, uint256 balance1) = _balancesAtPrice(rm, oracleSqrt);
@@ -541,7 +556,7 @@ contract SecureBotModule {
         uint256 ratioX192 =
             Math.mulDiv(uint256(price0) * (10 ** dec1), uint256(1) << 192, uint256(price1) * (10 ** dec0));
         uint256 sqrtPriceX96 = Math.sqrt(ratioX192);
-        require(sqrtPriceX96 > 0 && sqrtPriceX96 <= type(uint160).max, "E_RATIO");
+        require(sqrtPriceX96 > 0 && sqrtPriceX96 <= type(uint160).max, AutonomousCheck(0x509120d6));
         return uint160(sqrtPriceX96);
     }
 
@@ -553,7 +568,7 @@ contract SecureBotModule {
         balance0 = IERC20Sweep(rm.token0()).balanceOf(rangeManager);
         balance1 = IERC20Sweep(rm.token1()).balanceOf(rangeManager);
         uint256[] memory positions = rm.getOwnerPositions();
-        require(positions.length <= 1, "E_POS");
+        require(positions.length <= 1, AutonomousCheck(0x4b08c5a7));
         if (positions.length == 0) return (balance0, balance1);
 
         (,,,,, int24 tickLower, int24 tickUpper, uint128 liquidity,,, uint128 owed0, uint128 owed1) =
@@ -582,14 +597,14 @@ contract SecureBotModule {
     }
 
     modifier onlyBot() {
-        require(msg.sender == botAddress, "Only bot allowed");
-        if (paused) revert ModulePaused();
+        require(msg.sender == botAddress, AutonomousCheck(0xa33c1783));
+        if (paused()) revert ModulePaused();
         _requireCurrentModule();
         _;
     }
 
     modifier onlyBotAddress() {
-        require(msg.sender == botAddress, "Only bot allowed");
+        require(msg.sender == botAddress, AutonomousCheck(0xa33c1783));
         _requireCurrentModule();
         _;
     }
@@ -602,7 +617,7 @@ contract SecureBotModule {
     modifier onlyAllowedFunction(bytes calldata data) {
         if (data.length < 4) revert InvalidCallData();
         bytes4 selector = bytes4(data[:4]);
-        require(_allowedFunctions[selector], "Function not allowed");
+        require(_allowedFunctions[selector], AutonomousCheck(0x50290082));
         _;
     }
 
@@ -615,7 +630,7 @@ contract SecureBotModule {
     ///      que executeVaultFunction puisse l'appeler conditionnellement (exemption endRebalance).
     function _consumeDailyLimit() private {
         _resetDailyCounterIfNeeded();
-        require(dailySpent < dailyLimit, "Daily limit exceeded");
+        require(dailySpent < dailyLimit, AutonomousCheck(0xf8773246));
         dailySpent++;
     }
 
@@ -679,8 +694,8 @@ contract SecureBotModule {
         bytes4 selector = bytes4(data[:4]);
         if (selector != ADJUST_HEDGE_SELECTOR && selector != REPAIR_HF_SELECTOR) revert InvalidTarget();
         if (data.length != 4) revert InvalidCallData();
-        require(_allowedFunctions[selector], "Function not allowed");
-        if (selector == ADJUST_HEDGE_SELECTOR && paused) revert ModulePaused();
+        require(_allowedFunctions[selector], AutonomousCheck(0x50290082));
+        if (selector == ADJUST_HEDGE_SELECTOR && paused()) revert ModulePaused();
         _execute(hedgeManager, 0, data);
 
         emit FunctionExecuted(selector, dailySpent);
@@ -688,7 +703,7 @@ contract SecureBotModule {
 
     /// @notice Execute a Treasury function (bridge operations only, per whitelist)
     function executeTreasuryFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) withinDailyLimit {
-        if (paused) revert ModulePaused();
+        if (paused()) revert ModulePaused();
         _execute(treasury, 0, data);
 
         bytes4 selector = bytes4(data[:4]);
@@ -696,7 +711,7 @@ contract SecureBotModule {
     }
 
     /// @notice Execute a Treasury function with native ETH value (Stargate cross-chain fees)
-    /// @dev Phase 1: forwards ETH to Safe, then Safe calls Treasury. Phase 2: module calls Treasury directly.
+
     function executeTreasuryFunctionWithValue(bytes calldata data, uint256 value)
         external
         payable
@@ -704,8 +719,8 @@ contract SecureBotModule {
         onlyAllowedFunction(data)
         withinDailyLimit
     {
-        if (paused) revert ModulePaused();
-        require(msg.value == value, "Invalid ETH value");
+        if (paused()) revert ModulePaused();
+        require(msg.value == value, AutonomousCheck(0x23a54c99));
 
         uint256 nativeBefore = address(this).balance - msg.value;
         (address refundToken, uint256 tokenBefore) = _treasuryUsdcBalance();
@@ -713,7 +728,7 @@ contract SecureBotModule {
         if (directExecution && address(this).balance > nativeBefore) {
             uint256 refund = address(this).balance - nativeBefore;
             (bool ok,) = botAddress.call{value: refund}("");
-            require(ok, "Refund failed");
+            require(ok, AutonomousCheck(0xcef6850b));
             emit ModuleSweep(address(0), refund);
         }
         _sweepTreasuryUsdcToBot(refundToken, tokenBefore);
@@ -724,100 +739,70 @@ contract SecureBotModule {
 
     // Fonctions d'administration (appelées par la Safe)
     function allowFunction(bytes4 selector, bool allowed) external onlyOwner {
-        require(_isCoreSelector(selector), "Selector not core");
-        require(selector != REPAIR_HF_SELECTOR || allowed, "HF repair required");
+        AutonomousPoolLib.requireInstallation(vault);
+        require(_isCoreSelector(selector), AutonomousCheck(0xfac078d3));
+        require(selector != REPAIR_HF_SELECTOR || allowed, AutonomousCheck(0x089ab8a5));
         _allowedFunctions[selector] = allowed;
         emit FunctionAllowed(selector, allowed);
     }
 
     function setDailyLimit(uint256 newLimit) external onlyOwner {
-        require(newLimit > 0 && newLimit <= 1000, "Invalid limit");
+        AutonomousPoolLib.requireInstallation(vault);
+        require(newLimit > 0 && newLimit <= 1000, AutonomousCheck(0xb08174c0));
         uint256 currentDay = block.timestamp / 86400;
         uint256 actualSpent = (currentDay == lastResetDay) ? dailySpent : 0;
-        require(newLimit >= actualSpent, "Below spent");
+        require(newLimit >= actualSpent, AutonomousCheck(0x08620a89));
         dailyLimit = newLimit;
         emit DailyLimitUpdated(newLimit);
     }
 
     /// @notice Pause d'urgence du module.
-    /// @dev En Phase 2, owner devient le timelock mais la Safe immutable reste guardian d'urgence.
+
     function setPaused(bool _paused) external {
         if (msg.sender != owner && msg.sender != safe) revert UnauthorizedOwner();
-        if (msg.sender == safe && msg.sender != owner) require(_paused, "Safe pause only");
-        paused = _paused;
+        ProtocolSafetyLib.setPause(_pauseState, owner, _paused);
         emit Paused(_paused);
     }
 
-    /// @notice Phase 2 switch. false = Gnosis Safe module execution; true = direct module execution.
-    function setDirectExecution(bool enabled) external onlyOwner {
-        directExecution = enabled;
-        emit DirectExecutionUpdated(enabled);
+    function pauseFor(uint64 duration) external onlyOwner {
+        ProtocolSafetyLib.setPauseFor(_pauseState, safe, duration); emit Paused(true);
+    }
+    function guardianPauseUntil() external view returns (uint64) { return _pauseState.until; }
+
+    function paused() public view returns (bool) {
+        return _pauseState.active && block.timestamp < _pauseState.until;
     }
 
-    function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "Invalid address");
-        pendingOwner = newOwner;
-        emit OwnershipTransferStarted(owner, newOwner);
-    }
 
-    function acceptOwnership() external {
-        require(msg.sender == pendingOwner, "Only pending owner");
-        address oldOwner = owner;
-        owner = pendingOwner;
-        pendingOwner = address(0);
-        emit OwnershipTransferred(oldOwner, owner);
-    }
+
+
+
+
 
     function sweepNativeToSafe() external {
-        if (msg.sender != owner && msg.sender != safe) revert UnauthorizedOwner();
-        uint256 amount = address(this).balance;
-        require(amount > 0, "No balance");
-        (bool ok,) = safe.call{value: amount}("");
-        require(ok, "Sweep failed");
+        if (msg.sender != owner) revert UnauthorizedOwner();
+        uint256 amount = ProtocolSafetyLib.sweep(address(0), treasury);
         emit ModuleSweep(address(0), amount);
     }
 
     function sweepTokenToSafe(address token) external {
-        if (msg.sender != owner && msg.sender != safe) revert UnauthorizedOwner();
-        uint256 amount = IERC20Sweep(token).balanceOf(address(this));
-        require(amount > 0, "No balance");
-        _safeTransfer(token, safe, amount);
+        if (msg.sender != owner) revert UnauthorizedOwner();
+        uint256 amount = ProtocolSafetyLib.sweep(token, treasury);
         emit ModuleSweep(token, amount);
     }
 
     function _treasuryUsdcBalance() private view returns (address token, uint256 balance) {
-        (bool ok, bytes memory ret) = treasury.staticcall(abi.encodeWithSignature("usdc()"));
-        if (!ok || ret.length < 32) return (address(0), 0);
-        token = abi.decode(ret, (address));
-        balance = IERC20Sweep(token).balanceOf(address(this));
+        return ProtocolSafetyLib.bountyBalance(treasury);
     }
 
     function _sweepTreasuryUsdcToBot(address token, uint256 balanceBefore) private {
-        if (token == address(0)) return;
-        uint256 balance = IERC20Sweep(token).balanceOf(address(this));
-        uint256 amount = balance > balanceBefore ? balance - balanceBefore : 0;
-        if (amount == 0) return;
-        _safeTransfer(token, botAddress, amount);
-        emit ModuleSweep(token, amount);
-    }
-
-    function _safeTransfer(address token, address to, uint256 amount) private {
-        (bool ok, bytes memory ret) = token.call(abi.encodeWithSelector(IERC20Sweep.transfer.selector, to, amount));
-        require(ok && (ret.length == 0 || (ret.length >= 32 && abi.decode(ret, (bool)))), "Sweep failed");
+        uint256 amount = ProtocolSafetyLib.sweepBountyDelta(treasury, botAddress, token, balanceBefore);
+        if (amount > 0) emit ModuleSweep(token, amount);
     }
 
     function _execute(address target, uint256 value, bytes memory data) private {
-        if (directExecution) {
-            (bool success, bytes memory reason) = target.call{value: value}(data);
-            if (!success) _revertWithReason(reason);
-        } else {
-            if (value > 0) {
-                (bool sent,) = safe.call{value: value}("");
-                require(sent, "ETH transfer to Safe failed");
-            }
-            bool success = ISafe(safe).execTransactionFromModule(target, value, data, 0);
-            require(success, "Execution failed");
-        }
+        (bool success, bytes memory reason) = target.call{value: value}(data);
+        if (!success) _revertWithReason(reason);
     }
 
     function _revertWithReason(bytes memory reason) private pure {
@@ -851,7 +836,7 @@ contract SecureBotModule {
         if (
             selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
         ) {
-            if (paused) revert ModulePaused();
+            if (paused()) revert ModulePaused();
             address controller = pauseController;
             // Yul shl order is shl(shift, value): left-align requireInflowsActive().
             assembly ("memory-safe") {
@@ -868,7 +853,11 @@ contract SecureBotModule {
         return selector == 0x0be1c372 // refreshPriceCache()
             || selector == CHECKPOINT_SELECTOR || selector == REBALANCE_SELECTOR || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
             || selector == 0x0040718e // endRebalance()
-            || selector == ADJUST_HEDGE_SELECTOR || selector == REPAIR_HF_SELECTOR || selector == 0xa5599124 // bridgeToStakers(uint256)
-            || selector == 0x56a12aca; // distributeToStakers(uint256)
+            || selector == ADJUST_HEDGE_SELECTOR || selector == REPAIR_HF_SELECTOR || selector == bytes4(keccak256("bridgeRevenue(uint256)")) // bridgeRevenue(uint256)
+            || selector == bytes4(keccak256("forwardRevenue(uint256)"))
+            || selector == bytes4(keccak256("convertSourceFeesToUSDC(address,address)"))
+            || selector == bytes4(keccak256("convertSourceFeeChunk(address,address,uint256)"))
+            || selector == bytes4(keccak256("convertFeesToUSDC(address)"))
+            || selector == bytes4(keccak256("wrapNativeFees()")); // forwardRevenue(uint256)
     }
 }

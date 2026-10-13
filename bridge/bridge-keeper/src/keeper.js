@@ -3,10 +3,10 @@ const { durableWriteFileSync, durableUnlinkSync } = require('./durable-file');
 // SPDX-License-Identifier: MIT
 
 /**
- * Liquid Hub — Bridge Keeper Bot (Phase 2)
+ * Liquid Hub — Autonomous Treasury Keeper
  *
- * Triggers bridgeToStakers() on Liquid Hub Treasury contracts when:
- *   - Phase 2 is active (bridgeEnabled + bridgeBountyEnabled)
+ * Triggers bridgeRevenue() on Liquid Hub Treasury contracts when:
+ *   - the installed bridge is enabled
  *   - The cooldown since the last paid bounty has elapsed
  *   - The Treasury holds enough USDC to satisfy the minRatio safeguard
  *   - The Stargate cross-chain fee is below the configured cap, using a live native/USD oracle
@@ -38,13 +38,18 @@ class ConfirmedTransactionRevert extends Error {}
 
 
 // ===== ABI =====
+const { REVENUE_CONVERSION_ABI, prepareFeeConversion, prepareNativeWrap } = require("./revenue-maintenance");
 const TREASURY_ABI = [
+    ...REVENUE_CONVERSION_ABI,
     'function usdc() view returns (address)',
-    'function adminWithdrawEnabled() view returns (bool)',
+    'function previewFeeConversion(address) view returns (uint256 amountIn,uint256 minOut,uint64 nextAt)',
+    'function previewSourceFeeConversion(address,address) view returns (uint256 amountIn,uint256 minOut,uint64 nextAt)',
+    'function convertSourceFeesToUSDC(address,address) returns (uint256)',
+    'function convertFeesToUSDC(address) returns (uint256)',
     'function bridgeEnabled() view returns (bool)',
     'function bridgeDestinationEid() view returns (uint32)',
     'function bridgeDestinationAddress() view returns (address)',
-    'function stakingRewardsAddress() view returns (address)',
+    'function revenueDestination() view returns (address)',
     'function bridgeBountyEnabled() view returns (bool)',
     'function bridgeBountyAmount() view returns (uint256)',
     'function bridgeBountyCooldown() view returns (uint64)',
@@ -52,10 +57,10 @@ const TREASURY_ABI = [
     'function bridgeBountyMinRatio() view returns (uint16)',
     'function bridgeableUsdc() view returns (uint256)',
     'function estimateBridgeFee(uint256 amount) view returns (uint256 nativeFee, uint256 amountReceived)',
-    'function bridgeToStakers(uint256 amount) payable',
-    'function distributeToStakers(uint256 amount)',
+    'function bridgeRevenue(uint256 amount) payable',
+    'function forwardRevenue(uint256 amount)',
     'event BridgeBountyPaid(address indexed keeper, uint256 amount)',
-    'event BridgedToStakers(uint256 amountSent, uint256 amountReceived, uint32 dstEid, bytes32 guid)',
+    'event RevenueBridged(uint256 amountSent, uint256 amountReceived, uint32 dstEid, bytes32 guid)',
 ];
 
 const ERC20_ABI = [
@@ -766,12 +771,19 @@ function loadConfig() {
         alertAfterCycles: parseIntEnv('ALERT_AFTER_CYCLES', '3', 1),
         // Same-chain distribution has no protocol bounty. Community operators
         // can opt in, while the main bot remains its funded fallback.
+        enableUnpaidFeeConversions: process.env.ENABLE_UNPAID_FEE_CONVERSIONS !== 'false',
+        conversionMaxGas: 300_000n,
         unpaidSameChainDistribution: process.env.ENABLE_UNPAID_SAME_CHAIN_DISTRIBUTION === 'true',
         sameChainMinUsdc: parseEnvNumber('BRIDGE_MIN_USDC', '50', 0),
         // Treasuries to monitor (read from TREASURIES env var, JSON-encoded).
         // Format: [{ "name": "LP Arbitrum", "address": "0x...", "usdc": "0x...", "chainId": 42161, "rpcUrls": ["https://..."] }, ...]
         treasuries: [],
     };
+
+    if (process.env.ENABLE_UNPAID_FEE_CONVERSIONS
+        && !['true', 'false'].includes(process.env.ENABLE_UNPAID_FEE_CONVERSIONS)) {
+        throw new Error('ENABLE_UNPAID_FEE_CONVERSIONS must be true or false');
+    }
 
     if (process.env.ENABLE_UNPAID_SAME_CHAIN_DISTRIBUTION
         && !['true', 'false'].includes(process.env.ENABLE_UNPAID_SAME_CHAIN_DISTRIBUTION)) {
@@ -801,13 +813,19 @@ function loadConfig() {
         if (!Number.isInteger(Number(t.chainId)) || Number(t.chainId) <= 0) {
             throw new Error(`Treasury ${t.name || t.address} has invalid chainId`);
         }
+        if (t.conversions !== undefined) {
+            if (!Array.isArray(t.conversions)) throw new Error('conversions must be a source/token array');
+            t.conversions = t.conversions.map(({ source, token }) => ({ source: ethers.getAddress(source), token: ethers.getAddress(token) }));
+            if (t.conversions.some(x => x.source === ethers.ZeroAddress || x.token === ethers.ZeroAddress || x.token === ethers.getAddress(t.usdc))) throw new Error('invalid source conversion');
+        }
         // A same-chain distribution has no Stargate native fee; its Treasury
         // need not configure a native/USD oracle. The cross-chain path checks it.
-        if ((t.tokens || []).length > 0) {
-            throw new Error(
-                `Treasury ${t.name || t.address}: token conversion is governance-only; ` +
-                'remove tokens from TREASURIES and call swapToUSDC through the Safe/timelock first'
-            );
+        if (t.tokens !== undefined) {
+            if (!Array.isArray(t.tokens)) throw new Error('tokens must be an array of token addresses (native placeholder allowed)');
+            t.tokens = [...new Set(t.tokens.map(token => ethers.getAddress(token)))];
+            if (t.tokens.some(token => token === ethers.ZeroAddress || token === ethers.getAddress(t.usdc))) {
+                throw new Error('conversion tokens must exclude zero and USDC');
+            }
         }
     }
     return cfg;
@@ -981,7 +999,6 @@ async function processTreasury(t, cfg) {
             const treasuryUsdc = authenticateTreasuryUsdc(t.usdc, await treasury.usdc());
             const usdc = new ethers.Contract(treasuryUsdc, ERC20_ABI, provider);
             return await Promise.all([
-                treasury.adminWithdrawEnabled(),
                 treasury.bridgeEnabled(),
                 treasury.bridgeBountyEnabled(),
                 treasury.bridgeBountyAmount(),
@@ -992,21 +1009,20 @@ async function processTreasury(t, cfg) {
                 treasury.bridgeDestinationAddress(),
                 usdc.balanceOf(t.address),
                 usdc.decimals(),
-                treasury.stakingRewardsAddress(),
+                treasury.revenueDestination(),
             ]);
         });
         const [
-            adminEnabled, bridgeEnabled, bridgeBountyEnabled,
+            bridgeEnabled, bridgeBountyEnabled,
             bountyAmount, cooldown, lastAt, minRatio,
-            destEid, destAddr, usdcBalance, usdcDecimals, stakingAddress,
+            destEid, destAddr, usdcBalance, usdcDecimals, revenueAddress,
         ] = values;
         state = {
-            phase: adminEnabled ? 1 : 2,
             bridgeEnabled, bridgeBountyEnabled,
             bountyAmount: BigInt(bountyAmount), cooldown: Number(cooldown),
             lastAt: Number(lastAt), minRatio: Number(minRatio),
             destEid: Number(destEid), destAddr,
-            stakingAddress,
+            revenueAddress,
             usdcBalance: BigInt(usdcBalance),
             usdcDecimals: Number(usdcDecimals),
         };
@@ -1014,6 +1030,49 @@ async function processTreasury(t, cfg) {
         const message = safeErrorMessage(e);
         console.log(`${tag} ⚠  Read failed: ${message}`);
         return { error: 'read_failed', message };
+    }
+
+    // Conversion is a separate, explicitly subsidized action with a fixed on-chain route.
+    // Failure of one optional conversion must not stop bridging already available USDC.
+    if (cfg.enableUnpaidFeeConversions) {
+        const conversions = [...(t.tokens || []).map(token => ({ token, source: null })), ...(t.conversions || [])];
+        try {
+            const native=await rpcPool.execute(provider=>prepareNativeWrap(
+                new ethers.Contract(t.address,TREASURY_ABI,provider),provider,walletAddress,cfg.conversionMaxGas));
+            if(native) {
+                const receipt=await rpcPool.sendSigned(walletAddress,async provider=>({
+                    wallet:new ethers.Wallet(cfg.privateKey,provider),request:native.request,
+                }),`${tag} native fee wrapping`);
+                if(receipt.status!==1)throw new Error('Native wrap reverted');
+                conversions.push({source:t.address,token:native.token});
+            }
+        } catch(error) {
+            if(error.code==='KEEPER_STATE_REFRESH_REQUIRED'||rpcPool._readPendingSignedTx?.())return {error:'conversion_reconciliation_required'};
+            console.log(`${tag} Native wrap deferred: ${safeErrorMessage(error)}`); }
+        for (const { token, source } of conversions) {
+            try {
+                const selected = await rpcPool.execute(async provider => {
+                    const treasury = new ethers.Contract(t.address, TREASURY_ABI, provider);
+                    // Pool direct receipts use the Treasury's root source. Swap
+                    // Treasuries use their native, single-source chunk entry.
+                    const poolTreasury = await provider.call({ to: t.address,
+                        data: new ethers.Interface(['function sourceOf(address) view returns (address)']).encodeFunctionData('sourceOf', [t.address]) })
+                        .then(() => true).catch(() => false);
+                    return await prepareFeeConversion(treasury, provider, walletAddress,
+                        { token, source: source || (poolTreasury ? t.address : null) }, cfg.conversionMaxGas);
+                });
+                if (!selected) continue;
+                const receipt = await rpcPool.sendSigned(walletAddress, async provider => {
+                    const wallet = new ethers.Wallet(cfg.privateKey, provider);
+                    return { wallet, request: selected.request };
+                }, `${tag} fee conversion`);
+                if (receipt.status !== 1) throw new Error('Fee conversion reverted');
+                console.log(`${tag} Fixed-route fee conversion confirmed`);
+            } catch (error) {
+                if(error.code==='KEEPER_STATE_REFRESH_REQUIRED'||rpcPool._readPendingSignedTx?.())return {error:'conversion_reconciliation_required'};
+                console.log(`${tag} Fee conversion skipped: ${safeErrorMessage(error)}`);
+            }
+        }
     }
 
     try {
@@ -1026,24 +1085,21 @@ async function processTreasury(t, cfg) {
         console.log(`${tag} ⚠  ${message}`);
         return { error: 'bridgeable_read_failed', message };
     }
-    console.log(`${tag} phase=${state.phase} bridgeEnabled=${state.bridgeEnabled} bountyEnabled=${state.bridgeBountyEnabled}`);
+    console.log(`${tag} bridgeEnabled=${state.bridgeEnabled} bountyEnabled=${state.bridgeBountyEnabled}`);
     console.log(`${tag} usdcBalance=${fmt(state.usdcBalance, state.usdcDecimals)} bridgeable=${fmt(state.bridgeable, state.usdcDecimals)} bounty=${fmt(state.bountyAmount, state.usdcDecimals)} cooldown=${state.cooldown}s minRatio=${state.minRatio}×`);
 
     // 2. Eligibility checks (mirror the on-chain anti-drain logic)
-    if (state.phase !== 2) {
-        console.log(`${tag} ⏭  Treasury still in Phase 1, no bridge yet`);
-        return { skipped: 'phase_1' };
-    }
+
     if (!state.bridgeEnabled) {
         if (!cfg.unpaidSameChainDistribution) return { skipped: 'unpaid_same_chain_not_enabled' };
-        if (!state.stakingAddress || state.stakingAddress === ethers.ZeroAddress) return { skipped: 'no_staking_destination' };
+        if (!state.revenueAddress || state.revenueAddress === ethers.ZeroAddress) return { skipped: 'no_revenue_destination' };
         const minimum = ethers.parseUnits(String(cfg.sameChainMinUsdc), state.usdcDecimals);
         if (state.bridgeable < minimum) return { skipped: 'insufficient_balance' };
         const receipt = await rpcPool.sendSigned(walletAddress, async provider => {
             const wallet = new ethers.Wallet(cfg.privateKey, provider);
             const treasury = new ethers.Contract(t.address, TREASURY_ABI, wallet);
-            return { wallet, request: await treasury.distributeToStakers.populateTransaction(state.bridgeable) };
-        }, `${tag} distributeToStakers`);
+            return { wallet, request: await treasury.forwardRevenue.populateTransaction(state.bridgeable) };
+        }, `${tag} forwardRevenue`);
         if (receipt.status !== 1) return { error: 'tx_reverted', message: 'same-chain distribution reverted' };
         return { success: true, bounty: 0n };
     }
@@ -1127,10 +1183,10 @@ async function processTreasury(t, cfg) {
             if (String(log.address).toLowerCase() !== t.address.toLowerCase()) continue;
             try {
                 const event = treasuryParser.parseLog(log);
-                if (event?.name === 'BridgedToStakers') guid = String(event.args.guid);
+                if (event?.name === 'RevenueBridged') guid = String(event.args.guid);
             } catch { /* Another Treasury event. */ }
         }
-        if (!guid) throw new Error('Source receipt has no BridgedToStakers GUID; investigate before marking the source transfer');
+        if (!guid) throw new Error('Source receipt has no RevenueBridged GUID; investigate before marking the source transfer');
         if (bountyEarned > 0n) {
             console.log(`${tag} Source confirmed, destination delivery pending: ${guid}; bounty ${fmt(bountyEarned, state.usdcDecimals)} USDC (block ${receipt.blockNumber})`);
             return { success: true, sourceConfirmed: true, destinationConfirmed: false, guid, bounty: bountyEarned };
@@ -1142,16 +1198,16 @@ async function processTreasury(t, cfg) {
     if (state.bridgeable >= minBridgeAmount) {
         const checked = await ensureFeeAffordable(state.bridgeable);
         if (checked.error || checked.skipped) return checked;
-        console.log(`${tag} 🚀  Sending bridgeToStakers(${fmt(state.bridgeable, state.usdcDecimals)}) value=${fmt(checked.estimate.fee.native, NATIVE_DECIMALS)}`);
+        console.log(`${tag} 🚀  Sending bridgeRevenue(${fmt(state.bridgeable, state.usdcDecimals)}) value=${fmt(checked.estimate.fee.native, NATIVE_DECIMALS)}`);
         try {
             const receipt = await rpcPool.sendSigned(walletAddress, async (provider) => {
                 const wallet = new ethers.Wallet(cfg.privateKey, provider);
                 const treasury = new ethers.Contract(t.address, TREASURY_ABI, wallet);
                 return {
                     wallet,
-                    request: await treasury.bridgeToStakers.populateTransaction(state.bridgeable, { value: checked.estimate.fee.native }),
+                    request: await treasury.bridgeRevenue.populateTransaction(state.bridgeable, { value: checked.estimate.fee.native }),
                 };
-            }, `${tag} bridgeToStakers`);
+            }, `${tag} bridgeRevenue`);
             console.log(`${tag} txHash=${receipt.hash}`);
             return await finalizeReceipt(receipt);
         } catch (e) {
@@ -1162,7 +1218,7 @@ async function processTreasury(t, cfg) {
     }
 
     console.log(`${tag} USDC bridgeable ${fmt(state.bridgeable, state.usdcDecimals)} < min ${fmt(minBridgeAmount, state.usdcDecimals)} required for bounty`);
-    console.log(`${tag} ⏭  Non-USDC conversion is governance-only; the keeper will retry after swapToUSDC is executed`);
+    console.log(`${tag} ⏭  No eligible fixed-route conversion remains; available USDC forwarding continues`);
     return { skipped: 'insufficient_balance' };
 }
 

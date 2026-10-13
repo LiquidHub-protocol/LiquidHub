@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./AutonomousErrors.sol";
 
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
@@ -38,11 +39,11 @@ contract SequencerCheckedAggregator is AggregatorV3Interface {
     /// @param _sequencerUptimeFeed Le Sequencer Uptime Feed du L2.
     /// @param _gracePeriod Fenêtre de grâce en secondes (ex: 3600).
     constructor(address _underlyingFeed, address _sequencerUptimeFeed, uint256 _gracePeriod) {
-        require(_underlyingFeed != address(0) && _sequencerUptimeFeed != address(0), "zero feed");
-        require(_gracePeriod >= 3600 && _gracePeriod <= 86400, "bad grace"); // 1h<=g<=24h
+        require(_underlyingFeed != address(0) && _sequencerUptimeFeed != address(0), AutonomousCheck(0xf801ca85));
+        require(_gracePeriod >= 3600 && _gracePeriod <= 86400, AutonomousCheck(0xf83d0a55)); // 1h<=g<=24h
         AggregatorV3Interface feed = AggregatorV3Interface(_underlyingFeed);
         uint8 dec = feed.decimals();
-        require(dec <= 18, "bad dec");
+        require(dec <= 18, AutonomousCheck(0xfc321305));
         underlyingFeed = feed;
         sequencerUptimeFeed = AggregatorV3Interface(_sequencerUptimeFeed);
         underlyingDecimals = dec;

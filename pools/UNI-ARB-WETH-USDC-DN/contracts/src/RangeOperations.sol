@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./ProtocolSafetyLib.sol";
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -10,6 +11,7 @@ import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 /// @dev Interface minimale du vault pour la comptabilite des fees (utilisee par burnPositionCore).
+interface IRevenueReceiver { function recordRevenue(address token, uint256 amount) external; }
 interface IRangeVaultComm {
     function commissionRate() external view returns (uint256);
     function recordFeesCollected(uint256 fees0, uint256 fees1, uint256 commission0, uint256 commission1) external;
@@ -422,8 +424,8 @@ library RangeOperations {
             uint256 commRate = IRangeVaultComm(vault).commissionRate();
             uint256 commission0 = (fees0 * commRate) / 10000;
             uint256 commission1 = (fees1 * commRate) / 10000;
-            if (commission0 > 0) IERC20(token0).safeTransfer(treasuryAddress, commission0);
-            if (commission1 > 0) IERC20(token1).safeTransfer(treasuryAddress, commission1);
+            ProtocolSafetyLib.sendCommission(treasuryAddress, token0, commission0);
+            ProtocolSafetyLib.sendCommission(treasuryAddress, token1, commission1);
             IRangeVaultComm(vault).recordFeesCollected(fees0, fees1, commission0, commission1);
         }
 
@@ -464,28 +466,14 @@ library RangeOperations {
             uint256 commRate = IRangeVaultComm(vault).commissionRate();
             uint256 commission0 = (fees0 * commRate) / 10000;
             uint256 commission1 = (fees1 * commRate) / 10000;
-            if (commission0 > 0) IERC20(token0).safeTransfer(treasuryAddress, commission0);
-            if (commission1 > 0) IERC20(token1).safeTransfer(treasuryAddress, commission1);
+            ProtocolSafetyLib.sendCommission(treasuryAddress, token0, commission0);
+            ProtocolSafetyLib.sendCommission(treasuryAddress, token1, commission1);
             IRangeVaultComm(vault).recordFeesCollected(fees0, fees1, commission0, commission1);
         }
     }
 
     /// @notice Retrait d'urgence: transfere min(requested, balance) de chaque token vers recipient (deplace depuis RangeManager).
-    function emergencyWithdrawCore(
-        address token0,
-        address token1,
-        uint256 amount0Requested,
-        uint256 amount1Requested,
-        address recipient,
-        address contractAddress
-    ) external returns (uint256 amount0Sent, uint256 amount1Sent) {
-        uint256 balance0 = IERC20(token0).balanceOf(contractAddress);
-        uint256 balance1 = IERC20(token1).balanceOf(contractAddress);
-        amount0Sent = amount0Requested > balance0 ? balance0 : amount0Requested;
-        amount1Sent = amount1Requested > balance1 ? balance1 : amount1Requested;
-        if (amount0Sent > 0) IERC20(token0).safeTransfer(recipient, amount0Sent);
-        if (amount1Sent > 0) IERC20(token1).safeTransfer(recipient, amount1Sent);
-    }
+
 
     /// @notice Swap exact-input single via SwapRouter + fee optionnelle au treasury (deplace depuis RangeManager).
     function executeSwapCore(

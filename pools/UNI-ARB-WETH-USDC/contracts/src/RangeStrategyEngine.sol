@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./AutonomousPoolLib.sol";
 
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
 import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
@@ -161,8 +162,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     StrategyConfig public strategyConfig;
     DecisionMode public override decisionMode;
     uint16 public learningInfluenceBps;
-    // One increment per owner call: a uint256 revision cannot wrap in a feasible chain lifetime.
-    uint256 private _configurationRevision = 1;
+    // Strategy configuration is fixed by construction.
+    uint256 internal _configurationRevision = 1;
     uint256 private _decisionConfigurationRevision;
     uint64 private _lastCheckpointEpoch;
     uint64 private _outOfRangeSince;
@@ -259,6 +260,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         _feeWeights = [uint16(3334), 3333, 3333];
         _transferOwnership(vaultAddress);
     }
+
+
 
     function renounceOwnership() public pure override {
         revert InvalidAddress();
@@ -943,63 +946,13 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         emit StrategyExecutionRecorded(current.epoch, decisionHash, action, keeper, msg.sender);
     }
 
-    function setDecisionMode(DecisionMode mode) external onlyOwner {
-        unchecked {
-            ++_configurationRevision;
-        }
-        decisionMode = mode;
-        emit DecisionModeUpdated(mode);
-    }
 
-    function setLearningInfluence(uint16 influenceBps) external onlyOwner {
-        if (influenceBps > maxLearningInfluenceBps) revert InvalidConfiguration();
-        unchecked {
-            ++_configurationRevision;
-        }
-        learningInfluenceBps = influenceBps;
-        emit LearningInfluenceUpdated(influenceBps);
-    }
 
-    function setRiskParameters(
-        uint16 maxSkewBps,
-        uint16 tailRiskBps,
-        uint16 minEdgeBps,
-        uint16 maxCenterMoveBps,
-        uint16 maxWidthChangeBps
-    ) external onlyOwner {
-        if (
-            maxSkewBps > 5000 || tailRiskBps < 100 || tailRiskBps > 5000 || minEdgeBps == 0 || minEdgeBps > 2000
-                || maxCenterMoveBps > BPS || maxWidthChangeBps > BPS
-        ) revert InvalidConfiguration();
-        unchecked {
-            ++_configurationRevision;
-        }
-        strategyConfig.maxSkewBps = maxSkewBps;
-        strategyConfig.tailRiskBps = tailRiskBps;
-        strategyConfig.minEdgeBps = minEdgeBps;
-        strategyConfig.maxCenterMoveBps = maxCenterMoveBps;
-        strategyConfig.maxWidthChangeBps = maxWidthChangeBps;
-        emit StrategyRiskParametersUpdated(maxSkewBps, tailRiskBps, minEdgeBps, maxCenterMoveBps, maxWidthChangeBps);
-    }
 
-    function setRangeBounds(uint16 fallbackUp, uint16 fallbackDown, uint16 minHalf, uint16 maxHalf)
-        external
-        onlyOwner
-    {
-        uint256 minimum = uint256(uint24(_strategyTickSpacing)) * 5;
-        if (
-            minHalf < minimum || maxHalf <= minHalf || maxHalf > 5000 || fallbackUp < minHalf || fallbackUp > maxHalf
-                || fallbackDown < minHalf || fallbackDown > maxHalf || !_hasAlignedHalfWidth(minHalf, maxHalf)
-        ) revert InvalidConfiguration();
-        unchecked {
-            ++_configurationRevision;
-        }
-        strategyConfig.fallbackRangeUpTicks = fallbackUp;
-        strategyConfig.fallbackRangeDownTicks = fallbackDown;
-        strategyConfig.minHalfRangeTicks = minHalf;
-        strategyConfig.maxHalfRangeTicks = maxHalf;
-        emit StrategyRangeBoundsUpdated(fallbackUp, fallbackDown, minHalf, maxHalf);
-    }
+
+
+
+
 
     function _alignedRange(int24 center, int24 down, int24 up) private view returns (int24 lower, int24 upper) {
         lower = _floorToSpacing(_boundedTick(int256(center) - down));
@@ -1008,7 +961,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         if (upper >= MAX_TICK) upper = _floorToSpacing(MAX_TICK - _strategyTickSpacing);
     }
 
-    function _hasAlignedHalfWidth(uint16 minHalf, uint16 maxHalf) private view returns (bool) {
+    function _hasAlignedHalfWidth(uint16 minHalf, uint16 maxHalf) internal view returns (bool) {
         uint256 spacing = uint256(uint24(_strategyTickSpacing));
         uint256 alignedMin = (uint256(minHalf) + spacing - 1) / spacing * spacing;
         uint256 alignedMax = uint256(maxHalf) / spacing * spacing;
@@ -1090,4 +1043,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         if (value > maximum) return maximum;
         return value;
     }
+
+
+
+
 }
