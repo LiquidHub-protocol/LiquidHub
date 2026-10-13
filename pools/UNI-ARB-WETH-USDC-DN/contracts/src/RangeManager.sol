@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./AutonomousErrors.sol";
+import "./ProtocolSafetyLib.sol";
+import "./AutonomousPoolLib.sol";
+import "./ProtectionPolicyLib.sol";
+import "./AutonomousExecutionLib.sol";
 
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
 import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
@@ -40,13 +45,14 @@ interface IMultiUserVault {
  * @notice Manages Uniswap V3 liquidity positions for the MultiUserVault
  * @dev OWNERSHIP MODEL: This contract intentionally uses Ownable pattern.
  *      Ownership is NOT a security risk here - it's a requirement:
- *      - Owner (MultiUserVault) relays governance settings; executors perform recurring operations
+ *      - Owner (MultiUserVault) installs sealed rules and relays bounded safety adjustments; executors perform recurring operations
  *      - safeAddress is only the emergency rescue address
  *      - Required for: oracle configuration, emergency recovery, protocol upgrades
  *      - Renouncing ownership would break critical vault operations
  *      Security scanners may flag this as a risk, but for DeFi vault contracts
  *      managing user funds, administrative control is essential, not optional.
  */
+
 contract RangeManager is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using RangeOperations for *;
@@ -119,6 +125,17 @@ contract RangeManager is Ownable, ReentrancyGuard {
     mapping(uint32 => uint256) private indexToPosition;
     mapping(uint256 => bool) private isOwnedPosition;
 
+    address public immutable pauseController;
+    ProtectionPolicyLib.OverrideState private _protectionOverride;
+    function protectionOverrideUntil() external view returns (uint64) { return _protectionOverride.until; }
+    function nextProtectionOverrideAt() external view returns (uint64) { return _protectionOverride.nextAt; }
+    function _effectiveTwap() private view returns (bool) { return block.timestamp < _protectionOverride.until ? _protectionOverride.twap : protectionConfig.sandwichDetectionEnabled; }
+    function _effectiveMev() private view returns (bool) { return block.timestamp < _protectionOverride.until ? _protectionOverride.mev : protectionConfig.mevProtectionEnabled; }
+    function _effectiveTicks() private view returns (uint16) { return block.timestamp < _protectionOverride.until ? _protectionOverride.ticks : protectionConfig.maxTwapDeviationTicks; }
+    function effectiveProtections() external view returns (bool twap, bool mev, uint16 ticks) {
+        return (_effectiveTwap(), _effectiveMev(), _effectiveTicks());
+    }
+    function transferOwnership(address) public pure override { revert("Immutable Vault owner"); }
     // ===== EVENTS =====
 
     event PositionCreated(
@@ -156,7 +173,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     modifier operationalChecks() {
         // Failure counters are informational only: state changes made before a revert are rolled back by the EVM.
         // Liveness must rely on the bot/module watchdog, oracle/deviation checks and Safe intervention.
-        if (protectionConfig.mevProtectionEnabled) {
+        if (_effectiveMev()) {
             if (block.timestamp - config.lastRebalanceTime < MIN_REBALANCE_INTERVAL) revert E03();
         }
         if (!config.oraclesConfigured) revert E04();
@@ -201,6 +218,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     ) {
         require(_vault != address(0), "E09");
         require(_pauseController != address(0), "E09");
+        pauseController = _pauseController;
         vault = _vault;
 
         require(
@@ -258,10 +276,11 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /**
      * @notice Configure l'adresse de la Safe
-     * @dev Appelable par le vault owner pour permettre la migration Safe -> Timelock en phase 2.
+     * @dev Appelable par le Vault pendant son installation, avant le scellement.
      * @param _safe L'adresse de la Safe
      */
     function setSafeAddress(address _safe) external onlyVaultOwner {
+        AutonomousPoolLib.requireInstallation(vault);
         if (_safe == address(0)) revert E13();
         safeAddress = _safe;
         emit SafeAddressSet(_safe);
@@ -269,13 +288,14 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /**
      * @notice Autorise ou rEvoque un exEcuteur
-     * @dev Appele par le vault owner. Phase 2: le Timelock passe par le Vault relay.
+     * @dev Installation-only through the Vault relay.
      * @param _executor L'adresse a autoriser/rEvoquer
      * @param _authorized True pour autoriser, false pour revoquer
      * @dev SECURITY NOTE: safeAddress n'a pas de droits de configuration ici. Il sert uniquement au rescueToken().
-     *      Les autorisations operationnelles passent par le Vault owner (Safe en Phase 1, Timelock en Phase 2).
+     *      Operational authorisations are installed through the Vault and cannot change after sealing.
      */
     function setAuthorizedExecutor(address _executor, bool _authorized) external {
+        AutonomousPoolLib.requireInstallation(vault);
         if (_executor == address(0)) revert E15();
         if (msg.sender != owner()) revert E16();
         authorizedExecutors[_executor] = _authorized;
@@ -294,18 +314,12 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     // ===== FONCTIONS DE CONFIGURATION (gouvernance via Vault owner) =====
 
-    /// @notice Binds the immutable DN engine; governance may rotate its protocol module and operator.
+    /// @notice Binds the immutable DN engine; the protocol module and operator are sealed at installation.
     function setStrategyEngine(address engine, address protocolBot) external onlyVaultOwner {
+        AutonomousPoolLib.requireInstallation(vault);
         if (address(strategyEngine) != address(0) && engine != address(strategyEngine)) revert E40();
-        // The typed identity/profile reads below also reject addresses without contract code.
-        address botOperator = IProtocolBotIdentity(protocolBot).botAddress();
-        if (botOperator == address(0)) revert E40();
+        address botOperator = AutonomousExecutionLib.validateEngine(engine, protocolBot, address(pool), IMultiUserVault(vault).hedgeManager(), true);
         IRangeStrategyEngine candidate = IRangeStrategyEngine(engine);
-        if (
-            candidate.rangeManager() != address(this) || candidate.pool() != address(pool)
-                || candidate.profile() != IRangeStrategyEngine.StrategyProfile.DELTA_NEUTRAL
-                || candidate.hedgeManager() != IMultiUserVault(vault).hedgeManager()
-        ) revert E40();
         strategyEngine = candidate;
         authorizedExecutors[protocolBotAddress] = false;
         authorizedExecutors[protocolBotOperator] = false;
@@ -321,6 +335,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     function configureTolerance(uint16 _toleranceBps) external onlyVaultOwner {
+        AutonomousPoolLib.requireInstallation(vault);
         if (_toleranceBps > 1000) revert E20();
 
         uint16 oldTolerance = config.toleranceBps;
@@ -329,20 +344,12 @@ contract RangeManager is Ownable, ReentrancyGuard {
         emit ToleranceUpdated(oldTolerance, _toleranceBps);
     }
 
-    function configureProtections(bool _twapGuardEnabled, bool _mevProtection, uint16 _maxTwapDeviationTicks)
-        external
-        onlyVaultOwner
-    {
-        if (_maxTwapDeviationTicks > 1000) revert E21();
-        if (_twapGuardEnabled && _maxTwapDeviationTicks == 0) revert E21();
-
-        protectionConfig.sandwichDetectionEnabled = _twapGuardEnabled;
-        protectionConfig.mevProtectionEnabled = _mevProtection;
-        protectionConfig.maxTwapDeviationTicks = _maxTwapDeviationTicks;
+    function configureProtections(bool twap, bool mev, uint16 ticks) external onlyVaultOwner {
+        ProtectionPolicyLib.configure(protectionConfig, _protectionOverride, vault, twap, mev, ticks);
     }
 
     /// @notice (audit V1 — V3-M1) Paramètres oracle : seuil de déviation pool/oracle + heartbeats par feed.
-    /// @dev Gouvernance via Vault owner (Safe phase 1, Timelock phase 2) car ces bornes pilotent toute la protection MEV/staleness. Bornes dures :
+
     ///      déviation 1..1000 bps pour éviter de neutraliser la protection ; maxAge entre 1h et 48h
     ///      (Chainlink heartbeats réels 1h-24h, marge x2). Aiguille tous les _updatePriceCache() en aval.
     function setOracleParams(uint16 _maxOracleDeviationBps, uint32 _maxAge0, uint32 _maxAge1) external onlyVaultOwner {
@@ -364,6 +371,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         address _token1PriceFeed,
         address _nativePriceFeedForBatchCheck
     ) external onlyVaultOwner {
+        AutonomousPoolLib.requireInstallation(vault);
         require(
             _token0PriceFeed != address(0) && _token1PriceFeed != address(0)
                 && _nativePriceFeedForBatchCheck != address(0),
@@ -404,7 +412,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * @dev Used by DN bot after rebalance when ETH exposure decreased
      */
     function sendTokenForHedge(address token, uint256 amount, address to) external {
-        require(token == token0 || token == token1, "E24b");
+        require(token == token0 || token == token1, AutonomousCheck(0x050b2de0));
         if (amount == 0) revert E99();
         // SÉCURITÉ (audit V1) : destination FIGÉE au hedgeManager (lu depuis le vault). Avant, `to` était
         // arbitraire → une clé bot compromise pouvait envoyer le principal user idle vers une adresse
@@ -431,6 +439,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         maxPositionsCheck
         returns (uint256 tokenId, uint128 liquidity)
     {
+        AutonomousPoolLib.requireOperating(pauseController);
         require(config.oraclesConfigured, "E26");
         // Normal initial mint comes from the Vault. The only direct module exception is Safe recovery of a
         // progressive cycle after its NFT was burned: the Vault must still be locked and no position may exist.
@@ -576,6 +585,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
      *      Cette fonction ajoute simplement la liquidite avec les balances actuelles
      */
     function addLiquidityToPosition() external onlyVaultOrAuthorized nonReentrant {
+        AutonomousPoolLib.requireOperating(pauseController);
         // audit V1 (V3-H2) : barrière déviation/staleness avant d'ajouter de la liquidité (composition LP
         // sensible au prix du pool). Cache invalidé si le pool diverge de l'oracle => on refuse.
         uint256 tokenId = _refreshAndFirstPosition();
@@ -701,10 +711,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     // ===== FONCTIONS INTERNES =====
 
-    function _validatedStrategyDecision() private view returns (IRangeStrategyEngine.Decision memory decision) {
-        if (address(strategyEngine) == address(0)) revert E40();
-        decision = strategyEngine.previewDecision();
-        decision = strategyEngine.validateDecision(decision.decisionHash);
+    function _validatedStrategyDecision() private view returns (IRangeStrategyEngine.Decision memory) {
+        return AutonomousExecutionLib.currentDecision(address(strategyEngine));
     }
 
     /// @dev Best-effort range action bounty; Treasury availability never blocks maintenance.
@@ -757,8 +765,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
             token1PriceFeed,
             pool,
             config,
-            protectionConfig.sandwichDetectionEnabled,
-            protectionConfig.maxTwapDeviationTicks,
+            _effectiveTwap(),
+            _effectiveTicks(),
             protectionConfig.maxOracleDeviationBps,
             protectionConfig.maxAge0,
             protectionConfig.maxAge1
@@ -818,7 +826,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         returns (uint256 amount0Sent, uint256 amount1Sent)
     {
         require(recipient != address(0), "E41");
-        (amount0Sent, amount1Sent) = RangeOperations.emergencyWithdrawCore(
+        (amount0Sent, amount1Sent) = ProtocolSafetyLib.emergencyWithdrawCore(
             token0, token1, amount0Requested, amount1Requested, recipient, address(this)
         );
         emit EmergencyWithdraw(recipient, amount0Sent, amount1Sent, msg.sender);
@@ -832,15 +840,11 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /**
      * @notice Recover ERC-20 tokens accidentally sent to this contract.
-     * @dev Safe-only in Phase 1 and Phase 2. Pool tokens (token0/token1) are excluded
+     * @dev Incident-only Safe recovery. Pool tokens (token0/token1) are excluded
      *      to avoid interfering with rebalance flows; use the Vault path for those.
      */
     function rescueToken(address tokenAddr, address to, uint256 amount) external {
-        require(msg.sender == safeAddress, "E16");
-        require(to != address(0), "E40");
-        require(tokenAddr != token0 && tokenAddr != token1, "E41");
-        IERC20(tokenAddr).safeTransfer(to, amount);
-        emit TokenRescued(tokenAddr, to, amount);
+        ProtocolSafetyLib.rescueRangeToken(owner(), safeAddress, token0, token1, tokenAddr, to, amount);
     }
 
     /**
@@ -908,6 +912,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint256 minAmountOut,
         address keeper
     ) external onlyAuthorized nonReentrant returns (int24 lower, int24 upper) {
+        AutonomousPoolLib.requireOperating(pauseController);
         _refreshAndRequireValid();
         if (step == 0) {
             IRangeStrategyEngine.Decision memory decision = _validatedRebalanceDecision(expectedDecisionHash, keeper);
@@ -947,6 +952,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         address tokenIn,
         address tokenOut
     ) external nonReentrant {
+        AutonomousPoolLib.requireOperating(pauseController);
         require(swapAmountsIn.length == minAmountsOut.length, "len");
         // SÉCURITÉ (audit V1 — High 2) : rafraîchir le cache de prix AVANT de valider les minOuts.
         // rebalance() est permissionless ; sans ce refresh, le plancher oracle (validateMinOutsAgainstOracle)
@@ -1041,19 +1047,11 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     function _validatedRebalanceDecision(bytes32 expectedDecisionHash, address keeper)
-        private
-        view
-        returns (IRangeStrategyEngine.Decision memory decision)
-    {
-        if (protectionConfig.mevProtectionEnabled) {
-            require(block.timestamp - config.lastRebalanceTime >= MIN_REBALANCE_INTERVAL, "E03");
-        }
-        decision = strategyEngine.validateDecision(expectedDecisionHash);
-        require(decision.action == IRangeStrategyEngine.Action.RANGE_AND_HEDGE && positionCount == 1, "E90");
-        if (isProtocolBotCaller(keeper)) {
-            IRangeStrategyEngine.Telemetry memory telemetry = strategyEngine.currentTelemetry();
-            require(block.timestamp >= uint256(telemetry.checkpointTimestamp) + MAIN_BOT_KEEPER_DELAY, "E03");
-        }
+        private view returns (IRangeStrategyEngine.Decision memory decision) {
+        if (_effectiveMev()) require(block.timestamp - config.lastRebalanceTime >= MIN_REBALANCE_INTERVAL, "E03");
+        require(positionCount == 1, "E90");
+        return AutonomousExecutionLib.validateDecision(address(strategyEngine), expectedDecisionHash,
+            isProtocolBotCaller(keeper), uint8(IRangeStrategyEngine.Action.RANGE_AND_HEDGE));
     }
 
     function _executeValidatedSwap(bool tokenInIsToken0, uint256 amountIn, uint256 minAmountOut)
@@ -1104,6 +1102,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     // ===== ADMIN SETTERS =====
 
     function setInitMultiSwapTvl(uint256 _initMultiSwapTvl) external onlyVaultOwner {
+        AutonomousPoolLib.requireInstallation(vault);
         require(_initMultiSwapTvl > 0 && _initMultiSwapTvl <= 1_000_000, "E97");
         require(IMultiUserVault(vault).dnMaxDepositUsd() <= _initMultiSwapTvl * 1e9, "E97");
         emit InitMultiSwapTvlUpdated(initMultiSwapTvl, _initMultiSwapTvl);
@@ -1111,6 +1110,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     function setTreasuryAddress(address _treasuryAddress) external onlyVaultOwner {
+        AutonomousPoolLib.requireInstallation(vault);
         require(_treasuryAddress != address(0), "E98"); // audit LOW : garde address(0)
         emit TreasuryAddressUpdated(treasuryAddress, _treasuryAddress); // audit LOW-5 : observabilité
         treasuryAddress = _treasuryAddress;

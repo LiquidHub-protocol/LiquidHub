@@ -1,6 +1,6 @@
 # Liquid Hub Protocol
 
-Decentralized liquidity management protocol.
+Autonomous-execution liquidity protocol with published, bounded multisig emergency controls.
 
 ## Overview
 
@@ -20,9 +20,9 @@ Liquid Hub automates range management through **adaptive decisions computed 100%
 | **RangeManager** | DEX position execution, bounded on-chain swaps and permissionless execution of fresh engine-approved rebalances |
 | **RangeOperations** | Library for tick alignment, liquidity calculations, swaps, valuation and fee accounting |
 | **PauseController** | Per-pool bounded circuit breaker for inflows, withdrawals and the deposit cooldown; holds no funds and leaves documented position-maintenance paths available |
-| **SecureBotModule** | Gnosis Safe module whitelisting specific function selectors for automated operations |
-| **Treasury** | Protocol fee collection, keeper / strategy-checkpoint / hedge bounties (+ Phase 2 bridge bounty), admin withdrawals with monthly cap |
-| **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: governed hedge target, permissionless over- and under-hedge correction when on-chain safety checks pass, atomic-rebalance fallback, proportional flash-loan settlement, health-factor monitoring |
+| **SecureBotModule** | Immutable executor for guarded public operations, canonical progressive rebalances and bootstrap mint |
+| **Treasury** | Fee-only accounting, isolated bounty reserves, public conversion/settlement and uncapped company withdrawals outside those reserves |
+| **AaveHedgeManager** | *(DN only)* AAVE V3 hedge: sealed strategy with bounded incident risk protection, permissionless over- and under-hedge correction when on-chain safety checks pass, atomic-rebalance fallback, proportional flash-loan settlement, health-factor monitoring |
 | **DnDepositLib / RangeStrategyDnLib** | *(DN only)* Stateless linked libraries for atomic deposit/hedge coordination and bounded Delta-Neutral strategy projection; hold no funds or mutable state |
 | **SequencerCheckedAggregator** | L2 oracle wrapper that rejects price reads while the sequencer is unavailable or inside its configured recovery grace period |
 | **LiquidHubVaultRegistry** | Chain-local, read-only vault discovery directory for wallet and portfolio integrations |
@@ -58,12 +58,14 @@ addresses from that page before interacting with a deployment.
 
 ## Security
 
-In Phase 1, administrative functions are controlled by the configured Gnosis Safe multisig policy. The protocol bot is restricted to the selectors exposed by each pool's `SecureBotModule`; independent community keepers use only the contracts' guarded permissionless entry points. See [docs/SECURITY.md](docs/SECURITY.md) for details.
+Existing pool rules and bindings are sealed before deposits open. Ordinary operations are public under on-chain guards. The Safe retains only the disclosed, bounded incident and protection powers; the company installs new pools and withdraws earned revenue outside protected bounty reserves. See [operating specification](docs/AUTONOMOUS-PROTOCOL.md) and [security model](docs/SECURITY.md).
 
 ## Documentation
 
+- [Operating specification](docs/AUTONOMOUS-PROTOCOL.md) — Sealed pools, bounded emergency powers and company revenue
+- [Transition validation](docs/AUTONOMOUS-TRANSITION-VALIDATION.md) — Tests, production sizes and exact source synchronisation
 - [PROTOCOL.md](docs/PROTOCOL.md) — How the protocol works (exposed + DN)
-- [TREASURY.md](docs/TREASURY.md) — Treasury rules and monthly cap
+- [TREASURY.md](docs/TREASURY.md) — Fee accounting, protected reserves and public settlement
 - [KEEPER-GUIDE.md](docs/KEEPER-GUIDE.md) — How to run a keeper
 - [SECURITY.md](docs/SECURITY.md) — Multisig powers and limitations
 - [Vault Registry](registry/README.md) — Per-network vault discovery contract and deployment directory

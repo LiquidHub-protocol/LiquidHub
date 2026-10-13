@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./AutonomousErrors.sol";
+import "./ProtocolSafetyLib.sol";
+import "./AutonomousPoolLib.sol";
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -12,6 +15,8 @@ import "./DnDepositLib.sol"; // EIP-170 : orchestration hedge au dépôt déport
 import "./interfaces/IRangeStrategyEngine.sol";
 
 // Interface etendue pour RangeManager
+
+
 interface IRangeManagerExtended {
     function setSafeAddress(address _safe) external;
     function setAuthorizedExecutor(address _executor, bool _authorized) external;
@@ -156,7 +161,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     IRangeManager public rangeManager;
     IERC20 public immutable token0;
     IERC20 public immutable token1;
-    address private immutable pauseController;
+    address public immutable pauseController;
 
     mapping(address => UserInfo) public userInfo;
 
@@ -303,6 +308,19 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         _;
     }
 
+    /// @notice Permanently closes installation before public deposits.
+
+    bool public installationSealed;
+    event InstallationSealed(address indexed safe);
+    function sealInstallation() external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
+        ProtocolSafetyLib.validateVaultInstallation(botModule, address(rangeManager));
+        installationSealed = true; emit InstallationSealed(emergencySafe);
+    }
+    function transferOwnership(address next) public override onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1)); super.transferOwnership(next);
+    }
+
     modifier onlyEmergencySafe() {
         if (msg.sender != emergencySafe) revert E03();
         _;
@@ -340,7 +358,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // audit V1 (M3-B-fix) : plus d'init time-weighted (modele accFeePerShare, accumulateurs a 0 par defaut).
     }
 
-    /// @dev Governance must always remain transferable to a valid Safe or Timelock.
     function renounceOwnership() public pure override {
         revert();
     }
@@ -355,6 +372,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * Cette fonction ne peut etre appelee qu'une fois
      */
     function setupRangeManagerSafeAuthorization() external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
         // Appel a la nouvelle fonction setSafeAddress de RangeManager
         // Comme MultiUserVault est l'owner de RangeManager, cet appel va reussir
         IRangeManagerExtended(address(rangeManager)).setSafeAddress(owner());
@@ -366,55 +384,23 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @param authorized True pour autoriser, false pour revoquer
      */
     function authorizeExecutorOnRangeManager(address executor, bool authorized) external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
         if (executor == address(0)) revert E15();
         IRangeManagerExtended(address(rangeManager)).setAuthorizedExecutor(executor, authorized);
         emit ExecutorAuthorizedOnRangeManager(executor, authorized);
     }
 
-    /// @notice Phase 2 governance relay for RangeManager settings.
-    /// @dev RangeManager is owned by this Vault. Once the Vault owner is a timelock and Safe ops are disabled
-    ///      on RangeManager, governance can still execute RangeManager setters through this relay.
-    function executeRangeManagerGovernance(bytes calldata data) external onlyOwner returns (bytes memory result) {
-        if (data.length < 4) revert E21();
-        bytes4 selector = bytes4(data[:4]);
-        if (!_isAllowedRangeManagerGovernanceSelector(selector)) revert E21();
-        (bool ok, bytes memory ret) = address(rangeManager).call(data);
-        if (!ok) revert E21();
-        return ret;
+    /// @dev Vault-owned RangeManager installation or published bounded safety adjustments only.
+    function executeSafetyAdjustment(bytes calldata data) external onlyOwner returns (bytes memory result) {
+        return ProtocolSafetyLib.executeBoundedCall(address(rangeManager), data);
     }
 
-    function _isAllowedRangeManagerGovernanceSelector(bytes4 selector) private pure returns (bool) {
-        return selector == bytes4(keccak256("setStrategyEngine(address,address)"))
-            || selector == bytes4(keccak256("configureSlippage(uint24)"))
-            || selector == bytes4(keccak256("configureTolerance(uint16)"))
-            || selector == bytes4(keccak256("configureProtections(bool,bool,uint16)"))
-            || selector == bytes4(keccak256("setOracleParams(uint16,uint32,uint32)"))
-            || selector == bytes4(keccak256("configurePriceFeeds(address,address,address)"))
-            || selector == bytes4(keccak256("setInitMultiSwapTvl(uint256)"))
-            || selector == bytes4(keccak256("setTreasuryAddress(address)"))
-            || selector == bytes4(keccak256("setSafeAddress(address)"))
-            || selector == bytes4(keccak256("setAuthorizedExecutor(address,bool)"));
-    }
 
-    /// @notice Bounded governance relay to the strategy engine owned by this Vault.
-    function executeStrategyEngineGovernance(bytes calldata data) external onlyOwner returns (bytes memory result) {
-        if (data.length < 4) revert E21();
-        bytes4 selector = bytes4(data[:4]);
-        if (!_isAllowedStrategyEngineGovernanceSelector(selector)) revert E21();
-        address engine = IRangeManagerExtended(address(rangeManager)).strategyEngine();
-        if (engine == address(0)) revert E21();
-        (bool ok, bytes memory ret) = engine.call(data);
-        if (!ok) revert E21();
-        return ret;
-    }
 
-    function _isAllowedStrategyEngineGovernanceSelector(bytes4 selector) private pure returns (bool) {
-        return selector == bytes4(keccak256("setDecisionMode(uint8)"))
-            || selector == bytes4(keccak256("setLearningInfluence(uint16)"))
-            || selector == bytes4(keccak256("setRiskParameters(uint16,uint16,uint16,uint16,uint16)"))
-            || selector == bytes4(keccak256("setRangeBounds(uint16,uint16,uint16,uint16)"))
-            || selector == bytes4(keccak256("setDnHedgePolicy(uint16,uint16)"));
-    }
+    /// @notice Installation-only relay to the immutable strategy engine owned by this Vault.
+
+
+
 
     // REFONTE DN (nettoyage EIP-170) : calculateUserShareOfFees + estimateTotalFees (+ helpers
     // _estimateUncollectedFees/_calculateFeeGrowth) RETIRÉS — code mort (ancien modèle de fees, remplacé
@@ -426,6 +412,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     // Fonction pour configurer RangeManager
     function setRangeManager(address _rangeManager) external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
         if (rangeManagerSet) revert E16();
         if (_rangeManager == address(0)) revert E11();
 
@@ -438,6 +425,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // ===== DEPOSIT FUNCTIONS =====
 
     function deposit(uint256 amount0, uint256 amount1) external nonReentrant {
+        require(installationSealed, AutonomousCheck(0x60715aca));
         _requirePause(0x5ea9e82a); // requireInflowsActive()
         if (amount0 == 0 && amount1 == 0) revert E21();
         // DN pools: dépôts USDC uniquement (token0/WETH non accepté en dépôt direct)
@@ -1318,6 +1306,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // ===== FONCTIONS DE CONFIGURATION =====
 
     function updateCommissionRate(uint256 newRate) external onlyOwner nonReentrant {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
         if (newRate > 3000) revert E14();
         uint256 oldRate = commissionRate;
         // Cristallise feeGrowth avec l'ancien taux. Le callback recordFeesCollected() lit commissionRate
@@ -1328,6 +1317,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function updateTreasuryAddress(address newTreasury) external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
         if (newTreasury == address(0)) revert E17();
         address oldTreasury = treasuryAddress;
         treasuryAddress = newTreasury;
@@ -1335,6 +1325,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function setMinDepositUSD(uint256 _newMinimum) external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
         if (_newMinimum == 0 || _newMinimum > dnMaxDepositUsd) revert E23();
         uint256 oldMinimum = minDepositUSD;
         minDepositUSD = _newMinimum;
@@ -1355,6 +1346,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 maxDepositUsd,
         uint256 refundDelay
     ) external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
         if (postCheckMaxDriftBps < 50 || postCheckMaxDriftBps > 1000) revert E18();
         if (dustFloorUsd == 0 || dustFloorUsd > 50e8) revert E18();
         if (refundDelay < 3600 || refundDelay > 30 days) revert E18();
@@ -1369,8 +1361,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     /// @notice Atomically rotates the operational module and RangeManager identity, preserving the engine.
-    /// @dev Safe governance in Phase 1; the same entry point belongs to the Timelock in Phase 2.
+
     function setBotModule(address _module) external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
         if (_module == address(0)) revert E19();
         address oldModule = botModule;
         botModule = _module;
@@ -1381,6 +1374,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
 
     function setHedgeManager(address _hedgeManager) external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
         // Configuration one-shot du deploiement courant. Aucune migration ni inspection d'un ancien
         // HedgeManager: chaque nouvelle pool est deployee proprement et son ancien deploiement est liquide
         // separement par l'operateur.
@@ -1389,26 +1383,26 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit HedgeManagerSet(_hedgeManager);
     }
 
-    /// @notice Configure la Safe qui conserve les actions de secours en Phase 2.
-    /// @dev Séparé de owner/gouvernance : un transfert futur vers timelock ne doit pas bloquer le dépannage.
+    /// @dev Emergency authority is separate from sealed installation; recovery fixes the beneficiary.
     function setEmergencySafe(address newSafe) external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
         if (newSafe == address(0)) revert E17();
         emit EmergencySafeUpdated(emergencySafe, newSafe);
         emergencySafe = newSafe;
     }
 
     /// @notice Recover non-protected tokens (airdrops, erroneous transfers, donations)
-    /// @dev Pool tokens are recoverable only above the exact reserves backing queued deposits.
+
+
     ///      Active LP/AAVE capital is held outside the Vault; pending user funds remain untouchable.
     /// @param tokenAddr Token to rescue
     /// @param to Recipient address
     /// @param amount Amount to rescue
-    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyEmergencySafe nonReentrant {
-        if (to == address(0)) revert E17();
-        DnDepositLib.rescueVaultToken(
-            tokenAddr, address(token0), address(token1), to, amount, _pendingTotal0, _pendingTotal1
+    function rescueToken(address tokenAddr, address to, uint256 amount) external nonReentrant {
+        if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, address(0), 0)) revert E03();
+        ProtocolSafetyLib.rescueVaultToken(
+            treasuryAddress, tokenAddr, address(token0), address(token1), to, amount
         );
-        emit TokenRescued(tokenAddr, to, amount);
     }
 
     // ===== FONCTIONS DE RECUPERATION USER ET TOKENS PERDUS =====
@@ -1420,7 +1414,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @dev Le depot pending est retrouve par index 1-based puis retire par swap-and-pop. Le chemin reste O(1)
      *      quelle que soit la longueur de la file et ne demande aucun drainage prealable.
      */
-    function EmergencyRecoverUser(address userAddress) external onlyEmergencySafe nonReentrant {
+    function EmergencyRecoverUser(address userAddress) external nonReentrant {
+        if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, userAddress, 1)) revert E03();
         if (userAddress == address(0)) revert E43();
 
         UserInfo storage user = userInfo[userAddress];
@@ -1437,30 +1432,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // 1. Shares actives (cas normal)
         //    EmergencyBurnPositions doit etre appele avant pour ramener les tokens sur vault/RM
         if (userShares > 0) {
-            if (rangeManager.getOwnerPositions().length != 0) revert E46();
-            // SÉCURITÉ (audit V1) : exclure les dépôts EN ATTENTE de TOUS les users du balanceOf(vault)
-            // avant le calcul proportionnel (deposit() transfère sur le vault avant traitement). Sinon un
-            // user récupérerait une part d'un total gonflé par les pending d'autrui. Ses propres pending
-            // sont ajoutés séparément à l'étape 2.
-            uint256 raw0 = token0.balanceOf(address(this));
-            uint256 raw1 = token1.balanceOf(address(this));
-            if (raw0 < _pendingTotal0 || raw1 < _pendingTotal1) revert E46();
-            uint256 vBal0 = raw0 - _pendingTotal0;
-            uint256 vBal1 = raw1 - _pendingTotal1;
-            uint256 rBal0 = token0.balanceOf(address(rangeManager));
-            uint256 rBal1 = token1.balanceOf(address(rangeManager));
-            uint256 share0 = ((vBal0 + rBal0) * userShares) / totalSharesBefore;
-            uint256 share1 = ((vBal1 + rBal1) * userShares) / totalSharesBefore;
-
-            // Recuperer depuis RangeManager si vault n'a pas assez
-            if (share0 > vBal0 || share1 > vBal1) {
-                n0 = share0 > vBal0 ? share0 - vBal0 : 0;
-                n1 = share1 > vBal1 ? share1 - vBal1 : 0;
-                if (n0 > rBal0) n0 = rBal0;
-                if (n1 > rBal1) n1 = rBal1;
-            }
-            userAmount0 += share0;
-            userAmount1 += share1;
+            (userAmount0, userAmount1, n0, n1) = ProtocolSafetyLib.emergencyShares(address(rangeManager),
+                address(token0), address(token1), _pendingTotal0, _pendingTotal1, userShares, totalSharesBefore);
         }
 
         // 2. Depot en attente: index direct + swap-and-pop, donc O(1).
@@ -1538,24 +1511,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice - Burn le NFT en cas de problème sur la position
      * @dev Les fonds restent dans RangeManager apres le burn en attente d'un nouveau MINT
      */
-    function EmergencyBurnPositions() external onlyEmergencySafe nonReentrant {
-        // 1. Recuperer toutes les positions NFT
-        uint256[] memory positions = rangeManager.getOwnerPositions();
+    function EmergencyBurnPositions() external nonReentrant {
+        if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, address(0), 2)) revert E03();
 
-        if (positions.length == 0) revert E46();
-
-        // 2. Pour chaque position, retirer la liquidite puis burn le NFT
-        for (uint256 i = 0; i < positions.length; i++) {
-            uint256 tokenId = positions[i];
-
-            // Appeler burnPosition directement (pas de try/catch pour voir les erreurs)
-            IRangeManager(address(rangeManager)).emergencyBurnPosition(tokenId);
-            emit PositionBurned(tokenId, msg.sender);
-        }
-
-        // 3. Les fonds restent dans RangeManager
-        // 4. Les userInfo restent intacts
-
-        emit AllPositionsBurned(positions.length, msg.sender);
+        uint256 count = ProtocolSafetyLib.burnPositions(address(rangeManager));
+        emit AllPositionsBurned(count, msg.sender);
     }
 }

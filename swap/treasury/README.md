@@ -1,43 +1,11 @@
-# Liquid Hub Swap Treasury
+# SwapTreasury
 
-This folder exposes the dedicated frontend swap-fee treasury contract for public audit.
+Chain-specific swap partner fee collection, separate from pool principal and pool commissions. The implementation uses the same autonomous revenue and bridge libraries as the pool Treasury. There is no protocol token, DAO or governance transition.
 
-The published source is compiled for deployment with Solidity 0.8.36, the Paris
-EVM target, `via_ir = true` and 200 optimizer runs.
+Installed ERC20/native fees convert publicly through sealed V3 routes with live oracle floors, exact input/output accounting and input-volume windows. Smaller chunks remain possible. Arbitrary owner-provided swap calldata is removed. Native wrapping and conversion spend only actual revenue, with the installed wrapped-native token. USDC stays in Treasury until a public fixed bridge/forward or company withdrawal.
 
-Official deployment addresses for every network are published on the
-[Liquid Hub Contracts page](https://liquidhub.app/docs#contracts-addresses); never infer an address from this
-source directory.
+Five percent of cumulative actual USDC receipts, with carried rounding, funds protected bounty reserves. The company can withdraw earned USDC at any time with no ceiling outside those reserves. Receipts, conversions, reserve funding, bounty payments, settlement and withdrawals are on-chain events indexed in public histories.
 
-The frontend Velora integration sends partner fees to a chain-specific `SwapTreasury` address. This treasury is intentionally separate from LP pool treasuries, so swap revenue is not mixed with strategy revenue.
-It holds protocol commission revenue only: user deposit principal never passes through this contract.
+The company installer can add fresh fee assets for future activity; a sealed route cannot change. The rescue Safe has only bounded incident controls and fixed foreign-token recovery under the incident predicate. It cannot extract native fees, USDC or installed/accounted assets through rescue. Oracle wrapper, linked libraries and installed Stargate destination are verified with the Treasury implementation.
 
-Main responsibilities:
-
-- hold frontend swap fees received through Velora `partnerAddress`
-- convert configured non-USDC fee tokens to the chain USDC through oracle-bounded Velora Augustus calldata, callable by the owner and, in Phase 2, the existing rescue Safe
-- bridge USDC permissionlessly to the governed Phase 2 destination through Stargate
-- pay the existing permissionless Bridge Bounty when on-chain cooldown and minimum-ratio conditions are met
-
-Conversion and bridging are intentionally separate: a public keeper cannot choose the sale timing, token amount,
-route or slippage for Treasury-held non-USDC revenue. The owner can supply fresh Velora calldata in both phases;
-once Phase 2 disables admin withdrawals, the existing rescue Safe can also perform these conversions. Configuration
-remains owner-only. The contract pins the Augustus target and independently enforces exact input spending, its
-oracle minimum and receipt of canonical USDC by the Treasury. Keepers can only bridge the available USDC to the
-destination fixed on-chain.
-
-The rescue Safe cannot withdraw ETH or ERC20 tokens through the rescue functions while a conversion feed is
-configured for that asset. These assets must follow the conversion flow; USDC retains its separate withdrawal
-and distribution controls.
-
-The private Safe tooling that prepares these governance transactions explicitly requests a zero partner fee, so
-consolidating already-earned protocol revenue does not charge Liquid Hub's frontend commission a second time.
-
-The public bridge keeper remains in `../bridge/bridge-keeper`. It is the shared keeper for pool and swap treasuries.
-
-## License
-
-`SwapTreasury.sol` is source-available under the repository [Business Source License](../../LICENSE). Production
-software may freely interact with an official deployment, but copies and derivatives may not be deployed in
-production before **2028-08-21**. The contract becomes `GPL-2.0-or-later` on that date. The bridge keeper is separately
-licensed under MIT.
+See [operating specification](../../docs/AUTONOMOUS-PROTOCOL.md), [Treasury](../../docs/TREASURY.md) and [security](../../docs/SECURITY.md).
