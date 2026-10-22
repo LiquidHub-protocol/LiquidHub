@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
 import "./AutonomousErrors.sol";
-import "./ProtocolSafetyLib.sol";
+
 import "./AutonomousRevenueLib.sol";
-import {RevenueBridgeLib, IRevenueStargate} from "./RevenueBridgeLib.sol";
+
 
 import "openzeppelin-contracts/contracts/access/Ownable2Step.sol";
 import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
@@ -224,9 +224,9 @@ contract SwapTreasury is Ownable2Step, ReentrancyGuard {
             require(beforeNative - address(this).balance == amountIn
                 && IERC20(input).balanceOf(address(this)) - beforeWrapped == amountIn, AutonomousCheck(0x45f80872));
         }
-        (, uint160 limit) = ProtocolSafetyLib.bounds(input, address(usdc), amountIn, address(swapFeeds[tokenIn]),
+        (, uint160 limit) = AutonomousRevenueLib.bounds(input, address(usdc), amountIn, address(swapFeeds[tokenIn]),
             address(swapFeeds[address(usdc)]), swapFeedMaxAges[tokenIn], swapFeedMaxAges[address(usdc)], swapSlippageBps[tokenIn]);
-        amountOut = ProtocolSafetyLib.swap(input, address(usdc), router, conversionPoolFees[tokenIn], amountIn, minOut, limit);
+        amountOut = AutonomousRevenueLib.swap(input, address(usdc), router, conversionPoolFees[tokenIn], amountIn, minOut, limit);
         emit SwappedToUSDC(tokenIn, amountIn, amountOut);
     }
 
@@ -246,14 +246,14 @@ contract SwapTreasury is Ownable2Step, ReentrancyGuard {
         require(!distributionsPaused() && bridgeEnabled, AutonomousCheck(0x7b886e9d));
         _syncUsdc(); _requireDistributableUsdc(amount);
         AutonomousRevenueLib.debit(_revenue, address(usdc), amount);
-        (uint256 received, bytes32 guid, uint256 nativeFee) = RevenueBridgeLib.send(
+        (uint256 received, bytes32 guid, uint256 nativeFee) = AutonomousRevenueLib.send(
             address(stargatePool), address(usdc), bridgeDestinationEid, bridgeDestinationAddress, amount, bridgeMinReceivedBps);
         emit RevenueBridged(amount, received, bridgeDestinationEid, guid);
         _payBridgeBounty(msg.sender, amount); _refundNativeSurplus(nativeFee);
     }
 
     function estimateBridgeFee(uint256 amount) external view returns (uint256 nativeFee, uint256 amountReceived) {
-        return RevenueBridgeLib.quote(address(stargatePool), bridgeDestinationEid, bridgeDestinationAddress, amount);
+        return AutonomousRevenueLib.quote(address(stargatePool), bridgeDestinationEid, bridgeDestinationAddress, amount);
     }
 
     function adminWithdraw(uint256 amount, address to) external nonReentrant {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import {ProtocolAccountingLib} from "./ProtocolAccountingLib.sol";
 import "./AutonomousPoolLib.sol";
 
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
@@ -266,8 +267,6 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         _transferOwnership(vaultAddress);
     }
 
-
-
     function renounceOwnership() public pure override {
         revert InvalidAddress();
     }
@@ -281,14 +280,15 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
                 || cfg.maxOutOfRangeSeconds < cfg.epochSeconds || cfg.maxOutOfRangeSeconds > 7 days
                 || cfg.minHalfRangeTicks < minWidth || cfg.maxHalfRangeTicks <= cfg.minHalfRangeTicks
                 || cfg.maxHalfRangeTicks > 5000 || cfg.fallbackRangeUpTicks < cfg.minHalfRangeTicks
-                || cfg.fallbackRangeUpTicks > cfg.maxHalfRangeTicks || cfg.fallbackRangeDownTicks < cfg.minHalfRangeTicks
+                || cfg.fallbackRangeUpTicks > cfg.maxHalfRangeTicks
+                || cfg.fallbackRangeDownTicks < cfg.minHalfRangeTicks
                 || cfg.fallbackRangeDownTicks > cfg.maxHalfRangeTicks || cfg.maxSkewBps > 5000 || cfg.minEdgeBps == 0
                 || cfg.minEdgeBps > 2000 || cfg.tailRiskBps < 100 || cfg.tailRiskBps > 5000
-                || cfg.maxLearningInfluenceBps == 0 || cfg.maxLearningInfluenceBps > 5000 || cfg.learningInfluenceBps == 0
-                || cfg.learningInfluenceBps > cfg.maxLearningInfluenceBps || cfg.maxCenterMoveBps > 10_000
-                || cfg.maxWidthChangeBps > 10_000 || cfg.transitionCostBps > 1000 || cfg.dnMinStressHfBps < 11_000
-                || cfg.dnMinStressHfBps > 30_000 || cfg.dnHedgeOnlyMinEdgeBps == 0 || cfg.dnHedgeOnlyMinEdgeBps > 5000
-                || cfg.dnMinHedgeDeltaBps == 0 || cfg.dnMinHedgeDeltaBps > 2000
+                || cfg.maxLearningInfluenceBps == 0 || cfg.maxLearningInfluenceBps > 5000
+                || cfg.learningInfluenceBps == 0 || cfg.learningInfluenceBps > cfg.maxLearningInfluenceBps
+                || cfg.maxCenterMoveBps > 10_000 || cfg.maxWidthChangeBps > 10_000 || cfg.transitionCostBps > 1000
+                || cfg.dnMinStressHfBps < 11_000 || cfg.dnMinStressHfBps > 30_000 || cfg.dnHedgeOnlyMinEdgeBps == 0
+                || cfg.dnHedgeOnlyMinEdgeBps > 5000 || cfg.dnMinHedgeDeltaBps == 0 || cfg.dnMinHedgeDeltaBps > 2000
                 || !_hasAlignedHalfWidth(cfg.minHalfRangeTicks, cfg.maxHalfRangeTicks)
         ) revert InvalidConfiguration();
     }
@@ -313,8 +313,9 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         (uint128 price0, uint128 price1,, int24 liveTick,, bool valid) = rm.priceCache();
         if (!valid || price0 == 0 || price1 == 0) revert StrategyDataUnavailable();
 
-        (int24 tacticalTick, int24 strategicTick) =
-            _canonicalTwaps(pool, epoch, cfg.epochSeconds, cfg.tacticalHorizonSeconds, cfg.strategicHorizonSeconds);
+        (int24 tacticalTick, int24 strategicTick) = ProtocolAccountingLib.canonicalTwaps(
+            pool, epoch, cfg.epochSeconds, cfg.tacticalHorizonSeconds, cfg.strategicHorizonSeconds
+        );
         uint256 feeGrowth0 =
             configurationOnly ? marketState.feeGrowthGlobal0X128 : IUniswapV3Pool(pool).feeGrowthGlobal0X128();
         uint256 feeGrowth1 =
@@ -368,8 +369,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
                 realizedMove, tacticalTick, strategicTick, fastVol, slowVol, upside, downside, observedFees, slowFees
             );
         }
-        (int24 forecastTrend, uint24 forecastVol, uint16 forecastFees, uint16 uncertainty) = RangeOperations
-            .combineStrategyForecasts(
+        (int24 forecastTrend, uint24 forecastVol, uint16 forecastFees, uint16 uncertainty) = RangeOperations.combineStrategyForecasts(
             _trendPredictions,
             _volatilityPredictions,
             _feePredictions,
@@ -504,25 +504,20 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         if (_hfCritical(dn)) return _hfRepairDecision(decision, liveTick, position, dn);
         bool expectedPosition = decision.currentTickLower < decision.currentTickUpper;
         bool positionChanged = position.exists != expectedPosition
-            || (
-                expectedPosition
-                    && (position.lower != decision.currentTickLower || position.upper != decision.currentTickUpper)
-            );
+            || (expectedPosition
+                && (position.lower != decision.currentTickLower || position.upper != decision.currentTickUpper));
         uint256 maxExecutionDrift = _maxExecutionDrift();
         bool rangeAction = decision.action == Action.RANGE_AND_HEDGE;
-        bool strategyUnsafe = (
-            rangeAction
-                && (
-                    !dn.configured
+        bool strategyUnsafe =
+            (rangeAction
+                    && (!dn.configured
                         || !RangeStrategyDnLib.rangeSkewWithinBounds(
                             decision.targetTickLower,
                             decision.targetTickUpper,
                             liveTick,
                             _strategyTickSpacing,
                             strategyConfig.maxSkewBps
-                        )
-                )
-        ) || (decision.action == Action.HEDGE_ONLY && !_hedgeControl(dn, position, liveTick).eligible);
+                        ))) || (decision.action == Action.HEDGE_ONLY && !_hedgeControl(dn, position, liveTick).eligible);
         bool due = checkpointDue();
 
         if (
@@ -586,7 +581,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         bool due = checkpointDue();
         uint256 maxExecutionDrift = _maxExecutionDrift();
         decision.dataFresh = oracleValid && !due && marketState.checkpointTimestamp != 0
-            && block.timestamp <= decision.validUntil && _absTick(_subTicks(liveTick, referenceTick)) <= maxExecutionDrift;
+            && block.timestamp <= decision.validUntil
+            && _absTick(_subTicks(liveTick, referenceTick)) <= maxExecutionDrift;
 
         if (_hfCritical(dn)) {
             _hedgeRecoverySince = 0;
@@ -813,28 +809,6 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         risk.strategicHorizonSeconds = strategyConfig.strategicHorizonSeconds;
     }
 
-    function _canonicalTwaps(
-        address poolAddress,
-        uint64 epoch,
-        uint32 epochSeconds,
-        uint32 tacticalHorizonSeconds,
-        uint32 strategicHorizonSeconds
-    ) private view returns (int24 tacticalTick, int24 strategicTick) {
-        uint32 endAgo = uint32(block.timestamp - uint256(epoch) * epochSeconds);
-        uint32[] memory secondsAgos = new uint32[](3);
-        secondsAgos[0] = endAgo + strategicHorizonSeconds;
-        secondsAgos[1] = endAgo + tacticalHorizonSeconds;
-        secondsAgos[2] = endAgo;
-        (int56[] memory cumulatives,) = IUniswapV3Pool(poolAddress).observe(secondsAgos);
-        strategicTick = _meanCanonicalTick(cumulatives[2] - cumulatives[0], strategicHorizonSeconds);
-        tacticalTick = _meanCanonicalTick(cumulatives[2] - cumulatives[1], tacticalHorizonSeconds);
-    }
-
-    function _meanCanonicalTick(int56 delta, uint32 seconds_) private pure returns (int24 tick) {
-        tick = int24(delta / int56(uint56(seconds_)));
-        if (delta < 0 && delta % int56(uint56(seconds_)) != 0) tick--;
-    }
-
     function _hedgeControl(RangeStrategyDnLib.Context memory dn, PositionState memory position, int24 liveTick)
         private
         view
@@ -934,16 +908,6 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         emit StrategyExecutionRecorded(current.epoch, decisionHash, action, keeper, msg.sender);
     }
 
-
-
-
-
-
-
-
-
-
-
     function _hasAlignedHalfWidth(uint16 minHalf, uint16 maxHalf) internal view returns (bool) {
         uint256 spacing = uint256(uint24(_strategyTickSpacing));
         uint256 alignedMin = (uint256(minHalf) + spacing - 1) / spacing * spacing;
@@ -982,8 +946,4 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     function _max(uint256 a, uint256 b) private pure returns (uint256) {
         return a > b ? a : b;
     }
-
-
-
-
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./ProtocolAccountingLib.sol";
 import "./AutonomousErrors.sol";
 import "./ProtocolSafetyLib.sol";
 import "./AutonomousPoolLib.sol";
@@ -15,7 +16,6 @@ import "./DnDepositLib.sol"; // EIP-170 : orchestration hedge au dépôt déport
 import "./interfaces/IRangeStrategyEngine.sol";
 
 // Interface etendue pour RangeManager
-
 
 interface IRangeManagerExtended {
     function setSafeAddress(address _safe) external;
@@ -92,6 +92,34 @@ interface IBotNav {
 }
 
 contract MultiUserVault is Ownable, ReentrancyGuard {
+    function _calculateDepositValue(uint256 a, uint256 b) private view returns (uint256) {
+        return ProtocolAccountingLib.depositValue(address(rangeManager), a, b);
+    }
+
+    function getCurrentPortfolioValue() public view returns (uint256) {
+        return ProtocolSafetyLib.dnPortfolioValue(botModule, hedgeManager, address(rangeManager));
+    }
+
+    function _executeWithdrawFromRange(
+        uint256 principal0,
+        uint256 principal1,
+        address recipient,
+        uint256 shareAmount,
+        bool isFullWithdraw
+    ) private returns (uint256, uint256) {
+        return ProtocolAccountingLib.withdrawFromRange(
+            address(rangeManager),
+            address(token0),
+            address(token1),
+            principal0,
+            principal1,
+            recipient,
+            shareAmount,
+            totalShares + shareAmount,
+            isFullWithdraw
+        );
+    }
+
     using SafeERC20 for IERC20;
 
     // ===== CUSTOM ERRORS =====
@@ -312,13 +340,17 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     bool public installationSealed;
     event InstallationSealed(address indexed safe);
+
     function sealInstallation() external onlyOwner {
         require(!installationSealed, AutonomousCheck(0x9a247fa1));
         ProtocolSafetyLib.validateVaultInstallation(botModule, address(rangeManager));
-        installationSealed = true; emit InstallationSealed(emergencySafe);
+        installationSealed = true;
+        emit InstallationSealed(emergencySafe);
     }
+
     function transferOwnership(address next) public override onlyOwner {
-        require(!installationSealed, AutonomousCheck(0x9a247fa1)); super.transferOwnership(next);
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
+        super.transferOwnership(next);
     }
 
     modifier onlyEmergencySafe() {
@@ -395,12 +427,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         return ProtocolSafetyLib.executeBoundedCall(address(rangeManager), data);
     }
 
-
-
     /// @notice Installation-only relay to the immutable strategy engine owned by this Vault.
-
-
-
 
     // REFONTE DN (nettoyage EIP-170) : calculateUserShareOfFees + estimateTotalFees (+ helpers
     // _estimateUncollectedFees/_calculateFeeGrowth) RETIRÉS — code mort (ancien modèle de fees, remplacé
@@ -673,8 +700,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint16 depositPostCheckMaxDriftBps = dnPostCheckMaxDriftBps;
         if (hedgeManager != address(0)) {
             (bool positionExists,,,, int256 effectiveShort, uint256 driftBps,) = IDnStrategyHedgeState(
-                IRangeManagerExtended(address(rangeManager)).strategyEngine()
-            ).getHedgeStrategyState();
+                    IRangeManagerExtended(address(rangeManager)).strategyEngine()
+                )
+                .getHedgeStrategyState();
             uint16 adjustThresholdBps = IAaveHedgeSettlement(hedgeManager).adjustHedgeBps();
             if (adjustThresholdBps <= dnPostCheckMaxDriftBps) revert E72();
             if (positionExists && (effectiveShort < 0 || driftBps >= adjustThresholdBps)) revert E72();
@@ -695,7 +723,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             tokenIn,
             tokenOut,
             plannedDepositValue * 2
-        ) {} catch {
+        ) {}
+        catch {
             revert E73();
         }
         // 4. VERROU (un withdraw concurrent revert E32)
@@ -884,9 +913,13 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             if (wethBal > 0) {
                 token0.safeTransfer(hedgeManager, wethBal);
             }
-            IAaveHedgeSettlement(hedgeManager).settleProportional(
-                wethBal, RangeOperations.mulDivUp(shareAmount, 1e18, totalSharesBefore), isFullWithdraw, address(this)
-            );
+            IAaveHedgeSettlement(hedgeManager)
+                .settleProportional(
+                    wethBal,
+                    RangeOperations.mulDivUp(shareAmount, 1e18, totalSharesBefore),
+                    isFullWithdraw,
+                    address(this)
+                );
         }
 
         // Step 3: n'envoyer au user QUE le delta net (after − before), pas balanceOf entier.
@@ -997,74 +1030,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice _calculateHedgeReserve supprimée — la répartition AAVE/LP est pilotée on-chain
      *         via hedgeTargetBps + DnDepositLib pendant les dépôts/rebalances DN.
      */
-    function getCurrentPortfolioValue() public view returns (uint256) {
-        uint256 lpValue = _lpPortfolioValue();
-
-        // AAVE hedge net value (collat - dette), en USD 8 dec (meme unite que la valeur LP).
-        // Audit V2: sans ce terme, currentTotalValue sous-estime la vraie valeur du protocole (collat AAVE
-        // ignore) -> sharesToMint surevalue -> retrait > juste part via deposit+withdraw atomique.
-        // audit V1 (M3-B-fix, retour Codex) — le bloc hedge est SORTI des try/catch internes : un revert ici
-        // (FAIL-CLOSED) ne doit PAS etre avale par un catch englobant et rendre une valeur LP-seule fausse.
-        if (hedgeManager != address(0)) {
-            // Les soldes idle du HedgeManager font partie des actifs du Vault. Ils doivent etre ajoutes AVANT
-            // la dette AAVE : saturer LP - deficit a zero plus tot sous-estimerait la NAV alors que ces actifs
-            // peuvent encore couvrir une partie du deficit. Les controles HF restent appliques aux actions DN.
-            try DnDepositLib.idleHedgeValueUsd(hedgeManager, address(rangeManager)) returns (uint256 idleUsd) {
-                lpValue += idleUsd;
-            } catch {
-                revert E73();
-            }
-
-            try IAaveHedgeSettlement(hedgeManager).getHedgeData() returns (
-                uint256 totalCollateralBase, uint256 totalDebtBase, uint256, uint256
-            ) {
-                // Comptabilite signee : si AAVE devient net negatif, le deficit reduit la NAV.
-                // Si le deficit couvre toute la LP, on retourne 0 pour bloquer les nouveaux mints.
-                if (totalCollateralBase >= totalDebtBase) {
-                    lpValue += (totalCollateralBase - totalDebtBase);
-                } else {
-                    uint256 deficit = totalDebtBase - totalCollateralBase;
-                    if (deficit >= lpValue) return 0;
-                    lpValue -= deficit;
-                }
-            } catch {
-                // FAIL-CLOSED : hedgeManager present mais getHedgeData() en echec -> on ne peut pas evaluer
-                // correctement. Retourner la valeur LP seule SOUS-ESTIMERAIT le denominateur du mint de shares
-                // (hedge net positif ignore). On revert ; mint/withdraw retenteront quand AAVE repondra.
-                revert E73();
-            }
-        }
-
-        return lpValue;
-    }
 
     /// @dev Valeur LP seule (tokens libres + position) en USD 8 dec. Une lecture impossible doit bloquer
     ///      tout calcul de shares : une NAV partielle sous-evaluerait le denominateur d'un nouveau depot.
-    function _lpPortfolioValue() private view returns (uint256) {
-        address module = botModule;
-        if (module == address(0)) revert E73();
-        try IBotNav(module).getOracleLpValueUsd() returns (uint256 valueUsd) {
-            return valueUsd;
-        } catch {
-            revert E73();
-        }
-    }
-
-    function _calculateDepositValue(uint256 amount0, uint256 amount1) private view returns (uint256) {
-        try rangeManager.priceCache() returns (uint128 price0, uint128 price1, uint160, int24, uint64, bool valid) {
-            if (!valid) return 0;
-
-            // Récupérer les décimales depuis RangeManager
-            RangeOperations.RangeConfig memory config = rangeManager.config();
-
-            uint256 value0 = (amount0 * uint256(price0)) / (10 ** config.token0Decimals);
-            uint256 value1 = (amount1 * uint256(price1)) / (10 ** config.token1Decimals);
-
-            return value0 + value1;
-        } catch {
-            return 0;
-        }
-    }
 
     // ===== VIEW FONCTIONS =====
 
@@ -1126,91 +1094,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     /**
      * @notice Fonction de retrait utilisateurs
      */
-    function _executeWithdrawFromRange(
-        uint256 principal0, // part proportionnelle du user (calculee par _calculateWithdrawAmounts)
-        uint256 principal1, // idem token1 — SÉCURITÉ: on borne l'envoi a ce principal (audit V1)
-        address recipient,
-        uint256 shareAmount,
-        bool isFullWithdraw
-    ) private returns (uint256 amount0Sent, uint256 amount1Sent) {
-        // Verifier que le recipient est autorise
-        if (recipient != address(this) && recipient != msg.sender) revert E40();
-
-        uint256[] memory positions = rangeManager.getOwnerPositions();
-
-        // ===== ETAPE 1 : CALCULER LA LIQUIDITE A RETIRER =====
-        uint256 liquidityToRemove = 0;
-        uint256 totalLiquidity = 0;
-        uint256 tokenId = 0;
-
-        if (positions.length > 0) {
-            tokenId = positions[0];
-            INonfungiblePositionManager positionManager = rangeManager.positionManager();
-            (,,,,,,, uint128 liquidity,,,,) = positionManager.positions(tokenId);
-            totalLiquidity = uint256(liquidity);
-
-            if (totalLiquidity > 0) {
-                if (isFullWithdraw) {
-                    liquidityToRemove = totalLiquidity;
-                } else {
-                    // Retirer un pourcentage de liquidité proportionnel aux shares
-                    liquidityToRemove = RangeOperations.mulDivUp(totalLiquidity, shareAmount, totalShares + shareAmount);
-                }
-            }
-        }
-
-        // ===== ETAPE 1b : CRISTALLISER LES FEES AVANT DE RETIRER LE PRINCIPAL (audit M-01) =====
-        // removeLiquidityForWithdraw fait decreaseLiquidity + collect(max,max), qui BALAYE aussi les fees
-        // accrues avec le principal SANS passer par recordFeesCollected → fees non commissionnées (Treasury)
-        // ni créditées au ledger user. On collecte/comptabilise d'abord via collectFeesForVault() (qui
-        // cristallise, prélève la commission et met à jour accFeePerShare) ; le collect() suivant ne ramène
-        // alors plus que le principal.
-        if (tokenId > 0) {
-            rangeManager.collectFeesForVault();
-        }
-
-        // ===== ETAPE 2 : RETIRER LA LIQUIDITE SI NECESSAIRE =====
-        if (liquidityToRemove > 0 && tokenId > 0) {
-            rangeManager.removeLiquidityForWithdraw(tokenId, uint128(liquidityToRemove));
-        }
-        // Dernier utilisateur: le decrease/collect ci-dessus a vidé le NFT. Le burner puis le détracker
-        // dans la même transaction permet au prochain cycle (totalShares == DEAD_SHARES) de remint un range.
-        if (isFullWithdraw && tokenId > 0) rangeManager.emergencyBurnPosition(tokenId);
-
-        // ===== ETAPE 3 : TRANSFERER DEPUIS RANGEMANAGER VERS VAULT =====
-        // SÉCURITÉ (audit V1) : on n'envoie QUE le principal proportionnel du user, borné par
-        // la balance réellement disponible. Avant, on envoyait balanceOf(RM) ENTIER, ce qui
-        // distribuait aussi les tokens libres non déployés (dépôt mono-token en attente, réserve
-        // hedge) au premier qui withdraw. Le principal (= vaultSharesPercent% de getCurrentBalances,
-        // qui inclut LP + tokens libres) est la juste part. Le settle hedge (step 2) ajoute la part
-        // AAVE séparément. Full withdraw => on prend tout le restant.
-        uint256 realBalance0 = IERC20(token0).balanceOf(address(rangeManager));
-        uint256 realBalance1 = IERC20(token1).balanceOf(address(rangeManager));
-        uint256 toWithdraw0;
-        uint256 toWithdraw1;
-        if (isFullWithdraw) {
-            toWithdraw0 = realBalance0;
-            toWithdraw1 = realBalance1;
-        } else {
-            toWithdraw0 = principal0 < realBalance0 ? principal0 : realBalance0;
-            toWithdraw1 = principal1 < realBalance1 ? principal1 : realBalance1;
-        }
-
-        // Transférer la juste part vers le Vault
-        (amount0Sent, amount1Sent) = rangeManager.transferTokensForWithdraw(toWithdraw0, toWithdraw1, address(this));
-
-        // ===== ETAPE 4 : SI LE RECIPIENT N'EST PAS LE VAULT, TRANSFERER DEPUIS LE VAULT =====
-        if (recipient != address(this)) {
-            if (amount0Sent > 0) {
-                token0.safeTransfer(recipient, amount0Sent);
-            }
-            if (amount1Sent > 0) {
-                token1.safeTransfer(recipient, amount1Sent);
-            }
-        }
-
-        return (amount0Sent, amount1Sent);
-    }
 
     // _estimateUncollectedFees + _calculateFeeGrowth RETIRÉS (helpers de estimateTotalFees, code mort).
 
@@ -1393,16 +1276,13 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     /// @notice Recover non-protected tokens (airdrops, erroneous transfers, donations)
 
-
     ///      Active LP/AAVE capital is held outside the Vault; pending user funds remain untouchable.
     /// @param tokenAddr Token to rescue
     /// @param to Recipient address
     /// @param amount Amount to rescue
     function rescueToken(address tokenAddr, address to, uint256 amount) external nonReentrant {
         if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, address(0), 0)) revert E03();
-        ProtocolSafetyLib.rescueVaultToken(
-            treasuryAddress, tokenAddr, address(token0), address(token1), to, amount
-        );
+        ProtocolSafetyLib.rescueVaultToken(treasuryAddress, tokenAddr, address(token0), address(token1), to, amount);
     }
 
     // ===== FONCTIONS DE RECUPERATION USER ET TOKENS PERDUS =====
@@ -1432,8 +1312,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // 1. Shares actives (cas normal)
         //    EmergencyBurnPositions doit etre appele avant pour ramener les tokens sur vault/RM
         if (userShares > 0) {
-            (userAmount0, userAmount1, n0, n1) = ProtocolSafetyLib.emergencyShares(address(rangeManager),
-                address(token0), address(token1), _pendingTotal0, _pendingTotal1, userShares, totalSharesBefore);
+            (userAmount0, userAmount1, n0, n1) = ProtocolSafetyLib.emergencyShares(
+                address(rangeManager),
+                address(token0),
+                address(token1),
+                _pendingTotal0,
+                _pendingTotal1,
+                userShares,
+                totalSharesBefore
+            );
         }
 
         // 2. Depot en attente: index direct + swap-and-pop, donc O(1).
@@ -1480,9 +1367,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             if (wethForRepay > 0) {
                 token0.safeTransfer(hedgeManager, wethForRepay);
             }
-            IAaveHedgeSettlement(hedgeManager).emergencySettleForVault(
-                wethForRepay, proportionX18, isFullWithdraw, userAddress
-            );
+            IAaveHedgeSettlement(hedgeManager)
+                .emergencySettleForVault(wethForRepay, proportionX18, isFullWithdraw, userAddress);
         }
 
         // 5. Envoyer les fonds.

@@ -18,7 +18,10 @@ Liquid Hub automates range management through **adaptive decisions computed 100%
 | **MultiUserVault** | Multi-user vault managing deposits, withdrawals, share accounting, and LP position lifecycle |
 | **RangeStrategyEngine** | Per-pool decision contract combining an analytical controller, fixed multi-scenario optimizer, bounded online adaptation and false-start protection; holds no funds and publishes deterministic on-chain actions, reason codes, validity and exact target ticks |
 | **RangeManager** | DEX position execution, bounded on-chain swaps and permissionless execution of fresh engine-approved rebalances |
-| **RangeOperations** | Library for tick alignment, liquidity calculations, swaps, valuation and fee accounting |
+| **RangeOperations** | Library for tick alignment, LP operations, swaps and strategy math |
+| **ProtocolAccountingLib** | Oracle/TWAP reads, portfolio valuation, position accounting and deterministic settlement |
+| **ProtocolSafetyLib** | Canonical execution checks, installation and bounded Safe emergency/protection policy |
+| **AutonomousRevenueLib** | Shared fee accounting, protected bounty reserves, fixed USDC conversions and Stargate settlement |
 | **PauseController** | Per-pool bounded circuit breaker for inflows, withdrawals and the deposit cooldown; holds no funds and leaves documented position-maintenance paths available |
 | **SecureBotModule** | Immutable executor for guarded public operations, canonical progressive rebalances and bootstrap mint |
 | **Treasury** | Fee-only accounting, isolated bounty reserves, public conversion/settlement and uncapped company withdrawals outside those reserves |

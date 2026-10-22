@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
-import "./ProtocolSafetyLib.sol";
+import "./AutonomousRevenueLib.sol";
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -11,7 +11,10 @@ import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 /// @dev Interface minimale du vault pour la comptabilite des fees (utilisee par burnPositionCore).
-interface IRevenueReceiver { function recordRevenue(address token, uint256 amount) external; }
+interface IRevenueReceiver {
+    function recordRevenue(address token, uint256 amount) external;
+}
+
 interface IRangeVaultComm {
     function commissionRate() external view returns (uint256);
     function recordFeesCollected(uint256 fees0, uint256 fees1, uint256 commission0, uint256 commission1) external;
@@ -133,84 +136,6 @@ library RangeOperations {
     /// @dev V3 : on passe uniquement les 3 scalaires oracle (maxDeviationBps, maxAge0, maxAge1) au lieu de
     ///      tout le ProtectionConfig — évite au RangeManager d'ABI-encoder un struct à chaque refresh (bytecode).
     ///      Miroir exact de la pool DN (cohérence std/DN).
-    function updatePriceCache(
-        AggregatorV3Interface token0PriceFeed,
-        AggregatorV3Interface token1PriceFeed,
-        IUniswapV3Pool pool,
-        RangeConfig memory cfg,
-        bool twapGuardEnabled,
-        uint16 maxTwapDeviationTicks,
-        uint16 maxDeviationBps,
-        uint32 maxAge0In,
-        uint32 maxAge1In
-    ) external view returns (PriceCache memory newCache) {
-        if (address(token0PriceFeed) == address(0) || address(token1PriceFeed) == address(0)) {
-            return PriceCache(0, 0, 0, 0, 0, false);
-        }
-
-        // Pas de try/catch ici, le contrat principal s'en charge
-        (uint80 roundId0, int256 price0,, uint256 updatedAt0, uint80 answeredInRound0) =
-            token0PriceFeed.latestRoundData();
-        (uint80 roundId1, int256 price1,, uint256 updatedAt1, uint80 answeredInRound1) =
-            token1PriceFeed.latestRoundData();
-
-        if (price0 <= 0 || price1 <= 0 || answeredInRound0 < roundId0 || answeredInRound1 < roundId1) {
-            return PriceCache(0, 0, 0, 0, 0, false);
-        }
-
-        // audit V1 (V3) : âge max PAR FEED (heartbeats distincts). 0 => défaut 90000s (rétrocompat).
-        uint256 maxAge0 = maxAge0In == 0 ? 90000 : uint256(maxAge0In);
-        uint256 maxAge1 = maxAge1In == 0 ? 90000 : uint256(maxAge1In);
-        if (block.timestamp - updatedAt0 > maxAge0 || block.timestamp - updatedAt1 > maxAge1) {
-            return PriceCache(0, 0, 0, 0, 0, false);
-        }
-
-        (uint160 sqrtPriceX96, int24 tick,,,,,) = pool.slot0();
-
-        newCache = PriceCache({
-            price0: _safeUint128(uint256(price0)),
-            price1: _safeUint128(uint256(price1)),
-            poolSqrtPriceX96: sqrtPriceX96,
-            poolTick: tick,
-            timestamp: uint64(block.timestamp),
-            valid: true
-        });
-
-        // audit V1 (V3 — High #1/#2) : check déviation pool/oracle INTÉGRÉ au refresh. slot0 et prix Chainlink
-        // capturés au même instant => cache LIVE. Tous les appelants de _updatePriceCache héritent de la barrière.
-        if (maxDeviationBps > 0 && _deviationExceeds(newCache, maxDeviationBps, cfg.token0Decimals, cfg.token1Decimals))
-        {
-            // Conserve uniquement les valeurs oracle fraiches pour le fallback de retrait protege.
-            // Toutes les actions LP ordinaires continuent d'exiger valid=true.
-            newCache.valid = false;
-            return newCache;
-        }
-        if (twapGuardEnabled && _twapDeviationExceeds(pool, tick, maxTwapDeviationTicks)) {
-            newCache.valid = false;
-            return newCache;
-        }
-    }
-
-    function _twapDeviationExceeds(IUniswapV3Pool pool, int24 spotTick, uint16 maxTwapDeviationTicks)
-        private
-        view
-        returns (bool)
-    {
-        uint32[] memory secondsAgos = new uint32[](2);
-        secondsAgos[0] = 300;
-        try pool.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
-            int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
-            int24 twapTick = int24(tickDelta / 300);
-            if (tickDelta < 0 && tickDelta % 300 != 0) twapTick--;
-            int24 diff = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
-            return uint24(diff) > uint24(maxTwapDeviationTicks);
-        } catch {
-            // Bypass uniquement au bootstrap (une seule observation initialisee). Des la deuxieme,
-            // tout echec observe() invalide le cache, y compris pendant le reste du warm-up 300s.
-            (,,, uint16 cardinality,,,) = pool.slot0();
-            return cardinality != 1;
-        }
-    }
 
     /**
      * @notice Verifie si une position est hors du range
@@ -291,27 +216,6 @@ library RangeOperations {
      */
     /// @notice Cœur partagé du check de déviation : retourne true si l'écart pool/oracle dépasse le seuil.
     /// @dev Utilisé par updatePriceCache, qui invalide le cache pour tous les chemins sensibles.
-    function _deviationExceeds(PriceCache memory pc, uint16 maxDeviationBps, uint8 token0Decimals, uint8 token1Decimals)
-        internal
-        pure
-        returns (bool)
-    {
-        if (maxDeviationBps == 0 || !pc.valid || pc.poolSqrtPriceX96 == 0 || pc.price0 == 0 || pc.price1 == 0) {
-            return false;
-        }
-
-        uint256 sp = uint256(pc.poolSqrtPriceX96);
-        uint256 poolRaw = Math.mulDiv(sp, sp, 1 << 96);
-        poolRaw = Math.mulDiv(poolRaw, 1e18, 1 << 96);
-        uint256 poolPrice = Math.mulDiv(poolRaw, 10 ** token0Decimals, 10 ** token1Decimals);
-
-        uint256 oraclePrice = Math.mulDiv(uint256(pc.price0), 1e18, uint256(pc.price1));
-        if (oraclePrice == 0) return false;
-
-        uint256 diff = poolPrice > oraclePrice ? poolPrice - oraclePrice : oraclePrice - poolPrice;
-        uint256 deviationBps = (diff * 10000) / oraclePrice;
-        return deviationBps > maxDeviationBps;
-    }
 
     /// @notice Valide UN swap (executeSwap) contre l'oracle : plancher minOut basé sur le prix Chainlink.
     /// @dev V3 : check de déviation retiré d'ici (centralisé dans updatePriceCache + _refreshAndRequireValid
@@ -486,8 +390,8 @@ library RangeOperations {
             uint256 commRate = IRangeVaultComm(vault).commissionRate();
             uint256 commission0 = (fees0 * commRate) / 10000;
             uint256 commission1 = (fees1 * commRate) / 10000;
-            ProtocolSafetyLib.sendCommission(treasuryAddress, token0, commission0);
-            ProtocolSafetyLib.sendCommission(treasuryAddress, token1, commission1);
+            AutonomousRevenueLib.sendCommission(treasuryAddress, token0, commission0);
+            AutonomousRevenueLib.sendCommission(treasuryAddress, token1, commission1);
             IRangeVaultComm(vault).recordFeesCollected(fees0, fees1, commission0, commission1);
         }
 
@@ -528,14 +432,13 @@ library RangeOperations {
             uint256 commRate = IRangeVaultComm(vault).commissionRate();
             uint256 commission0 = (fees0 * commRate) / 10000;
             uint256 commission1 = (fees1 * commRate) / 10000;
-            ProtocolSafetyLib.sendCommission(treasuryAddress, token0, commission0);
-            ProtocolSafetyLib.sendCommission(treasuryAddress, token1, commission1);
+            AutonomousRevenueLib.sendCommission(treasuryAddress, token0, commission0);
+            AutonomousRevenueLib.sendCommission(treasuryAddress, token1, commission1);
             IRangeVaultComm(vault).recordFeesCollected(fees0, fees1, commission0, commission1);
         }
     }
 
     /// @notice Retrait d'urgence: transfere min(requested, balance) de chaque token vers recipient (deplace depuis RangeManager).
-
 
     /// @notice Swap exact-input single via SwapRouter + fee optionnelle au treasury (deplace depuis RangeManager).
     function executeSwapCore(
@@ -1296,19 +1199,20 @@ library RangeOperations {
         uint256 feeTotal;
         uint16[3] memory uniform = [uint16(3334), 3333, 3333];
         for (uint256 i; i < 4; ++i) {
-            uint256 weight = (
-                uint256(trendWeights[i]) * learningInfluenceBps + uint256(2500) * (10000 - learningInfluenceBps)
-            ) / 10000;
+            uint256 weight =
+                (uint256(trendWeights[i]) * learningInfluenceBps + uint256(2500) * (10000 - learningInfluenceBps))
+                    / 10000;
             trendTotal += int256(trendPredictions[i]) * int256(weight);
         }
         for (uint256 i; i < 3; ++i) {
-            uint256 volatilityWeight = (
-                uint256(volatilityWeights[i]) * learningInfluenceBps
-                    + uint256(uniform[i]) * (10000 - learningInfluenceBps)
-            ) / 10000;
-            uint256 feeWeight = (
-                uint256(feeWeights[i]) * learningInfluenceBps + uint256(uniform[i]) * (10000 - learningInfluenceBps)
-            ) / 10000;
+            uint256 volatilityWeight =
+                (uint256(volatilityWeights[i])
+                        * learningInfluenceBps
+                        + uint256(uniform[i])
+                        * (10000 - learningInfluenceBps)) / 10000;
+            uint256 feeWeight =
+                (uint256(feeWeights[i]) * learningInfluenceBps + uint256(uniform[i]) * (10000 - learningInfluenceBps))
+                    / 10000;
             volatilityTotal += uint256(volatilityPredictions[i]) * volatilityWeight;
             feeTotal += uint256(feePredictions[i]) * feeWeight;
         }

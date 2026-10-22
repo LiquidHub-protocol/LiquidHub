@@ -1,6 +1,6 @@
 # Autonomous protocol transition validation
 
-Revision: 13 October 2026. Operating reference: [AUTONOMOUS-PROTOCOL.md](AUTONOMOUS-PROTOCOL.md).
+Revision: 14 October 2026. Operating reference: [AUTONOMOUS-PROTOCOL.md](AUTONOMOUS-PROTOCOL.md).
 
 The release implements one autonomous-execution model for Standard and DN pools, with sealed existing rules, bounded emergency Safe powers, unlimited new-pool development and uncapped company USDC withdrawals outside protected bounty reserves. Token, DAO, governance-transition sources and installation batches are retired. Validation uses private builds and local tests; no contract was deployed or transaction broadcast during this transition.
 
@@ -23,23 +23,31 @@ The release implements one autonomous-execution model for Standard and DN pools,
 
 An additional 500-scenario archive strategy-parity campaign for each pool passed earlier in this transition. Later changes concerned permissions, installation sealing, fee accounting and documentation; the four-layer strategy algorithm was unchanged. Operational fork scenarios were replayed after the final permission/sealing changes. Fork transactions execute locally through a read-only upstream RPC boundary.
 
-Production compilation uses the pinned Foundry 1.8.5 toolchain, Solidity 0.8.36, via-IR, one optimiser run and Paris EVM. All production runtimes and initcode satisfy EIP-170/EIP-3860. DN Vault runtime is 24,422 bytes (154 bytes below EIP-170), DN deposit library 24,403 (173 bytes margin), each pool Treasury 24,256 (320 bytes margin), and SwapTreasury 17,376. These small DN margins require the same compiler profile in deployment tooling; no security guard was removed to fit the limit.
+Production compilation uses the pinned Foundry 1.8.5 toolchain, Solidity 0.8.36, via-IR, one optimiser run and Paris EVM. The 14 October library regrouping reduces the deployment catalogue to four libraries for Standard and six for DN, including Treasury dependencies. Every production contract and deployed library reserves at least 2,048 bytes below EIP-170, enforced before deployment and in CI. The minimum measured margins are 2,128 bytes for Standard and 2,056 for DN. The shared pool Treasury is 22,448 bytes and depends only on the byte-identical AutonomousRevenueLib; SwapTreasury is 17,358 bytes. The architecture and complete manual deployment commands are recorded in [LIBRARY-DEPLOYMENT.md](LIBRARY-DEPLOYMENT.md).
 
 Targeted scenarios include immutable source roles and asset rules, distinct company/Safe authorities, cross-source reserve isolation, cumulative receipt rounding, uncapped withdrawal excluding unaccounted reserves, adversarial ERC20 reentrancy, smaller fixed-route conversion tranches, exact native wrapping, temporary pause expiry/reuse windows, immutable HF bounty minimum and coupled HF bounds, terminal beneficiary recovery and post-bootstrap public execution. Command preparation matches compiled ABIs and simulates from the actual authority without signing.
 
+## Library regrouping validation on 14 October
+
+The final regrouping passed the complete Standard suite (265 tests), complete DN suite (513), SwapTreasury (21) and Registry (13): **812 Solidity tests, no failures or skips**, including fuzz/invariant and archive-fork scenarios. The last installation-role change was followed by another complete Standard/DN replay. The strategy and security conditions were retained; public pool entry-point signatures and caller context are preserved.
+
+Operational/bot regression tests passed 427 cases. The Standard, DN and bridge test keepers passed 91, 103 and 36 cases. The catalogue tests compare both public/admin inventories against actual compiled library dependencies and separately exercise a reused Treasury's real library address. Deployment/publication tooling, CI checks, App/Admin lint and TypeScript checks passed. The public frontend was inspected with all four Standard and all six DN library rows visible; the isolated browser required login for the Admin page, whose shared inventory was verified through code, tests and typechecking.
+
+The deployment wizard and CI reject any pool contract or deployed library with less than 2,048 bytes runtime headroom. No contract deployment, transaction signing or real-network state mutation was performed. Public source alignment covers the local checkout; GitHub publication is a separate step.
+
 ## Source synchronisation
 
-Exact relative file sets and file contents match in every mapped tree. There are 44 contract files and 25 keeper source files: zero different, missing or extra files. The main-bot fee-maintenance helper also matches the test/public bridge helper. Keeper tests and public configuration examples are synchronised. Public publication requires no Solidity or TypeScript build.
+Exact relative file sets and file contents match in every mapped tree. There are 37 contract files and 25 keeper source files: zero different, missing or extra files. The main-bot fee-maintenance helper also matches the test/public bridge helper. Keeper tests and public configuration examples are synchronised. Public publication requires no Solidity or TypeScript build.
 
 | Public tree | Files | SHA-256 tree digest |
 | --- | --- | --- |
-| `pools/UNI-ARB-WETH-USDC/contracts/src` | 16 | `cba1bf48a72ec2112412686eb2e34efebe1d759b6c6adf4ec94f76e101257495` |
-| `pools/UNI-ARB-WETH-USDC-DN/contracts/src` | 21 | `686b6b080656796b7acfb81605df6440d92490f15e8018dc234cdcaff7c0156d` |
-| `swap/treasury/src` | 6 | `292ac67ced82ab48869288a1e565707e76b87f721b75c766b1f4506287aa679a` |
-| `registry/contracts/src` | 1 | `1ee2ba0509fdc0a57cb76557d59781854599abf015f8ee20e90f00e72ebf5895` |
-| `pools/UNI-ARB-WETH-USDC/keeper-bot/src` | 10 | `ffe6f7eb16331a4811d8b7dc05acaef10c02fa0988c4e5896a27bf385ec73a2d` |
-| `pools/UNI-ARB-WETH-USDC-DN/keeper-bot/src` | 11 | `969ded62b081be60de589856af5ea5a41ab6c30067d7234308f5043c4f23de0a` |
-| `bridge/bridge-keeper/src` | 4 | `d6fc4afb6077b191254836614cb8dc22974d7072270588c2430efd618812e92d` |
+| `pools/UNI-ARB-WETH-USDC/contracts/src` | 14 | `2fcadfdb3d706f34040d5cb73ce9ab37fe28687283f1791f776a1066b6182bbb` |
+| `pools/UNI-ARB-WETH-USDC-DN/contracts/src` | 18 | `3710bfbac562b0d1539d886d506bc9f50c70a3fd10c76a2de6f62a102a0a5bbb` |
+| `swap/treasury/src` | 4 | `697fa4e8ab2f939627432b574ce8f6006ec72bcf4064f2561a8499bce058ccfd` |
+| `registry/contracts/src` | 1 | `0849df6a03c79070fba6193cc388365d0191607360d82f9510c40876c76be8a5` |
+| `pools/UNI-ARB-WETH-USDC/keeper-bot/src` | 10 | `d23ff37642b18ad919ea7355dd92617e4501e62efb38aa0b297e397a4cec2631` |
+| `pools/UNI-ARB-WETH-USDC-DN/keeper-bot/src` | 11 | `326b8aa372bf0d707bed1fe8829db964cbf63284cfa2fd7bac9800d8b5aad55e` |
+| `bridge/bridge-keeper/src` | 4 | `466adfeb0d73c86d5fc10d050e7f632993ac5b3c23a5a69364bfb153ea1c997d` |
 
 Tree digests hash the sorted list of relative paths and each file's SHA-256 digest. This proof covers source equality; it does not certify a live contract, an independent audit or a legal qualification.
 

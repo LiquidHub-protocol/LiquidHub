@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import {AutonomousRevenueLib} from "./AutonomousRevenueLib.sol";
+import "./ProtocolAccountingLib.sol";
 import "./AutonomousErrors.sol";
 import "./ProtocolSafetyLib.sol";
 import "./AutonomousPoolLib.sol";
-import "./ProtectionPolicyLib.sol";
-import "./AutonomousExecutionLib.sol";
 
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
 import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
@@ -48,6 +48,52 @@ interface IMultiUserVault {
  */
 
 contract RangeManager is Ownable, ReentrancyGuard {
+    function getOwnerPositions() public view returns (uint256[] memory positions) {
+        positions = new uint256[](positionCount);
+        for (uint256 i = 0; i < positionCount; i++) {
+            positions[i] = indexToPosition[uint32(i)];
+        }
+    }
+
+
+
+    function configureTolerance(uint16 _toleranceBps) external onlyVaultOwner {
+        ProtocolSafetyLib.configureTolerance(config, vault, _toleranceBps);
+    }
+
+    function configureSlippage(uint24 _maxSlippageBps) external onlyVaultOwner {
+        ProtocolSafetyLib.configureSlippage(config, _maxSlippageBps);
+    }
+
+    function _optimalSwapParams(int24 a, int24 b) private view returns (RangeOperations.OptimalSwapParams memory) {
+        return ProtocolAccountingLib.optimalSwapParams(a, b);
+    }
+
+    function _updatePriceCacheInternal() external {
+        require(msg.sender == address(this), "E39");
+        ProtocolAccountingLib.updateRangeCache(
+            priceCache, config, protectionConfig, _protectionOverride, token0PriceFeed, token1PriceFeed, pool
+        );
+    }
+
+    function _addPosition(uint256 id) private {
+        positionCount =
+            ProtocolAccountingLib.addPosition(isOwnedPosition, positionIndex, indexToPosition, positionCount, id);
+    }
+
+    function _removePosition(uint256 id) private {
+        positionCount =
+            ProtocolAccountingLib.removePosition(isOwnedPosition, positionIndex, indexToPosition, positionCount, id);
+    }
+
+    function setOracleParams(uint16 _maxOracleDeviationBps, uint32 _maxAge0, uint32 _maxAge1) external onlyVaultOwner {
+        ProtocolSafetyLib.configureOracleParams(protectionConfig, _maxOracleDeviationBps, _maxAge0, _maxAge1);
+    }
+
+    function _executeValidatedSwap(bool z, uint256 a, uint256 m) private returns (uint256) {
+        return ProtocolAccountingLib.executeValidatedSwap(z, a, m);
+    }
+
     using SafeERC20 for IERC20;
     using RangeOperations for *;
 
@@ -115,16 +161,42 @@ contract RangeManager is Ownable, ReentrancyGuard {
     mapping(uint256 => bool) private isOwnedPosition;
 
     address public immutable pauseController;
-    ProtectionPolicyLib.OverrideState private _protectionOverride;
-    function protectionOverrideUntil() external view returns (uint64) { return _protectionOverride.until; }
-    function nextProtectionOverrideAt() external view returns (uint64) { return _protectionOverride.nextAt; }
-    function _effectiveTwap() private view returns (bool) { return block.timestamp < _protectionOverride.until ? _protectionOverride.twap : protectionConfig.sandwichDetectionEnabled; }
-    function _effectiveMev() private view returns (bool) { return block.timestamp < _protectionOverride.until ? _protectionOverride.mev : protectionConfig.mevProtectionEnabled; }
-    function _effectiveTicks() private view returns (uint16) { return block.timestamp < _protectionOverride.until ? _protectionOverride.ticks : protectionConfig.maxTwapDeviationTicks; }
+    ProtocolSafetyLib.ProtectionOverrideState private _protectionOverride;
+
+    function protectionOverrideUntil() external view returns (uint64) {
+        return _protectionOverride.until;
+    }
+
+    function nextProtectionOverrideAt() external view returns (uint64) {
+        return _protectionOverride.nextAt;
+    }
+
+    function _effectiveTwap() private view returns (bool) {
+        return block.timestamp < _protectionOverride.until
+            ? _protectionOverride.twap
+            : protectionConfig.sandwichDetectionEnabled;
+    }
+
+    function _effectiveMev() private view returns (bool) {
+        return
+            block.timestamp < _protectionOverride.until
+                ? _protectionOverride.mev
+                : protectionConfig.mevProtectionEnabled;
+    }
+
+    function _effectiveTicks() private view returns (uint16) {
+        return block.timestamp < _protectionOverride.until
+            ? _protectionOverride.ticks
+            : protectionConfig.maxTwapDeviationTicks;
+    }
+
     function effectiveProtections() external view returns (bool twap, bool mev, uint16 ticks) {
         return (_effectiveTwap(), _effectiveMev(), _effectiveTicks());
     }
-    function transferOwnership(address) public pure override { revert("Immutable Vault owner"); }
+
+    function transferOwnership(address) public pure override {
+        revert("Immutable Vault owner");
+    }
     // ===== EVENTS =====
 
     event PositionCreated(
@@ -180,12 +252,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     modifier onlyVaultOrAuthorized() {
-        if (
-            !(
-                msg.sender == address(this) || msg.sender == vault || msg.sender == owner()
-                    || authorizedExecutors[msg.sender]
-            )
-        ) revert E94();
+        if (!(msg.sender == address(this) || msg.sender == vault || msg.sender == owner()
+                    || authorizedExecutors[msg.sender])) revert E94();
         _;
     }
 
@@ -295,10 +363,10 @@ contract RangeManager is Ownable, ReentrancyGuard {
     /// @dev RangeStrategyEngine uses this view to enforce the community keeper priority window on-chain.
     function isProtocolBotCaller(address caller) public view returns (bool) {
         return caller != address(0)
-            && (
-                caller == protocolBotAddress || caller == protocolBotOperator || caller == safeAddress
-                    || authorizedExecutors[caller]
-            );
+            && (caller == protocolBotAddress
+                || caller == protocolBotOperator
+                || caller == safeAddress
+                || authorizedExecutors[caller]);
     }
 
     // ===== FONCTIONS DE CONFIGURATION (gouvernance via Vault owner) =====
@@ -307,46 +375,21 @@ contract RangeManager is Ownable, ReentrancyGuard {
     function setStrategyEngine(address engine, address protocolBot) external onlyVaultOwner {
         AutonomousPoolLib.requireInstallation(vault);
         if (address(strategyEngine) != address(0) && engine != address(strategyEngine)) revert E40();
-        address botOperator = AutonomousExecutionLib.validateEngine(engine, protocolBot, address(pool), address(0), false);
+        address botOperator = ProtocolSafetyLib.validateEngine(authorizedExecutors, protocolBotAddress, protocolBotOperator, engine, protocolBot, address(pool), address(0), false);
         IRangeStrategyEngine candidate = IRangeStrategyEngine(engine);
         strategyEngine = candidate;
-        authorizedExecutors[protocolBotAddress] = false;
-        authorizedExecutors[protocolBotOperator] = false;
-        authorizedExecutors[protocolBot] = true;
         protocolBotAddress = protocolBot;
         protocolBotOperator = botOperator;
         emit StrategyEngineSet(engine, protocolBot);
     }
 
-    function configureSlippage(uint24 _maxSlippageBps) external onlyVaultOwner {
-        if (_maxSlippageBps < 50 || _maxSlippageBps > 500) revert E19();
-        config.maxSlippageBps = _maxSlippageBps;
-    }
-
-    function configureTolerance(uint16 _toleranceBps) external onlyVaultOwner {
-        AutonomousPoolLib.requireInstallation(vault);
-        if (_toleranceBps > 1000) revert E20();
-
-        uint16 oldTolerance = config.toleranceBps;
-        config.toleranceBps = _toleranceBps;
-
-        emit ToleranceUpdated(oldTolerance, _toleranceBps);
-    }
-
     function configureProtections(bool twap, bool mev, uint16 ticks) external onlyVaultOwner {
-        ProtectionPolicyLib.configure(protectionConfig, _protectionOverride, vault, twap, mev, ticks);
+        ProtocolSafetyLib.configureProtections(protectionConfig, _protectionOverride, vault, twap, mev, ticks);
     }
 
     /// @notice (audit V1 — V3-M1) Paramètres oracle : seuil de déviation pool/oracle + heartbeats par feed.
 
     ///      désactivé : la NAV oracle du BotModule utilise le sqrt spot borné comme seed. Heartbeats 1h-48h.
-    function setOracleParams(uint16 _maxOracleDeviationBps, uint32 _maxAge0, uint32 _maxAge1) external onlyVaultOwner {
-        if (_maxOracleDeviationBps == 0 || _maxOracleDeviationBps > 1000) revert E21();
-        if (_maxAge0 < 3600 || _maxAge0 > 172800 || _maxAge1 < 3600 || _maxAge1 > 172800) revert E20();
-        protectionConfig.maxOracleDeviationBps = _maxOracleDeviationBps;
-        protectionConfig.maxAge0 = _maxAge0;
-        protectionConfig.maxAge1 = _maxAge1;
-    }
 
     /**
      * @notice Configure les oracles de prix Chainlink
@@ -558,12 +601,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     // ===== FONCTIONS DE CONSULTATION =====
 
-    function getOwnerPositions() public view returns (uint256[] memory positions) {
-        positions = new uint256[](positionCount);
-        for (uint256 i = 0; i < positionCount; i++) {
-            positions[i] = indexToPosition[uint32(i)];
-        }
-    }
+
 
     /**
      * @notice Fonction publique pour calculer les target ticks (appelable par le bot)
@@ -634,30 +672,23 @@ contract RangeManager is Ownable, ReentrancyGuard {
         return _optimalSwapParams(decision.targetTickLower, decision.targetTickUpper);
     }
 
-    function _optimalSwapParams(int24 tickLower, int24 tickUpper)
-        private
-        view
-        returns (RangeOperations.OptimalSwapParams memory)
-    {
-        // AUDIT C-02 : balances TOTALES (libres + principal NFT) = composition POST-burn que rebalance()
-        // rééquilibrera. Sinon une position hors-range (quasi mono-token, ~0 libre) → 0 swap calculé → mint
-        // revert après burn. getCurrentBalances() reflète l'état post-burn → dimensionnement keeper correct.
-        (uint256 bal0, uint256 bal1) = RangeOperations.getCurrentBalances(
-            token0, token1, address(this), getOwnerPositions(), positionManager, pool
+    function validateDepositSwapPlan(
+        uint256 depositAmount0,
+        uint256 depositAmount1,
+        uint256[] calldata swapAmountsIn,
+        uint256[] calldata minAmountsOut,
+        address tokenIn,
+        address tokenOut
+    ) external view onlyVault {
+        ProtocolSafetyLib.validateDeposit(
+            depositAmount0, depositAmount1, swapAmountsIn, minAmountsOut, tokenIn, tokenOut
         );
-        return RangeOperations.calculateOptimalSwapParams(bal0, bal1, priceCache, config, tickLower, tickUpper);
-    }
-
-    function validateDepositSwapPlan(uint256 depositAmount0, uint256 depositAmount1,
-        uint256[] calldata swapAmountsIn, uint256[] calldata minAmountsOut, address tokenIn, address tokenOut)
-        external view onlyVault {
-        AutonomousExecutionLib.validateDeposit(depositAmount0, depositAmount1, swapAmountsIn, minAmountsOut, tokenIn, tokenOut);
     }
 
     // ===== FONCTIONS INTERNES =====
 
     function _validatedStrategyDecision() private view returns (IRangeStrategyEngine.Decision memory) {
-        return AutonomousExecutionLib.currentDecision(address(strategyEngine));
+        return ProtocolSafetyLib.currentDecision(address(strategyEngine));
     }
 
     /// @dev (audit V1 — V3-H2) Refresh + barrière déviation/staleness mutualisée. updatePriceCache invalide le
@@ -693,7 +724,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
             return;
         }
         // SIMPLIFIÉ (audit V1 — gain bytecode, cohérence DN) : le pré-check try/catch latestRoundData +
-        // price<=0 était REDONDANT avec RangeOperations.updatePriceCache. Un seul try/catch suffit.
+        // price<=0 était REDONDANT avec ProtocolAccountingLib.updatePriceCache. Un seul try/catch suffit.
         try this._updatePriceCacheInternal() {
             emit PriceCacheUpdated(priceCache.price0, priceCache.price1, priceCache.poolTick);
         } catch {
@@ -715,49 +746,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
      *      This is NOT a security vulnerability - it's a design pattern. The only entry point is
      *      _updatePriceCache() which is called internally by other protected functions.
      */
-    function _updatePriceCacheInternal() external {
-        require(msg.sender == address(this), "E39"); // Self-call only - see NatSpec above
-        // Utiliser la library pour calculer le nouveau cache
-        RangeOperations.PriceCache memory newCache = RangeOperations.updatePriceCache(
-            token0PriceFeed,
-            token1PriceFeed,
-            pool,
-            config,
-            _effectiveTwap(),
-            _effectiveTicks(),
-            protectionConfig.maxOracleDeviationBps,
-            protectionConfig.maxAge0,
-            protectionConfig.maxAge1
-        );
-        // Mettre a jour le storage
-        priceCache = newCache;
-    }
-
-    function _addPosition(uint256 tokenId) private {
-        if (!isOwnedPosition[tokenId]) {
-            uint32 index = positionCount++;
-            positionIndex[tokenId] = index;
-            indexToPosition[index] = tokenId;
-            isOwnedPosition[tokenId] = true;
-        }
-    }
-
-    function _removePosition(uint256 tokenId) private {
-        if (isOwnedPosition[tokenId]) {
-            uint32 index = positionIndex[tokenId];
-            uint32 lastIndex = --positionCount;
-
-            if (index != lastIndex) {
-                uint256 lastTokenId = indexToPosition[lastIndex];
-                indexToPosition[index] = lastTokenId;
-                positionIndex[lastTokenId] = index;
-            }
-
-            delete indexToPosition[lastIndex];
-            delete positionIndex[tokenId];
-            delete isOwnedPosition[tokenId];
-        }
-    }
 
     function _getCurrentPortfolioValue() private view returns (uint256) {
         return IMultiUserVault(vault).getCurrentPortfolioValue();
@@ -784,7 +772,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         returns (uint256 amount0Sent, uint256 amount1Sent)
     {
         require(recipient != address(0), "E41");
-        (amount0Sent, amount1Sent) = ProtocolSafetyLib.emergencyWithdrawCore(
+        (amount0Sent, amount1Sent) = AutonomousRevenueLib.emergencyWithdrawCore(
             token0, token1, amount0Requested, amount1Requested, recipient, address(this)
         );
         emit EmergencyWithdraw(recipient, amount0Sent, amount1Sent, msg.sender);
@@ -887,7 +875,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         require(positionCount == 0 && IMultiUserVault(vault).isRebalancing(), "E90");
         RangeOperations.OptimalSwapParams memory plan = _optimalSwapParams(tickLower, tickUpper);
         require(step == 2, "E90");
-        _requireSubmittedSwapPlan(
+        ProtocolSafetyLib.requireSubmittedSwapPlan(
             plan.swapNeeded ? plan.amountIn : 0, plan.zeroForOne, plan.zeroForOne, amountIn, config.toleranceBps
         );
         if (amountIn > 0) _executeValidatedSwap(plan.zeroForOne, amountIn, minAmountOut);
@@ -950,7 +938,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
             }
             require(totalSwapUsd <= maxTotalSwapUsd, "E92");
         }
-        _requireSubmittedSwapPlan(
+        ProtocolSafetyLib.requireSubmittedSwapPlan(
             expectedPlan.swapNeeded ? expectedPlan.amountIn : 0,
             expectedPlan.zeroForOne,
             tokenInIsToken0,
@@ -987,57 +975,23 @@ contract RangeManager is Ownable, ReentrancyGuard {
     }
 
     function _validatedRebalanceDecision(bytes32 expectedDecisionHash, address keeper)
-        private view returns (IRangeStrategyEngine.Decision memory decision) {
+        private
+        view
+        returns (IRangeStrategyEngine.Decision memory decision)
+    {
         if (_effectiveMev()) require(block.timestamp - config.lastRebalanceTime >= MIN_REBALANCE_INTERVAL, "E03");
         require(positionCount == 1, "E90");
-        return AutonomousExecutionLib.validateDecision(address(strategyEngine), expectedDecisionHash,
-            isProtocolBotCaller(keeper), uint8(IRangeStrategyEngine.Action.RANGE_REBALANCE));
-    }
-
-    function _executeValidatedSwap(bool tokenInIsToken0, uint256 amountIn, uint256 minAmountOut)
-        private
-        returns (uint256 amountOut)
-    {
-        RangeOperations.validateSwapAgainstOracle(tokenInIsToken0, amountIn, minAmountOut, priceCache, config);
-        uint256 amountUsd = (amountIn * uint256(tokenInIsToken0 ? priceCache.price0 : priceCache.price1))
-            / (10 ** (tokenInIsToken0 ? config.token0Decimals : config.token1Decimals));
-        require(amountUsd <= initMultiSwapTvl * 1e8, "E91");
-        address tokenIn = tokenInIsToken0 ? token0 : token1;
-        address tokenOut = tokenInIsToken0 ? token1 : token0;
-        amountOut = RangeOperations.executeSwapCore(
-            tokenIn,
-            tokenOut,
-            amountIn,
-            minAmountOut,
-            config.fee,
-            address(this),
-            swapRouter,
-            _swapSqrtPriceLimit(tokenInIsToken0)
+        return ProtocolSafetyLib.validateDecision(
+            address(strategyEngine),
+            expectedDecisionHash,
+            isProtocolBotCaller(keeper),
+            uint8(IRangeStrategyEngine.Action.RANGE_REBALANCE)
         );
-        emit SwapExecuted(tokenIn, tokenOut, amountIn, amountOut);
     }
 
     /// @dev Bounds one swap to roughly config.maxSlippageBps of price movement from the validated live pool price.
     function _swapSqrtPriceLimit(bool zeroForOne) private view returns (uint160) {
         return RangeOperations.boundedSwapSqrtPriceLimit(priceCache.poolSqrtPriceX96, config.maxSlippageBps, zeroForOne);
-    }
-
-    function _requireSubmittedSwapPlan(
-        uint256 expectedAmountIn,
-        bool expectedZeroForOne,
-        bool tokenInIsToken0,
-        uint256 submittedAmountIn,
-        uint16 toleranceBps
-    ) private pure {
-        if (expectedAmountIn == 0) {
-            require(submittedAmountIn == 0, "E93");
-            return;
-        }
-        require(tokenInIsToken0 == expectedZeroForOne, "E94");
-        uint256 tolerance = (expectedAmountIn * uint256(toleranceBps)) / 10000;
-        if (tolerance == 0) tolerance = 1;
-        require(submittedAmountIn + tolerance >= expectedAmountIn, "E93");
-        require(submittedAmountIn <= expectedAmountIn + tolerance, "E93");
     }
 
     // ===== ADMIN SETTERS =====

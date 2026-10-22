@@ -115,135 +115,6 @@ library RangeStrategyDnLib {
     /// @dev Delegatecall from the existing hedge path. Admission uses the PRE-swap drift.
     ///      Consume free inventory before borrowing, preserve each dust floor and use the RM's
     ///      existing per-swap USD ceiling. A capped correction may continue at a later checkpoint.
-    function prepareHedgeInventory(uint256 target, bool enforceThresholds, bool allowInventoryContinuation)
-        external
-        returns (uint256 debt, int256 effectiveShort, bool inventoryOnly, uint256 normalized0)
-    {
-        IDnNegativeHedgeContext context = IDnNegativeHedgeContext(address(this));
-        address token0 = context.weth();
-        address rangeManager = context.rangeManager();
-        uint256 dustFloor = context.donationDustToken0();
-        uint256 idleHm;
-        (debt, effectiveShort, idleHm) = _effectiveShort(context.variableDebtWeth(), token0, rangeManager, dustFloor);
-        // Above the range, only reduce a net LONG inventory. Never create a short
-        // against an all-stable LP or repay the whole hedge merely because its target is zero.
-        if (target == 0 && !enforceThresholds) revert HedgeCheck(44);
-        bool inventoryRepay = target == 0 && effectiveShort >= 0;
-        uint256 difference = inventoryRepay
-            ? debt
-            : effectiveShort < int256(target)
-                ? uint256(int256(target) - effectiveShort)
-                : uint256(effectiveShort - int256(target));
-        bool pendingInventoryOnly = enforceThresholds && allowInventoryContinuation && effectiveShort < int256(target)
-            && int256(debt) > effectiveShort;
-        // Finishing a recorded chunk sequence never authorizes borrowing, even if
-        // the last chunk also satisfies the ordinary/critical hedge thresholds.
-        inventoryOnly = pendingInventoryOnly;
-        // Recorded continuations only consume inventory; ordinary/critical
-        // thresholds apply to every fresh debt adjustment, never to this continuation.
-        if (enforceThresholds && !pendingInventoryOnly) {
-            IDnAaveStrategyState hedge = IDnAaveStrategyState(address(this));
-            uint256 drift = target == 0 ? type(uint256).max : difference * BPS / target;
-            if (drift < hedge.adjustHedgeBps()) revert HedgeCheck(44);
-            if (
-                block.timestamp < uint256(hedge.lastHedgeAdjustAt()) + hedge.hedgeAdjustCooldown()
-                    && drift < hedge.criticalHedgeBps()
-            ) revert HedgeCheck(41);
-        }
-        if (!inventoryRepay && effectiveShort >= int256(target)) {
-            return (debt, effectiveShort, false, 0);
-        }
-        uint256 idle = inventoryRepay ? idleHm : uint256(int256(debt) - effectiveShort);
-        if (idle == 0) {
-            if (inventoryRepay) revert HedgeCheck(44);
-            return (debt, effectiveShort, false, 0);
-        }
-        IDnRangeManagerState(rangeManager).refreshPriceCache();
-        (uint128 price0, uint128 price1, uint160 sqrtP,,, bool valid) = IDnRangeManagerState(rangeManager).priceCache();
-        if (!(valid && price0 > 0 && price1 > 0 && sqrtP > 0)) revert InvalidNegativeHedgeSwap();
-
-        address token1 = context.usdc();
-        uint8 decimals0 = context.volatileDecimals();
-        uint256 inventoryNeeded = _min(difference, idle);
-        uint256 amount0 = _min(inventoryNeeded, _inventoryCap(rangeManager, price0, decimals0));
-        if (amount0 == 0) revert InvalidNegativeHedgeSwap();
-        // A zero-target inventory step is followed by a range decision, with no new
-        // borrowing, bounty or cooldown even when the net long has been eliminated.
-        inventoryOnly = target == 0 || inventoryOnly || amount0 < inventoryNeeded;
-        if (inventoryRepay) {
-            // A capped repayment from HM inventory removes matching assets and debt:
-            // no swap, no new delta, no extra debt. It makes a large residual inventory
-            // manageable by a subsequent atomic range sync without exceeding its cap.
-            if (IDnAaveSupply(context.pool()).repay(token0, amount0, 2, address(this)) != amount0) {
-                revert InvalidNegativeHedgeSwap();
-            }
-            emit RepayDebt(amount0);
-            return (debt, effectiveShort, true, amount0);
-        }
-        if (amount0 > idleHm) {
-            IDnRangeManagerState(rangeManager).sendTokenForHedge(token0, amount0 - idleHm, address(this));
-        }
-        uint256 slippageBps = context.swapSlippageBps();
-        uint256 minOut = _inventoryMinOut(amount0, price0, price1, decimals0, context.stableDecimals(), slippageBps);
-        if (minOut == 0) revert InvalidNegativeHedgeSwap();
-        uint256 rawLimit = (uint256(sqrtP) * (token0 < token1 ? 20000 - slippageBps : 20000 + slippageBps)) / 20000;
-        uint160 sqrtLimit = rawLimit < MIN_SQRT_PRICE_LIMIT_X96
-            ? MIN_SQRT_PRICE_LIMIT_X96
-            : rawLimit > MAX_SQRT_PRICE_LIMIT_X96 ? MAX_SQRT_PRICE_LIMIT_X96 : uint160(rawLimit);
-
-        uint256 token0Before = IERC20(token0).balanceOf(address(this));
-        uint256 amount1 = ISwapRouter(context.swapRouter()).exactInputSingle(
-            ISwapRouter.ExactInputSingleParams({
-                tokenIn: token0,
-                tokenOut: token1,
-                fee: context.swapPoolFee(),
-                recipient: address(this),
-                deadline: block.timestamp,
-                amountIn: amount0,
-                amountOutMinimum: minOut,
-                sqrtPriceLimitX96: sqrtLimit
-            })
-        );
-        if (IERC20(token0).balanceOf(address(this)) != token0Before - amount0) {
-            revert InvalidNegativeHedgeSwap();
-        }
-        // The stable reserve is shared portfolio equity; queued user deposits stay in the Vault.
-        IDnAaveSupply(context.pool()).supply(token1, IERC20(token1).balanceOf(address(this)), address(this), 0);
-        int256 beforeShort = effectiveShort;
-        (debt, effectiveShort,) = _effectiveShort(context.variableDebtWeth(), token0, rangeManager, dustFloor);
-        if (effectiveShort != beforeShort + int256(amount0)) revert InvalidNegativeHedgeSwap();
-        normalized0 = amount0;
-        emit HedgeInventoryNormalized(amount0, amount1, amount0 == inventoryNeeded);
-    }
-
-    function _inventoryMinOut(
-        uint256 amount0, uint128 price0, uint128 price1, uint8 decimals0, uint8 decimals1, uint256 slippageBps
-    ) private pure returns (uint256) {
-        return Math.mulDiv(
-            Math.mulDiv(amount0, uint256(price0) * (10 ** decimals1), uint256(price1) * (10 ** decimals0)),
-            BPS - slippageBps,
-            BPS
-        );
-    }
-
-    function _inventoryCap(address rm, uint128 price0, uint8 decimals0) private view returns (uint256) {
-        return Math.mulDiv(IDnRangeManagerState(rm).initMultiSwapTvl() * 1e8, 10 ** decimals0, price0);
-    }
-
-    function _effectiveShort(address debtToken, address token0, address rangeManager, uint256 dustFloor)
-        private
-        view
-        returns (uint256 debt, int256 effectiveShort, uint256 idleHm)
-    {
-        debt = IERC20(debtToken).balanceOf(address(this));
-        idleHm = _netOfDust(IERC20(token0).balanceOf(address(this)), dustFloor);
-        uint256 idleRm = _netOfDust(IERC20(token0).balanceOf(rangeManager), dustFloor);
-        effectiveShort = int256(debt) - int256(idleHm) - int256(idleRm);
-    }
-
-    function _netOfDust(uint256 balance, uint256 dustFloor) private pure returns (uint256) {
-        return balance > dustFloor ? balance - dustFloor : 0;
-    }
 
     struct Context {
         bool configured;
@@ -408,7 +279,7 @@ library RangeStrategyDnLib {
         // These assets belong to the RM; pending deposits remain reserved in the Vault.
         context.idleRmValueBase = idleRm * uint256(price0) / (10 ** context.token0Decimals)
             + IERC20(IDnRangeManagerState(rangeManager).token1()).balanceOf(rangeManager) * uint256(price1)
-                / (10 ** context.token1Decimals);
+            / (10 ** context.token1Decimals);
         context.hedgeTargetBps = hedge.hedgeTargetBps();
         context.adjustThresholdBps = hedge.adjustHedgeBps();
         context.liquidationThresholdBps = hedge.liqThresholdBps();
@@ -493,8 +364,9 @@ library RangeStrategyDnLib {
         pure
         returns (bool)
     {
-        return liveTick > lower && liveTick < upper
-            && _rangeSkewWithinBounds(lower, upper, liveTick, tickSpacing, maxSkewBps);
+        return
+            liveTick > lower && liveTick < upper
+                && _rangeSkewWithinBounds(lower, upper, liveTick, tickSpacing, maxSkewBps);
     }
 
     function searchCandidates(
@@ -526,8 +398,7 @@ library RangeStrategyDnLib {
                 int256 skew =
                     int256(width) * int256(skewFactors[s]) * int256(uint256(config.maxSkewBps)) / int256(BPS * BPS);
                 int24 center = _clampInt24(int256(config.analyticalAnchor) + skew);
-                (int24 lower, int24 upper) =
-                    _alignedCandidateRange(center, uint16(alignedWidth), config.tickSpacing);
+                (int24 lower, int24 upper) = _alignedCandidateRange(center, uint16(alignedWidth), config.tickSpacing);
                 Candidate memory candidate =
                     _evaluateCandidate(context, position, risk, config, lower, upper, position.inRange);
                 if (candidate.admissible) {
@@ -566,13 +437,11 @@ library RangeStrategyDnLib {
         bool isCurrentRange = position.exists && lower == position.lower && upper == position.upper;
         if (
             lower >= upper || lower <= MIN_TICK || upper >= MAX_TICK
-                || (
-                    !isCurrentRange
-                        && (
-                            config.referenceTick <= lower || config.referenceTick >= upper || config.liveTick <= lower
-                                || config.liveTick >= upper
-                        )
-                )
+                || (!isCurrentRange
+                    && (config.referenceTick <= lower
+                        || config.referenceTick >= upper
+                        || config.liveTick <= lower
+                        || config.liveTick >= upper))
         ) return candidate;
 
         uint256 halfWidth = uint256(uint24(upper - lower)) / 2;
@@ -656,10 +525,8 @@ library RangeStrategyDnLib {
     ) private pure returns (int24 bestLower, int24 bestUpper, bool found) {
         if (
             !context.configured
-                || (
-                    !position.exists
-                        && (context.idleRmValueBase == 0 || (context.collateralBase == 0 && context.debtBase == 0))
-                )
+                || (!position.exists
+                    && (context.idleRmValueBase == 0 || (context.collateralBase == 0 && context.debtBase == 0)))
         ) return (0, 0, false);
         int256 spacing = int256(config.tickSpacing);
         int256 low = int256(config.liveTick) - int256(uint256(width)) + spacing;
@@ -682,8 +549,7 @@ library RangeStrategyDnLib {
 
         for (uint256 iteration; iteration < 12 && low <= high; ++iteration) {
             int256 middle = (low + high) / 2;
-            (int24 lower, int24 upper) =
-                _alignedCandidateRange(_clampInt24(middle), alignedWidth, config.tickSpacing);
+            (int24 lower, int24 upper) = _alignedCandidateRange(_clampInt24(middle), alignedWidth, config.tickSpacing);
             uint256 target;
             if (
                 config.liveTick > lower && config.liveTick < upper
@@ -710,10 +576,11 @@ library RangeStrategyDnLib {
             int256 center = endpoint == 0 ? low : high;
             if (center < minimumSearchCenter) center = minimumSearchCenter;
             if (center > maximumSearchCenter) center = maximumSearchCenter;
-            (int24 lower, int24 upper) =
-                _alignedCandidateRange(_clampInt24(center), alignedWidth, config.tickSpacing);
+            (int24 lower, int24 upper) = _alignedCandidateRange(_clampInt24(center), alignedWidth, config.tickSpacing);
             if (config.liveTick <= lower || config.liveTick >= upper) continue;
-            if (!_rangeSkewWithinBounds(lower, upper, config.liveTick, config.tickSpacing, config.maxSkewBps)) continue;
+            if (!_rangeSkewWithinBounds(lower, upper, config.liveTick, config.tickSpacing, config.maxSkewBps)) {
+                continue;
+            }
             if (position.inRange && !_movementWithinBounds(position, config, lower, upper)) continue;
             uint256 target = _candidateTargetShort(context, position, lower, upper, config.liveTick);
             if (target == 0) continue;
@@ -874,8 +741,8 @@ library RangeStrategyDnLib {
         direction = int256(target) > short ? 1 : int256(target) < short ? 2 : 0;
         uint256 exposureToken0 = direction == 1 ? uint256(int256(target) - short) : uint256(short - int256(target));
         uint256 token0Units = 10 ** context.token0Decimals;
-        uint256 portfolioBase = token0InLp * uint256(context.price0) / token0Units
-            + token1InLp * uint256(context.price1) / (10 ** context.token1Decimals);
+        uint256 portfolioBase = token0InLp * uint256(context.price0) / token0Units + token1InLp
+            * uint256(context.price1) / (10 ** context.token1Decimals);
         uint256 exposureBase = exposureToken0 * uint256(context.price0) / token0Units;
         exposureBps = portfolioBase == 0 ? type(uint256).max : exposureBase * BPS / portfolioBase;
         if (target == 0 && short >= 0) {
@@ -958,8 +825,8 @@ library RangeStrategyDnLib {
         view
         returns (RangeTiming memory timing)
     {
-        timing.forcePersistent =
-            input.outOfRangeSince > 0 && block.timestamp >= uint256(input.outOfRangeSince) + input.maxOutOfRangeSeconds;
+        timing.forcePersistent = input.outOfRangeSince > 0
+            && block.timestamp >= uint256(input.outOfRangeSince) + input.maxOutOfRangeSeconds;
         uint256 outsideDepth = input.liveTick < input.lower
             ? uint256(uint24(input.lower - input.liveTick))
             : input.liveTick > input.upper ? uint256(uint24(input.liveTick - input.upper)) : 0;
@@ -972,7 +839,8 @@ library RangeStrategyDnLib {
         bool cooldownEndsSoon =
             timing.cooldownActive && rangeAvailableAt <= block.timestamp + input.coalesceHorizonSeconds;
         bool persistenceDueSoon = input.outOfRangeSince > 0
-            && uint256(input.outOfRangeSince) + input.maxOutOfRangeSeconds <= block.timestamp + input.coalesceHorizonSeconds;
+            && uint256(input.outOfRangeSince) + input.maxOutOfRangeSeconds
+                <= block.timestamp + input.coalesceHorizonSeconds;
         bool rangeSignal = (input.edgeEnough && timing.exitConfirmed) || !input.inRange;
         timing.coalesceHedge =
             hedgeEligible && !input.criticalHedge && rangeSignal && (cooldownEndsSoon || persistenceDueSoon);
@@ -1014,8 +882,9 @@ library RangeStrategyDnLib {
         uint256 outsideDepth,
         uint256 currentHalfWidth
     ) private view returns (bool) {
-        bool twapOutsideSameSide = (liveTick <= position.lower && tacticalTwapTick <= position.lower)
-            || (liveTick >= position.upper && tacticalTwapTick >= position.upper);
+        bool twapOutsideSameSide =
+            (liveTick <= position.lower && tacticalTwapTick <= position.lower)
+                || (liveTick >= position.upper && tacticalTwapTick >= position.upper);
         bool persistedOneEpoch = signalSince > 0 && block.timestamp >= uint256(signalSince) + epochSeconds;
         return twapOutsideSameSide || persistedOneEpoch
             || outsideDepth >= _exitConfirmationDepth(currentHalfWidth, tickSpacing);
@@ -1068,8 +937,8 @@ library RangeStrategyDnLib {
     ) private pure returns (uint256) {
         (uint256 amount0, uint256 amount1) =
             RangeOperations.strategyAmountsAtTick(lower, upper, liveTick, SAMPLE_LIQUIDITY);
-        uint256 value = amount0 * uint256(context.price0) / (10 ** context.token0Decimals)
-            + amount1 * uint256(context.price1) / (10 ** context.token1Decimals);
+        uint256 value = amount0 * uint256(context.price0) / (10 ** context.token0Decimals) + amount1
+            * uint256(context.price1) / (10 ** context.token1Decimals);
         if (value == 0) return 0;
         // RM balances are reminted together with the released NFT, in ordinary
         // rebalances as well as recovery. They are not also available to finance the hedge.
@@ -1110,8 +979,14 @@ library RangeStrategyDnLib {
             // Match the executor's smallest representable output. A near-aligned
             // target must not schedule an inventory swap whose minOut rounds to zero.
             if (
-                _inventoryMinOut(amount0, context.price0, context.price1, context.token0Decimals,
-                    context.token1Decimals, context.swapSlippageBps) == 0
+                _inventoryMinOut(
+                        amount0,
+                        context.price0,
+                        context.price1,
+                        context.token0Decimals,
+                        context.token1Decimals,
+                        context.swapSlippageBps
+                    ) == 0
             ) return projected;
             inventoryRemaining = amount0 < needed || (allowInventoryStep && context.inventoryNormalizationPending);
             effectiveShort += int256(amount0);
@@ -1259,5 +1134,28 @@ library RangeStrategyDnLib {
         if (value < minimum) return minimum;
         if (value > maximum) return maximum;
         return value;
+    }
+
+    function _netOfDust(uint256 balance, uint256 dustFloor) private pure returns (uint256) {
+        return balance > dustFloor ? balance - dustFloor : 0;
+    }
+
+    function _inventoryCap(address rm, uint128 price0, uint8 decimals0) private view returns (uint256) {
+        return Math.mulDiv(IDnRangeManagerState(rm).initMultiSwapTvl() * 1e8, 10 ** decimals0, price0);
+    }
+
+    function _inventoryMinOut(
+        uint256 amount0,
+        uint128 price0,
+        uint128 price1,
+        uint8 decimals0,
+        uint8 decimals1,
+        uint256 slippageBps
+    ) private pure returns (uint256) {
+        return Math.mulDiv(
+            Math.mulDiv(amount0, uint256(price0) * (10 ** decimals1), uint256(price1) * (10 ** decimals0)),
+            BPS - slippageBps,
+            BPS
+        );
     }
 }

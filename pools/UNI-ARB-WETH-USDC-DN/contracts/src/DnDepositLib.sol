@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./ProtocolAccountingLib.sol";
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -157,91 +158,12 @@ library DnDepositLib {
     /// @dev A partial exit must meet the ordinary HF target, or preserve an already lower HF. The only
     ///      allowance below that inherited HF covers one native unit of each Aave token plus USD-base
     ///      conversion/percentMul rounding. It scales with debt, not a fixed percentage of the position.
-    function aavePostSettlement(
-        address aavePool,
-        address aToken,
-        address debtToken,
-        bool fullWithdraw,
-        uint256 hfBefore,
-        uint16 targetHfBps
-    ) external view {
-        if (fullWithdraw) {
-            if (IERC20(debtToken).balanceOf(address(this)) > 0 || IERC20(aToken).balanceOf(address(this)) > 0) {
-                revert HedgeCheck(56);
-            }
-            return;
-        }
-        (uint256 collateralBase, uint256 debtBase,,,, uint256 hfAfter) =
-            IAavePoolDep(aavePool).getUserAccountData(address(this));
-        uint256 targetHf = uint256(targetHfBps) * 1e14;
-        if (hfAfter >= targetHf) return;
-        if (hfBefore >= targetHf || hfAfter < 1e18 || debtBase == 0) revert BadHealthFactor();
-        if (hfAfter >= hfBefore) return;
-
-        uint256 collateralBalance = IERC20(aToken).balanceOf(address(this));
-        uint256 debtBalance = IERC20(debtToken).balanceOf(address(this));
-        if (collateralBalance == 0 || debtBalance == 0) revert BadHealthFactor();
-        uint256 collateralUnitBase = Math.mulDiv(collateralBase, 1, collateralBalance, Math.Rounding.Up) + 2;
-        uint256 debtUnitBase = Math.mulDiv(debtBase, 1, debtBalance, Math.Rounding.Up) + 1;
-        uint256 roundingAllowance = Math.mulDiv(hfBefore, debtUnitBase, debtBase, Math.Rounding.Up)
-            + Math.mulDiv(1e18, collateralUnitBase, debtBase, Math.Rounding.Up) + 1;
-        if (hfBefore - hfAfter > roundingAllowance) revert BadHealthFactor();
-    }
 
     /// @notice Exact debt-token amount to repay through the existing flash-loan path when HF is below target.
     /// @dev Solves the repay-first equation while accounting for the collateral needed to buy back the flash
     ///      principal and premium. A small 10 bps HF buffer absorbs Aave/base-unit rounding.
     /// @dev Sizes the idle repayment first, then the residual flash repair against the conservative
     ///      post-repay debt estimate. The caller executes both atomically and verifies the final HF.
-    function aaveHfRepairAmounts() external view returns (uint256 directAmount, uint256 flashAmount) {
-        IHedgeRepairContext context = IHedgeRepairContext(address(this));
-        address aavePool = context.pool();
-        address debtToken = context.variableDebtWeth();
-        uint16 targetHfBps = context.operationalHfTargetBps();
-        uint16 triggerHfBps = context.hfRepairTriggerBps();
-        uint16 swapSlippageBps = context.swapSlippageBps();
-        uint256 bufferedTarget = uint256(targetHfBps) + 10;
-        uint256 premiumBps = IAavePoolDep(aavePool).FLASHLOAN_PREMIUM_TOTAL();
-        uint256 costBps = 10000 + uint256(swapSlippageBps) + premiumBps + 5;
-        (uint256 collateralBase, uint256 debtBase,, uint256 liveThreshold,, uint256 hf) =
-            IAavePoolDep(aavePool).getUserAccountData(address(this));
-        if (debtBase == 0 || hf >= uint256(triggerHfBps) * 1e14) {
-            return (0, 0);
-        }
-
-        uint256 protectedCollateral = uint256(liveThreshold) * collateralBase;
-        uint256 required = bufferedTarget * debtBase;
-        if (required <= protectedCollateral) return (0, 0);
-
-        uint256 debtBalance = IERC20(debtToken).balanceOf(address(this));
-        if (debtBalance == 0) return (0, 0);
-        uint256 directNeeded =
-            Math.mulDiv(debtBalance, required - protectedCollateral, bufferedTarget * debtBase, Math.Rounding.Up);
-        uint256 roundingBuffer = debtBalance / debtBase + 1;
-        directNeeded = debtBalance - directNeeded < roundingBuffer ? debtBalance : directNeeded + roundingBuffer;
-        uint256 idle = IERC20(context.weth()).balanceOf(address(this));
-        directAmount = idle < directNeeded ? idle : directNeeded;
-
-        uint256 remainingDebtBase = debtBase;
-        uint256 remainingDebtBalance = debtBalance;
-        if (directAmount > 0) {
-            uint256 repaidBase = Math.mulDiv(debtBase, directAmount, debtBalance);
-            remainingDebtBase -= repaidBase;
-            remainingDebtBalance -= directAmount;
-        }
-        required = bufferedTarget * remainingDebtBase;
-        // Zero collateral still permits an idle repayment, but not a flash leg.
-        if (required <= protectedCollateral || remainingDebtBase == 0 || protectedCollateral == 0) {
-            return (directAmount, 0);
-        }
-
-        uint256 collateralCost = Math.mulDiv(uint256(liveThreshold), costBps, 10000, Math.Rounding.Up);
-        if (bufferedTarget <= collateralCost) revert InvalidSwapPlan();
-        uint256 repayBase =
-            Math.mulDiv(required - protectedCollateral, 1, bufferedTarget - collateralCost, Math.Rounding.Up);
-        flashAmount = Math.mulDiv(remainingDebtBalance, repayBase, remainingDebtBase, Math.Rounding.Up);
-        if (flashAmount > remainingDebtBalance) flashAmount = remainingDebtBalance;
-    }
 
     function executeDepositSwaps(
         address rangeManager,
@@ -392,16 +314,11 @@ library DnDepositLib {
         (uint128 p0, uint128 p1, uint160 sp, int24 tk, uint64 ts, bool v) = rm.priceCache();
         (bool twapEnabled,,,,,) = rm.protectionConfig();
         if (twapEnabled) {
-            tk = RangeOperations.trustedTwapTick(rm.pool());
+            tk = ProtocolAccountingLib.trustedTwapTick(rm.pool());
             sp = RangeOperations.sqrtRatioAtTickExt(tk);
         }
         pc = RangeOperations.PriceCache({
-            price0: p0,
-            price1: p1,
-            poolSqrtPriceX96: sp,
-            poolTick: tk,
-            timestamp: ts,
-            valid: v
+            price0: p0, price1: p1, poolSqrtPriceX96: sp, poolTick: tk, timestamp: ts, valid: v
         });
     }
 
@@ -587,18 +504,19 @@ library DnDepositLib {
         uint160 sqrtPriceLimitX96
     ) external returns (uint256 received) {
         uint256 beforeBalance = IERC20(tokenOut).balanceOf(address(this));
-        ISwapRouter(router).exactOutputSingle(
-            ISwapRouter.ExactOutputSingleParams({
-                tokenIn: tokenIn,
-                tokenOut: tokenOut,
-                fee: fee,
-                recipient: address(this),
-                deadline: block.timestamp,
-                amountOut: amountOut,
-                amountInMaximum: amountInMaximum,
-                sqrtPriceLimitX96: sqrtPriceLimitX96
-            })
-        );
+        ISwapRouter(router)
+            .exactOutputSingle(
+                ISwapRouter.ExactOutputSingleParams({
+                    tokenIn: tokenIn,
+                    tokenOut: tokenOut,
+                    fee: fee,
+                    recipient: address(this),
+                    deadline: block.timestamp,
+                    amountOut: amountOut,
+                    amountInMaximum: amountInMaximum,
+                    sqrtPriceLimitX96: sqrtPriceLimitX96
+                })
+            );
         received = IERC20(tokenOut).balanceOf(address(this)) - beforeBalance;
     }
 
@@ -613,8 +531,9 @@ library DnDepositLib {
         address recipient
     ) external {
         if (IERC20(aToken).balanceOf(address(this)) > 0) {
-            uint256 collateralAmount =
-                fullWithdraw ? type(uint256).max : (IERC20(aToken).balanceOf(address(this)) * proportionX18) / 1e18;
+            uint256 collateralAmount = fullWithdraw
+                ? type(uint256).max
+                : (IERC20(aToken).balanceOf(address(this)) * proportionX18) / 1e18;
             if (collateralAmount > 0) {
                 IAavePoolDep(aavePool).withdraw(collateralToken, collateralAmount, recipient);
             }
@@ -805,7 +724,7 @@ library DnDepositLib {
             // The caller still enforces the oracle AND TWAP deviation guards.
             (sqrtPriceX96, currentTick,,,,,) = lpPool.slot0();
         } else {
-            currentTick = RangeOperations.trustedTwapTick(lpPool);
+            currentTick = ProtocolAccountingLib.trustedTwapTick(lpPool);
             sqrtPriceX96 = RangeOperations.sqrtRatioAtTickExt(currentTick);
         }
         uint160 sqrtRatioA = RangeOperations.sqrtRatioAtTickExt(tickLower);
@@ -848,7 +767,7 @@ library DnDepositLib {
 
         (bool twapEnabled,, uint16 maxTwapDeviationTicks,,,) = IRmDep(rangeManager).protectionConfig();
         if (twapEnabled) {
-            int24 twapTick = RangeOperations.trustedTwapTick(lpPool);
+            int24 twapTick = ProtocolAccountingLib.trustedTwapTick(lpPool);
             int24 tickDiff = currentTick > twapTick ? currentTick - twapTick : twapTick - currentTick;
             if (uint24(tickDiff) > uint24(maxTwapDeviationTicks)) revert LpTwapDeviation();
         }
