@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./ProtocolAccountingLib.sol";
 import "./AutonomousErrors.sol";
 
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
@@ -12,7 +13,7 @@ import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/Aggrega
 ///
 ///      POURQUOI UN WRAPPER plutôt que modifier les contrats :
 ///      - Les prix Chainlink sont lus à PLUSIEURS endroits hors du cache RangeManager : Treasury.swapToUSDC,
-///        AaveHedgeManager (_oracleMaxUsdcForWeth, _requireLpNotDeviated). Un fix dans RangeOperations.updatePriceCache
+///        AaveHedgeManager (_oracleMaxUsdcForWeth, _requireLpNotDeviated). Un fix dans ProtocolAccountingLib.updatePriceCache
 ///        n'aurait couvert QUE le cache. Le wrapper couvre TOUS les consommateurs d'un coup.
 ///      - Les contrats critiques RangeManager/Treasury/HedgeManager continuent d'appeler latestRoundData()
 ///        sur ce qu'ils croient être un feed Chainlink. Le wrapper garantit aussi un prix USD en 8 décimales,

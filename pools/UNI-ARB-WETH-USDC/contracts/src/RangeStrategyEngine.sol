@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import {ProtocolAccountingLib} from "./ProtocolAccountingLib.sol";
 import "./AutonomousPoolLib.sol";
 
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
@@ -44,6 +45,12 @@ interface IStrategyCheckpointTreasury {
 /// @dev The contract never holds funds. It combines bounded online estimators, an analytical anchor and a
 ///      fixed multi-scenario optimizer. Keepers submit no market data, score, debt target or ticks.
 contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
+    function _canonicalTwaps(uint64 epoch, StrategyConfig memory cfg) private view returns (int24, int24) {
+        return ProtocolAccountingLib.canonicalTwaps(
+            pool, epoch, cfg.epochSeconds, cfg.tacticalHorizonSeconds, cfg.strategicHorizonSeconds
+        );
+    }
+
     uint16 public constant override strategyVersion = 2;
     uint256 private constant BPS = 10_000;
     uint256 private constant EXIT_CONFIRMATION_DEPTH_BPS = 1_000;
@@ -261,8 +268,6 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         _transferOwnership(vaultAddress);
     }
 
-
-
     function renounceOwnership() public pure override {
         revert InvalidAddress();
     }
@@ -276,13 +281,14 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
                 || cfg.maxOutOfRangeSeconds < cfg.epochSeconds || cfg.maxOutOfRangeSeconds > 7 days
                 || cfg.minHalfRangeTicks < minWidth || cfg.maxHalfRangeTicks <= cfg.minHalfRangeTicks
                 || cfg.maxHalfRangeTicks > 5000 || cfg.fallbackRangeUpTicks < cfg.minHalfRangeTicks
-                || cfg.fallbackRangeUpTicks > cfg.maxHalfRangeTicks || cfg.fallbackRangeDownTicks < cfg.minHalfRangeTicks
+                || cfg.fallbackRangeUpTicks > cfg.maxHalfRangeTicks
+                || cfg.fallbackRangeDownTicks < cfg.minHalfRangeTicks
                 || cfg.fallbackRangeDownTicks > cfg.maxHalfRangeTicks || cfg.maxSkewBps > 5000 || cfg.minEdgeBps == 0
                 || cfg.minEdgeBps > 2000 || cfg.tailRiskBps < 100 || cfg.tailRiskBps > 5000
-                || cfg.maxLearningInfluenceBps == 0 || cfg.maxLearningInfluenceBps > 5000 || cfg.learningInfluenceBps == 0
-                || cfg.learningInfluenceBps > cfg.maxLearningInfluenceBps || cfg.maxCenterMoveBps > 10_000
-                || cfg.maxWidthChangeBps > 10_000 || cfg.transitionCostBps > 1000 || cfg.dnMinStressHfBps != 0
-                || !_hasAlignedHalfWidth(cfg.minHalfRangeTicks, cfg.maxHalfRangeTicks)
+                || cfg.maxLearningInfluenceBps == 0 || cfg.maxLearningInfluenceBps > 5000
+                || cfg.learningInfluenceBps == 0 || cfg.learningInfluenceBps > cfg.maxLearningInfluenceBps
+                || cfg.maxCenterMoveBps > 10_000 || cfg.maxWidthChangeBps > 10_000 || cfg.transitionCostBps > 1000
+                || cfg.dnMinStressHfBps != 0 || !_hasAlignedHalfWidth(cfg.minHalfRangeTicks, cfg.maxHalfRangeTicks)
         ) revert InvalidConfiguration();
     }
 
@@ -351,8 +357,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
                 realizedMove, tacticalTick, strategicTick, fastVol, slowVol, upside, downside, observedFees, slowFees
             );
         }
-        (int24 forecastTrend, uint24 forecastVol, uint16 forecastFees, uint16 uncertainty) = RangeOperations
-            .combineStrategyForecasts(
+        (int24 forecastTrend, uint24 forecastVol, uint16 forecastFees, uint16 uncertainty) = RangeOperations.combineStrategyForecasts(
             _trendPredictions,
             _volatilityPredictions,
             _feePredictions,
@@ -435,29 +440,6 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         if (!configurationOnly) {
             try IStrategyCheckpointTreasury(treasury).payStrategyCheckpointBounty(msg.sender, epoch) {} catch {}
         }
-    }
-
-    function _canonicalTwaps(uint64 epoch, StrategyConfig memory cfg)
-        private
-        view
-        returns (int24 tacticalTick, int24 strategicTick)
-    {
-        uint256 boundary = uint256(epoch) * cfg.epochSeconds;
-        uint256 offset = block.timestamp - boundary;
-        if (offset > type(uint32).max) revert StrategyDataUnavailable();
-        uint32 endAgo = uint32(offset);
-        uint32[] memory secondsAgos = new uint32[](3);
-        secondsAgos[0] = endAgo + cfg.strategicHorizonSeconds;
-        secondsAgos[1] = endAgo + cfg.tacticalHorizonSeconds;
-        secondsAgos[2] = endAgo;
-        (int56[] memory cumulatives,) = IUniswapV3Pool(pool).observe(secondsAgos);
-        strategicTick = _meanTick(cumulatives[2] - cumulatives[0], cfg.strategicHorizonSeconds);
-        tacticalTick = _meanTick(cumulatives[2] - cumulatives[1], cfg.tacticalHorizonSeconds);
-    }
-
-    function _meanTick(int56 delta, uint32 seconds_) private pure returns (int24 tick) {
-        tick = int24(delta / int56(uint56(seconds_)));
-        if (delta < 0 && delta % int56(uint56(seconds_)) != 0) tick--;
     }
 
     function _observedFeeRateBps(
@@ -547,23 +529,21 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         PositionState memory position = _positionState(liveTick);
         bool expectedPosition = decision.currentTickLower < decision.currentTickUpper;
         bool positionChanged = position.exists != expectedPosition
-            || (
-                expectedPosition
-                    && (position.lower != decision.currentTickLower || position.upper != decision.currentTickUpper)
-            );
+            || (expectedPosition
+                && (position.lower != decision.currentTickLower || position.upper != decision.currentTickUpper));
         uint256 maxExecutionDrift =
             _max(uint256(strategyConfig.minHalfRangeTicks) / 2, uint256(uint24(_strategyTickSpacing)) * 2);
         bool rangeUnsafe = decision.action == Action.RANGE_REBALANCE
-            && (
-                liveTick <= decision.targetTickLower || liveTick >= decision.targetTickUpper
-                    || !_rangeSkewWithinBounds(decision.targetTickLower, decision.targetTickUpper, liveTick)
-            );
+            && (liveTick <= decision.targetTickLower
+                || liveTick >= decision.targetTickUpper
+                || !_rangeSkewWithinBounds(decision.targetTickLower, decision.targetTickUpper, liveTick));
         bool oracleGuard = !oracleValid || (profile == StrategyProfile.STABLE && _depegBps(price0, price1) > 200);
         bool due = checkpointDue();
 
         if (
             decision.decisionHash == bytes32(0) || oracleGuard || due || block.timestamp > decision.validUntil
-                || _absTick(_subTicks(liveTick, decision.currentTick)) > maxExecutionDrift || positionChanged || rangeUnsafe
+                || _absTick(_subTicks(liveTick, decision.currentTick)) > maxExecutionDrift || positionChanged
+                || rangeUnsafe
         ) {
             decision.action = Action.CHECKPOINT_ONLY;
             decision.reason =
@@ -597,7 +577,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         uint256 maxExecutionDrift =
             _max(uint256(strategyConfig.minHalfRangeTicks) / 2, uint256(uint24(_strategyTickSpacing)) * 2);
         decision.dataFresh = oracleValid && !due && marketState.checkpointTimestamp != 0
-            && block.timestamp <= decision.validUntil && _absTick(_subTicks(liveTick, referenceTick)) <= maxExecutionDrift;
+            && block.timestamp <= decision.validUntil
+            && _absTick(_subTicks(liveTick, referenceTick)) <= maxExecutionDrift;
 
         if (!oracleValid) {
             decision.action = Action.NO_ACTION;
@@ -780,10 +761,11 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         bool isCurrentRange = position.exists && lower == position.lower && upper == position.upper;
         if (
             lower >= upper || lower <= MIN_TICK || upper >= MAX_TICK
-                || (
-                    !isCurrentRange
-                        && (scoringTick <= lower || scoringTick >= upper || executionTick <= lower || executionTick >= upper)
-                )
+                || (!isCurrentRange
+                    && (scoringTick <= lower
+                        || scoringTick >= upper
+                        || executionTick <= lower
+                        || executionTick >= upper))
         ) {
             return candidate;
         }
@@ -946,14 +928,6 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         emit StrategyExecutionRecorded(current.epoch, decisionHash, action, keeper, msg.sender);
     }
 
-
-
-
-
-
-
-
-
     function _alignedRange(int24 center, int24 down, int24 up) private view returns (int24 lower, int24 upper) {
         lower = _floorToSpacing(_boundedTick(int256(center) - down));
         upper = _ceilToSpacing(_boundedTick(int256(center) + up));
@@ -1043,8 +1017,4 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         if (value > maximum) return maximum;
         return value;
     }
-
-
-
-
 }

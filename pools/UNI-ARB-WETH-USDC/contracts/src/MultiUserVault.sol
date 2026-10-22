@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./ProtocolAccountingLib.sol";
 import "./AutonomousErrors.sol";
 import "./ProtocolSafetyLib.sol";
 import "./AutonomousPoolLib.sol";
@@ -14,7 +15,6 @@ import "./RangeOperations.sol";
 import "./interfaces/IRangeStrategyEngine.sol";
 
 // Interface etendue pour RangeManager
-
 
 interface IRangeManagerExtended {
     function setSafeAddress(address _safe) external;
@@ -75,6 +75,31 @@ interface IProgressiveRebalanceStatus {
 }
 
 contract MultiUserVault is Ownable, ReentrancyGuard {
+    function _calculateDepositValue(uint256 a, uint256 b) private view returns (uint256) {
+        return ProtocolAccountingLib.depositValue(address(rangeManager), a, b);
+    }
+
+    function _executeWithdrawFromRange(
+        uint256 principal0,
+        uint256 principal1,
+        address recipient,
+        uint256 shareAmount,
+        uint256 totalSharesBefore,
+        bool isFullWithdraw
+    ) private returns (uint256, uint256) {
+        return ProtocolAccountingLib.withdrawFromRange(
+            address(rangeManager),
+            address(token0),
+            address(token1),
+            principal0,
+            principal1,
+            recipient,
+            shareAmount,
+            totalSharesBefore,
+            isFullWithdraw
+        );
+    }
+
     using SafeERC20 for IERC20;
 
     error E49(); // token transfer amount differs from the queued accounting amount
@@ -254,13 +279,17 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     bool public installationSealed;
     event InstallationSealed(address indexed safe);
+
     function sealInstallation() external onlyOwner {
         require(!installationSealed, AutonomousCheck(0x9a247fa1));
         ProtocolSafetyLib.validateVaultInstallation(botModule, address(rangeManager));
-        installationSealed = true; emit InstallationSealed(emergencySafe);
+        installationSealed = true;
+        emit InstallationSealed(emergencySafe);
     }
+
     function transferOwnership(address next) public override onlyOwner {
-        require(!installationSealed, AutonomousCheck(0x9a247fa1)); super.transferOwnership(next);
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
+        super.transferOwnership(next);
     }
 
     modifier onlyEmergencySafe() {
@@ -338,12 +367,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         return ProtocolSafetyLib.executeBoundedCall(address(rangeManager), data);
     }
 
-
-
     /// @notice Installation-only relay to the immutable strategy engine owned by this Vault.
-
-
-
 
     // AUDIT (nettoyage code mort, parité avec la pool DN) : calculateUserShareOfFees + estimateTotalFees
     // (+ helpers privés _estimateUncollectedFees / _calculateFeeGrowth) RETIRÉS — aucun appelant on-chain
@@ -682,7 +706,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 && msg.sender != emergencySafe
         ) revert OnlyOperationalExecutor();
         if (msg.sender == emergencySafe) {
-            require(IProgressiveRebalanceStatus(botModule).progressiveRebalanceStatus() == 0, AutonomousCheck(0xe9b99400));
+            require(
+                IProgressiveRebalanceStatus(botModule).progressiveRebalanceStatus() == 0, AutonomousCheck(0xe9b99400)
+            );
         }
         _processingRebalance = false;
         _rebalanceStartedAt = 0;
@@ -857,22 +883,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
     }
 
-    function _calculateDepositValue(uint256 amount0, uint256 amount1) private view returns (uint256) {
-        try rangeManager.priceCache() returns (uint128 price0, uint128 price1, uint160, int24, uint64, bool valid) {
-            if (!valid) return 0;
-
-            // Récupérer les décimales depuis RangeManager
-            RangeOperations.RangeConfig memory config = rangeManager.config();
-
-            uint256 value0 = (amount0 * uint256(price0)) / (10 ** config.token0Decimals);
-            uint256 value1 = (amount1 * uint256(price1)) / (10 ** config.token1Decimals);
-
-            return value0 + value1;
-        } catch {
-            return 0;
-        }
-    }
-
     // ===== VIEW FONCTIONS =====
 
     function getPendingDepositsCount() external view returns (uint256) {
@@ -933,95 +943,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     /**
      * @notice Fonction de retrait utilisateurs
      */
-    function _executeWithdrawFromRange(
-        uint256 principal0, // part proportionnelle du user (calculee par _calculateWithdrawAmounts)
-        uint256 principal1, // idem token1 — SÉCURITÉ: on borne l'envoi a ce principal (audit V1)
-        address recipient,
-        uint256 shareAmount,
-        uint256 totalSharesBefore,
-        bool isFullWithdraw
-    ) private returns (uint256 amount0Sent, uint256 amount1Sent) {
-        require(recipient == address(this) || recipient == msg.sender, AutonomousCheck(0x1b1b5e7c));
-
-        uint256[] memory positions = rangeManager.getOwnerPositions();
-
-        // ===== ETAPE 1 : CALCULER LA LIQUIDITE A RETIRER =====
-        uint256 liquidityToRemove = 0;
-        uint256 totalLiquidity = 0;
-        uint256 tokenId = 0;
-
-        if (positions.length > 0) {
-            tokenId = positions[0];
-            INonfungiblePositionManager positionManager = rangeManager.positionManager();
-            (,,,,,,, uint128 liquidity,,,,) = positionManager.positions(tokenId);
-            totalLiquidity = uint256(liquidity);
-
-            if (totalLiquidity > 0) {
-                if (isFullWithdraw) {
-                    liquidityToRemove = totalLiquidity;
-                } else {
-                    // Retirer un pourcentage de liquidité proportionnel aux shares
-                    liquidityToRemove = (totalLiquidity * shareAmount) / totalSharesBefore;
-                    // Une unité est le plafond d'arrondi sûr : les transferts restent bornés aux montants
-                    // proportionnels principal0/principal1, donc l'excédent éventuel demeure au RangeManager.
-                    if (liquidityToRemove == 0) liquidityToRemove = 1;
-                }
-            }
-        }
-
-        // ===== ETAPE 1b : CRISTALLISER LES FEES AVANT DE RETIRER LE PRINCIPAL (audit M-01) =====
-        // removeLiquidityForWithdraw fait decreaseLiquidity + collect(max,max), qui balaye aussi les fees
-        // accrues avec le principal SANS recordFeesCollected. On collecte/comptabilise d'abord (commission
-        // Treasury + accFeePerShare) ; le collect() suivant ne ramène plus que le principal.
-        if (tokenId > 0) {
-            rangeManager.collectFeesForVault();
-        }
-
-        // ===== ETAPE 2 : RETIRER LA LIQUIDITE SI NECESSAIRE =====
-        if (liquidityToRemove > 0 && tokenId > 0) {
-            rangeManager.removeLiquidityForWithdraw(tokenId, uint128(liquidityToRemove));
-        }
-
-        // Une fois le dernier utilisateur sorti, le NFT vide doit aussi quitter le PositionManager et le
-        // tracking RangeManager. Le prochain dépôt repassera ainsi par un mint initial propre.
-        if (isFullWithdraw && tokenId > 0) rangeManager.emergencyBurnPosition(tokenId);
-
-        // ===== ETAPE 3 : TRANSFERER DEPUIS RANGEMANAGER VERS VAULT =====
-        // SÉCURITÉ (audit V1) : on n'envoie QUE le principal proportionnel du user, borné par
-        // la balance réellement disponible. Avant, on envoyait balanceOf(RM) ENTIER, ce qui
-        // distribuait aussi les tokens libres non déployés (ex: un dépôt mono-token en attente)
-        // au premier qui withdraw → un attaquant déposait des fonds restant libres puis récupérait
-        // sa part + celle des autres. Le principal (= vaultSharesPercent% de getCurrentBalances,
-        // qui inclut LP + tokens libres) est la juste part : full withdraw => principal=balance.
-        uint256 realBalance0 = IERC20(token0).balanceOf(address(rangeManager));
-        uint256 realBalance1 = IERC20(token1).balanceOf(address(rangeManager));
-        uint256 toWithdraw0;
-        uint256 toWithdraw1;
-        if (isFullWithdraw) {
-            // Full withdraw (dernier user / 100%) : il a droit a TOUT le restant (dust inclus).
-            toWithdraw0 = realBalance0;
-            toWithdraw1 = realBalance1;
-        } else {
-            // Withdraw partiel : strictement la juste part, bornee par le disponible.
-            toWithdraw0 = principal0 < realBalance0 ? principal0 : realBalance0;
-            toWithdraw1 = principal1 < realBalance1 ? principal1 : realBalance1;
-        }
-
-        // Transférer la juste part vers le Vault
-        (amount0Sent, amount1Sent) = rangeManager.transferTokensForWithdraw(toWithdraw0, toWithdraw1, address(this));
-
-        // ===== ETAPE 4 : SI LE RECIPIENT N'EST PAS LE VAULT, TRANSFERER DEPUIS LE VAULT =====
-        if (recipient != address(this)) {
-            if (amount0Sent > 0) {
-                token0.safeTransfer(recipient, amount0Sent);
-            }
-            if (amount1Sent > 0) {
-                token1.safeTransfer(recipient, amount1Sent);
-            }
-        }
-
-        return (amount0Sent, amount1Sent);
-    }
 
     // AUDIT (nettoyage code mort) : _estimateUncollectedFees + _calculateFeeGrowth RETIRÉS — n'étaient
     // appelés que par estimateTotalFees (elle-même retirée). Parité avec la pool DN.
@@ -1221,16 +1142,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     /// @notice Recover airdrops or erroneous direct transfers held by this Vault.
 
-
     ///      This function cannot access RangeManager balances, LP liquidity or pending user deposits.
     /// @param tokenAddr Token to rescue
     /// @param to Recipient address
     /// @param amount Amount to rescue
     function rescueToken(address tokenAddr, address to, uint256 amount) external nonReentrant {
-        if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, address(0), 0)) revert OnlyEmergencySafe();
-        ProtocolSafetyLib.rescueVaultToken(
-            treasuryAddress, tokenAddr, address(token0), address(token1), to, amount
-        );
+        if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, address(0), 0)) {
+            revert OnlyEmergencySafe();
+        }
+        ProtocolSafetyLib.rescueVaultToken(treasuryAddress, tokenAddr, address(token0), address(token1), to, amount);
     }
 
     // ===== FONCTIONS DE RECUPERATION USER ET TOKENS PERDUS =====
@@ -1242,7 +1162,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @dev Les totaux pending et l'index utilisateur rendent ce chemin O(1), y compris avec une longue file.
      */
     function EmergencyRecoverUser(address userAddress) external nonReentrant {
-        if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, userAddress, 1)) revert OnlyEmergencySafe();
+        if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, userAddress, 1)) {
+            revert OnlyEmergencySafe();
+        }
         require(userAddress != address(0), "E43");
 
         UserInfo storage user = userInfo[userAddress];
@@ -1305,9 +1227,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // 3. Recuperer depuis RangeManager AVANT toute suppression d'accounting utilisateur.
         //    Fail-closed : si RangeManager revert, toute la transaction revert et userInfo reste intact.
         if (neededFromRange0 > 0 || neededFromRange1 > 0) {
-            (uint256 received0, uint256 received1) = IRangeManager(address(rangeManager)).emergencyWithdrawForUser(
-                neededFromRange0, neededFromRange1, address(this)
-            );
+            (uint256 received0, uint256 received1) = IRangeManager(address(rangeManager))
+                .emergencyWithdrawForUser(neededFromRange0, neededFromRange1, address(this));
             require(received0 == neededFromRange0 && received1 == neededFromRange1, "E47");
         }
 
@@ -1360,7 +1281,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @dev Les fonds restent dans RangeManager apres le burn en attente d'un nouveau MINT
      */
     function EmergencyBurnPositions() external nonReentrant {
-        if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, address(0), 2)) revert OnlyEmergencySafe();
+        if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, address(0), 2)) {
+            revert OnlyEmergencySafe();
+        }
 
         // 1. Recuperer toutes les positions NFT
         uint256[] memory positions = rangeManager.getOwnerPositions();

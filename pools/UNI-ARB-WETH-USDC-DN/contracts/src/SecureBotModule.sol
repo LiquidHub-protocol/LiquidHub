@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.36;
+import "./ProtocolAccountingLib.sol";
 import "./AutonomousErrors.sol";
 import "./AutonomousPoolLib.sol";
 import "./ProtocolSafetyLib.sol";
@@ -72,6 +73,17 @@ interface IProgressiveHedgeGuard {
 }
 
 contract SecureBotModule {
+    function getOracleLpValueUsd() external view returns (uint256 valueUsd) {
+        return ProtocolAccountingLib.getOracleLpValueUsd(rangeManager);
+    }
+
+    function isWithdrawValueSufficient(uint256 amount0, uint256 amount1, uint256 minValueUsd)
+        external
+        view
+        returns (bool)
+    {
+        return ProtocolAccountingLib.isWithdrawValueSufficient(rangeManager, amount0, amount1, minValueUsd);
+    }
     error InvalidCallData();
     error InvalidPrice();
     error InvalidProgressiveChunk();
@@ -99,7 +111,10 @@ contract SecureBotModule {
     address public immutable hedgeManager;
     address public immutable treasury;
     address public immutable owner;
-    function pendingOwner() external pure returns (address) { return address(0); }
+
+    function pendingOwner() external pure returns (address) {
+        return address(0);
+    }
 
     // Sécurité renforcée
     mapping(bytes4 => bool) private _allowedFunctions;
@@ -160,7 +175,9 @@ contract SecureBotModule {
         require(
             _safe != address(0) && _botAddress != address(0) && _rangeManager != address(0)
                 && _strategyEngine != address(0) && _strategyEngine.code.length > 0 && _vault != address(0)
-                && _pauseController != address(0) && _hedgeManager != address(0) && _treasury != address(0), AutonomousCheck(0xa8e86b08));
+                && _pauseController != address(0) && _hedgeManager != address(0) && _treasury != address(0),
+            AutonomousCheck(0xa8e86b08)
+        );
         require(_dailyLimit > 0 && _dailyLimit <= 1000, AutonomousCheck(0x30786559));
         safe = _safe;
         botAddress = _botAddress;
@@ -305,7 +322,10 @@ contract SecureBotModule {
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
         RangeOperations.OptimalSwapParams memory plan = rm.getOptimalSwapParams();
         (budgetUsdE8, reverseBudgetUsdE8, zeroForOne) = _progressivePlanBudget(plan);
-        require(plan.swapNeeded && budgetUsdE8 - reverseBudgetUsdE8 > rm.initMultiSwapTvl() * 1e8, AutonomousCheck(0xa2c7ce0c));
+        require(
+            plan.swapNeeded && budgetUsdE8 - reverseBudgetUsdE8 > rm.initMultiSwapTvl() * 1e8,
+            AutonomousCheck(0xa2c7ce0c)
+        );
     }
 
     function _progressiveCache() private view returns (RangeOperations.PriceCache memory cache) {
@@ -441,9 +461,10 @@ contract SecureBotModule {
             _consumeProgressiveSwapBudget(plan.zeroForOne, amountIn);
         }
         bytes32 decisionHash = progressiveDecisionHash;
-        IProgressiveRangeManager(rangeManager).progressiveRebalance(
-            2, bytes32(0), progressiveTickLower, progressiveTickUpper, amountIn, minAmountOut, msg.sender
-        );
+        IProgressiveRangeManager(rangeManager)
+            .progressiveRebalance(
+                2, bytes32(0), progressiveTickLower, progressiveTickUpper, amountIn, minAmountOut, msg.sender
+            );
         _clearProgressiveRebalance();
         emit ProgressiveRebalanceFinalized(decisionHash, msg.sender);
     }
@@ -501,8 +522,11 @@ contract SecureBotModule {
         require(msg.sender == owner && progressiveRebalanceStatus == 2, AutonomousCheck(0x78a71317));
         if (IRecoveryPause(pauseController).exitOnly()) {
             require(IRangeManagerPostCheck(rangeManager).getOwnerPositions().length == 0, "Close positions first");
-            bytes32 stopped = progressiveDecisionHash; _clearProgressiveRebalance();
-            IProgressiveVault(vault).endRebalance(); emit ProgressiveRebalanceCancelled(stopped, msg.sender); return;
+            bytes32 stopped = progressiveDecisionHash;
+            _clearProgressiveRebalance();
+            IProgressiveVault(vault).endRebalance();
+            emit ProgressiveRebalanceCancelled(stopped, msg.sender);
+            return;
         }
         ProtocolSafetyLib.requireEmergency(vault);
         IProgressiveStrategy engine = IProgressiveStrategy(strategyEngine);
@@ -511,9 +535,8 @@ contract SecureBotModule {
         _refreshProgressiveRebalance(decisionHash, true);
         if (!_progressiveSwapParams().swapNeeded) {
             progressiveRebalanceStatus = 3;
-            IProgressiveRangeManager(rangeManager).progressiveRebalance(
-                2, bytes32(0), progressiveTickLower, progressiveTickUpper, 0, 0, msg.sender
-            );
+            IProgressiveRangeManager(rangeManager)
+                .progressiveRebalance(2, bytes32(0), progressiveTickLower, progressiveTickUpper, 0, 0, msg.sender);
             _clearProgressiveRebalance();
             emit ProgressiveRebalanceCancelled(decisionHash, msg.sender);
         }
@@ -526,75 +549,8 @@ contract SecureBotModule {
     /// @notice LP/free RangeManager NAV reconstructed at the Chainlink token ratio (USD, 8 decimals).
     /// @dev Read-only and unaffected by the module kill-switch. The valuation sqrt is derived exclusively
     ///      from oracle prices; it remains exact and spot-independent even when the spot deviation guard is zero.
-    function getOracleLpValueUsd() external view returns (uint256 valueUsd) {
-        IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
-        (uint128 price0, uint128 price1,,, uint64 timestamp, bool valid) = rm.priceCache();
-        require(price0 > 0 && price1 > 0 && (valid || timestamp == uint64(block.timestamp)), AutonomousCheck(0x17270318));
-        RangeOperations.RangeConfig memory cfg = rm.config();
-        uint160 oracleSqrt = _oracleSqrtPrice(price0, price1, cfg.token0Decimals, cfg.token1Decimals);
-        (uint256 balance0, uint256 balance1) = _balancesAtPrice(rm, oracleSqrt);
-        valueUsd = Math.mulDiv(balance0, price0, 10 ** cfg.token0Decimals)
-            + Math.mulDiv(balance1, price1, 10 ** cfg.token1Decimals);
-    }
 
     /// @notice Oracle-value post-check used only by the Vault's fresh-divergence withdrawal fallback.
-    function isWithdrawValueSufficient(uint256 amount0, uint256 amount1, uint256 minValueUsd)
-        external
-        view
-        returns (bool)
-    {
-        IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
-        (uint128 price0, uint128 price1,,, uint64 timestamp,) = rm.priceCache();
-        if (price0 == 0 || price1 == 0 || timestamp != uint64(block.timestamp)) return false;
-        RangeOperations.RangeConfig memory cfg = rm.config();
-        uint256 valueUsd = Math.mulDiv(amount0, price0, 10 ** cfg.token0Decimals)
-            + Math.mulDiv(amount1, price1, 10 ** cfg.token1Decimals);
-        return valueUsd >= minValueUsd;
-    }
-
-    function _oracleSqrtPrice(uint128 price0, uint128 price1, uint8 dec0, uint8 dec1) private pure returns (uint160) {
-        uint256 ratioX192 =
-            Math.mulDiv(uint256(price0) * (10 ** dec1), uint256(1) << 192, uint256(price1) * (10 ** dec0));
-        uint256 sqrtPriceX96 = Math.sqrt(ratioX192);
-        require(sqrtPriceX96 > 0 && sqrtPriceX96 <= type(uint160).max, AutonomousCheck(0x509120d6));
-        return uint160(sqrtPriceX96);
-    }
-
-    function _balancesAtPrice(IRangeManagerPostCheck rm, uint160 sqrtPriceX96)
-        private
-        view
-        returns (uint256 balance0, uint256 balance1)
-    {
-        balance0 = IERC20Sweep(rm.token0()).balanceOf(rangeManager);
-        balance1 = IERC20Sweep(rm.token1()).balanceOf(rangeManager);
-        uint256[] memory positions = rm.getOwnerPositions();
-        require(positions.length <= 1, AutonomousCheck(0x4b08c5a7));
-        if (positions.length == 0) return (balance0, balance1);
-
-        (,,,,, int24 tickLower, int24 tickUpper, uint128 liquidity,,, uint128 owed0, uint128 owed1) =
-            rm.positionManager().positions(positions[0]);
-        (uint256 amount0, uint256 amount1) = _liquidityAmounts(liquidity, tickLower, tickUpper, sqrtPriceX96);
-        return (balance0 + amount0 + owed0, balance1 + amount1 + owed1);
-    }
-
-    function _liquidityAmounts(uint128 liquidity, int24 tickLower, int24 tickUpper, uint160 sqrtPriceX96)
-        private
-        pure
-        returns (uint256 amount0, uint256 amount1)
-    {
-        if (liquidity == 0) return (0, 0);
-        uint160 sqrtA = RangeOperations.sqrtRatioAtTickExt(tickLower);
-        uint160 sqrtB = RangeOperations.sqrtRatioAtTickExt(tickUpper);
-        uint256 numerator = uint256(liquidity) << 96;
-        if (sqrtPriceX96 <= sqrtA) {
-            amount0 = numerator / sqrtA - numerator / sqrtB;
-        } else if (sqrtPriceX96 >= sqrtB) {
-            amount1 = Math.mulDiv(liquidity, sqrtB - sqrtA, uint256(1) << 96);
-        } else {
-            amount0 = numerator / sqrtPriceX96 - numerator / sqrtB;
-            amount1 = Math.mulDiv(liquidity, sqrtPriceX96 - sqrtA, uint256(1) << 96);
-        }
-    }
 
     modifier onlyBot() {
         require(msg.sender == botAddress, AutonomousCheck(0xa33c1783));
@@ -765,19 +721,17 @@ contract SecureBotModule {
     }
 
     function pauseFor(uint64 duration) external onlyOwner {
-        ProtocolSafetyLib.setPauseFor(_pauseState, safe, duration); emit Paused(true);
+        ProtocolSafetyLib.setPauseFor(_pauseState, safe, duration);
+        emit Paused(true);
     }
-    function guardianPauseUntil() external view returns (uint64) { return _pauseState.until; }
+
+    function guardianPauseUntil() external view returns (uint64) {
+        return _pauseState.until;
+    }
 
     function paused() public view returns (bool) {
         return _pauseState.active && block.timestamp < _pauseState.until;
     }
-
-
-
-
-
-
 
     function sweepNativeToSafe() external {
         if (msg.sender != owner) revert UnauthorizedOwner();
@@ -815,11 +769,7 @@ contract SecureBotModule {
     }
 
     // Fonctions de lecture
-    function getDailyStats()
-        external
-        view
-        returns (uint256 limit, uint256 spent, uint256 remaining, uint256 resetsIn)
-    {
+    function getDailyStats() external view returns (uint256 limit, uint256 spent, uint256 remaining, uint256 resetsIn) {
         uint256 currentDay = block.timestamp / 86400;
         uint256 actualSpent = (currentDay == lastResetDay) ? dailySpent : 0;
 
@@ -853,7 +803,8 @@ contract SecureBotModule {
         return selector == 0x0be1c372 // refreshPriceCache()
             || selector == CHECKPOINT_SELECTOR || selector == REBALANCE_SELECTOR || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
             || selector == 0x0040718e // endRebalance()
-            || selector == ADJUST_HEDGE_SELECTOR || selector == REPAIR_HF_SELECTOR || selector == bytes4(keccak256("bridgeRevenue(uint256)")) // bridgeRevenue(uint256)
+            || selector == ADJUST_HEDGE_SELECTOR || selector == REPAIR_HF_SELECTOR
+            || selector == bytes4(keccak256("bridgeRevenue(uint256)")) // bridgeRevenue(uint256)
             || selector == bytes4(keccak256("forwardRevenue(uint256)"))
             || selector == bytes4(keccak256("convertSourceFeesToUSDC(address,address)"))
             || selector == bytes4(keccak256("convertSourceFeeChunk(address,address,uint256)"))

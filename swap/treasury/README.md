@@ -1,6 +1,6 @@
 # SwapTreasury
 
-Chain-specific swap partner fee collection, separate from pool principal and pool commissions. The implementation uses the same autonomous revenue and bridge libraries as the pool Treasury. There is no protocol token, DAO or governance transition.
+Chain-specific swap partner fee collection, separate from pool principal and pool commissions. The implementation uses the single, strategy-independent `AutonomousRevenueLib` library as the pool Treasury. There is no protocol token, DAO or governance transition.
 
 Installed ERC20/native fees convert publicly through sealed V3 routes with live oracle floors, exact input/output accounting and input-volume windows. Smaller chunks remain possible. Arbitrary owner-provided swap calldata is removed. Native wrapping and conversion spend only actual revenue, with the installed wrapped-native token. USDC stays in Treasury until a public fixed bridge/forward or company withdrawal.
 
