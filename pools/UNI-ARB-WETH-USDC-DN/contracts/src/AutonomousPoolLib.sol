@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.36;
+pragma solidity 0.8.38;
 import "./AutonomousErrors.sol";
 interface IAutonomousPool { function installationSealed() external view returns (bool); }
 interface IAutonomousPause { function exitOnly() external view returns (bool); }

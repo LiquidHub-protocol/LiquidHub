@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.36;
+pragma solidity 0.8.38;
 
 /// @notice Public, permissionless interface shared by Liquid Hub range engines, bots and keepers.
 interface IRangeStrategyEngine {

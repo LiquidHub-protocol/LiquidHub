@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.36;
+pragma solidity 0.8.38;
 import "./AutonomousErrors.sol";
 
 /// @notice Immutable Safe authority; bounded incident pauses and an irreversible exit-only circuit breaker.
