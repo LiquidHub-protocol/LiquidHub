@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-pragma solidity 0.8.36;
+pragma solidity 0.8.38;
 import "./ProtocolAccountingLib.sol";
 import "./AutonomousErrors.sol";
 import "./ProtocolSafetyLib.sol";
