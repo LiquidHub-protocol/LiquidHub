@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.38;
+import "./StrategyStateLib.sol";
+import "./VaultAccountingLib.sol";
+import "./AutonomousRevenueLib.sol";
+import "./interfaces/ILiquidityRoutes.sol";
 import {AutonomousRevenueLib} from "./AutonomousRevenueLib.sol";
 import "./ProtocolAccountingLib.sol";
 import "./AutonomousErrors.sol";
@@ -48,6 +52,30 @@ interface IMultiUserVault {
  */
 
 contract RangeManager is Ownable, ReentrancyGuard {
+    function liquidityRoutes() external view returns (LiquidityRoutes memory) {
+        // All sixteen fields are static ABI words, already sanitized by the storage-to-memory copy.
+        // Returning the tuple directly avoids duplicating its encoder in this size-bounded contract.
+        LiquidityRoutes memory result=_liquidityRoutes;
+        assembly ("memory-safe") { return(result,512) }
+    }
+    function configureLiquidityRoutes(bytes calldata routes) external onlyVaultOwner {
+        AutonomousPoolLib.requireInstallation(vault);
+        VaultAccountingLib.configureLiquidityRoutes(_liquidityRoutes,routes);
+    }
+    function executeDirectLiquiditySwap(bool z,uint256 amount,uint256 minimum,uint8 route,bytes calldata data)
+        external returns (uint256)
+    {
+        if (msg.sender != address(this)) revert E01();
+        if (route == 0) return ProtocolAccountingLib.executeValidatedSwap(z,amount,minimum);
+        return StrategyStateLib.executeLiquidityRoute(z,amount,minimum,route,data);
+    }
+    function executeRoutedSwap(bool z,uint256 amount,uint256 minimum,uint8 route,bytes calldata data)
+        external onlyAuthorized nonReentrant returns (uint256)
+    {
+        _refreshAndRequireValid();
+        return StrategyStateLib.executeValidatedRoutedSwap(z,amount,minimum,route,data);
+    }
+
     function getOwnerPositions() public view returns (uint256[] memory positions) {
         positions = new uint256[](positionCount);
         for (uint256 i = 0; i < positionCount; i++) {
@@ -171,12 +199,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
         return _protectionOverride.nextAt;
     }
 
-    function _effectiveTwap() private view returns (bool) {
-        return block.timestamp < _protectionOverride.until
-            ? _protectionOverride.twap
-            : protectionConfig.sandwichDetectionEnabled;
-    }
-
     function _effectiveMev() private view returns (bool) {
         return
             block.timestamp < _protectionOverride.until
@@ -184,18 +206,16 @@ contract RangeManager is Ownable, ReentrancyGuard {
                 : protectionConfig.mevProtectionEnabled;
     }
 
-    function _effectiveTicks() private view returns (uint16) {
-        return block.timestamp < _protectionOverride.until
-            ? _protectionOverride.ticks
-            : protectionConfig.maxTwapDeviationTicks;
-    }
-
     function effectiveProtections() external view returns (bool twap, bool mev, uint16 ticks) {
-        return (_effectiveTwap(), _effectiveMev(), _effectiveTicks());
+        if (block.timestamp < _protectionOverride.until) {
+            return (_protectionOverride.twap, _protectionOverride.mev, _protectionOverride.ticks);
+        }
+        return (protectionConfig.sandwichDetectionEnabled, protectionConfig.mevProtectionEnabled,
+            protectionConfig.maxTwapDeviationTicks);
     }
 
     function transferOwnership(address) public pure override {
-        revert("Immutable Vault owner");
+        revert E01(); // Ownership is permanently bound to the installed Vault.
     }
     // ===== EVENTS =====
 
@@ -400,6 +420,11 @@ contract RangeManager is Ownable, ReentrancyGuard {
     // (une clé bot compromise ne peut plus repointer). Le rafraîchissement
     // courant du cache (avant chaque tx) se fait via refreshPriceCache() ci-dessous, qui NE change aucune
     // adresse.
+    /// @notice Fixed USD oracle bindings for independent installation verification.
+    function oracleFeeds() external view returns (address feed0, address feed1) {
+        return (address(token0PriceFeed), address(token1PriceFeed));
+    }
+
     function configurePriceFeeds(
         address _token0PriceFeed,
         address _token1PriceFeed,
@@ -650,12 +675,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
         return RangeOperations.getPositionDetails(positionManager, priceCache, tokenId);
     }
 
-    function getCurrentBalances() external view returns (uint256 balance0, uint256 balance1) {
-        // Récupérer les balances dans RangeManager + positions NFT
-        // Cela inclut : tokens libres + liquidité active + tokensOwed (pending fees)
-        (balance0, balance1) = RangeOperations.getCurrentBalances(
-            token0, token1, address(this), getOwnerPositions(), positionManager, pool
-        );
+    function getCurrentBalances() external view returns (uint256 balance0,uint256 balance1) {
+        return VaultAccountingLib.currentRangeBalances();
     }
 
     function isSystemOperational() external view returns (bool) {
@@ -902,7 +923,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
         address tokenOut
     ) external nonReentrant {
         AutonomousPoolLib.requireOperating(pauseController);
-        require(swapAmountsIn.length == minAmountsOut.length, "len");
+        require(swapAmountsIn.length == minAmountsOut.length, "E90");
         // SÉCURITÉ (audit V1 — High 2 / V3-H2) : rafraîchir le cache AVANT de valider les minOuts. La barrière
         // de déviation pool/oracle est INTÉGRÉE au refresh (updatePriceCache invalide le cache si divergence) :
         // le require(priceCache.valid) ci-dessous la rend INCONDITIONNELLE, y compris dans le cas n==0 (rebalance
@@ -916,34 +937,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
         // Crystallise les fees avant de figer le plan. Toute la sequence reste atomique : une validation,
         // un swap ou un mint qui revert annule aussi collect, commission et accounting Vault.
         _collectFeesForVault(tokenId);
-        RangeOperations.OptimalSwapParams memory expectedPlan =
-            _optimalSwapParams(decision.targetTickLower, decision.targetTickUpper);
-
-        uint256 n = swapAmountsIn.length;
-        require(n <= 1, "E91");
-        uint256 totalSwapIn;
-        bool tokenInIsToken0 = tokenIn == token0;
-        if (n > 0) {
-            require((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0), "E43");
-            // Validation (chunk cap + plancher oracle anti-sandwich V4) deportee en library
-            // pour rester sous EIP-170. Reverte sur SwapChunkAboveCap ou MinOutBelowOracleFloor. Sans ce plancher,
-            // un appelant permissionless pouvait passer minAmountsOut[i] = 0 et se faire sandwicher.
-            uint256 totalSwapUsd = RangeOperations.validateMinOutsAgainstOracle(
-                tokenIn == token0, swapAmountsIn, minAmountsOut, priceCache, config, initMultiSwapTvl
-            );
-            // (déviation pool/oracle déjà garantie par _refreshAndRequireValid() en tête de rebalance — V3-H2)
-            uint256 maxTotalSwapUsd = _getCurrentPortfolioValue();
-            for (uint256 i; i < n; ++i) {
-                totalSwapIn += swapAmountsIn[i];
-            }
-            require(totalSwapUsd <= maxTotalSwapUsd, "E92");
-        }
-        ProtocolSafetyLib.requireSubmittedSwapPlan(
-            expectedPlan.swapNeeded ? expectedPlan.amountIn : 0,
-            expectedPlan.zeroForOne,
-            tokenInIsToken0,
-            totalSwapIn,
-            config.toleranceBps
+        bool tokenInIsToken0 = ProtocolAccountingLib.validateAtomicSwap(
+            decision.targetTickLower,decision.targetTickUpper,swapAmountsIn,minAmountsOut,tokenIn,tokenOut
         );
         strategyEngine.recordExecution(decision.decisionHash, decision.action, msg.sender);
 
@@ -955,14 +950,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
             _burnTrackedPosition(tokenId);
         }
 
-        uint160 sqrtPriceLimitX96 = n > 0 ? _swapSqrtPriceLimit(tokenInIsToken0) : 0;
-        for (uint256 i; i < n; ++i) {
-            uint256 amt = swapAmountsIn[i];
-            if (amt == 0) continue;
-            RangeOperations.executeSwapCore(
-                tokenIn, tokenOut, amt, minAmountsOut[i], config.fee, address(this), swapRouter, sqrtPriceLimitX96
-            );
-        }
+        if (swapAmountsIn.length > 0 && swapAmountsIn[0] > 0)
+            _executeValidatedSwap(tokenInIsToken0,swapAmountsIn[0],minAmountsOut[0]);
 
         // 4. Mint new position
         this._mintInternal(decision.targetTickLower, decision.targetTickUpper);
@@ -1014,4 +1003,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
     // ===== EVENTS =====
 
     event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
+    // Appended configuration: preserve all pre-existing storage positions.
+    LiquidityRoutes private _liquidityRoutes;
 }

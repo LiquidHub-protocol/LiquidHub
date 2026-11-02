@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.38;
 import {ProtocolAccountingLib} from "./ProtocolAccountingLib.sol";
+import {StrategyStateLib} from "./StrategyStateLib.sol";
 import "./AutonomousPoolLib.sol";
 
 import "openzeppelin-contracts/contracts/access/Ownable.sol";
@@ -112,25 +113,6 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         uint16 dnMinStressHfBps;
     }
 
-    struct MarketState {
-        uint64 epoch;
-        uint64 checkpointTimestamp;
-        int24 canonicalTick;
-        int24 tacticalTwapTick;
-        int24 strategicTwapTick;
-        int24 forecastTrendTicks;
-        uint24 fastVolatilityTicks;
-        uint24 slowVolatilityTicks;
-        uint24 forecastVolatilityTicks;
-        uint24 upsideSemivarianceTicks;
-        uint24 downsideSemivarianceTicks;
-        uint16 observedFeeRateBps;
-        uint16 forecastFeeRateBps;
-        uint16 uncertaintyBps;
-        uint256 feeGrowthGlobal0X128;
-        uint256 feeGrowthGlobal1X128;
-    }
-
     struct PositionState {
         bool exists;
         bool inRange;
@@ -169,7 +151,11 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     StrategyConfig public strategyConfig;
     DecisionMode public override decisionMode;
     uint16 public learningInfluenceBps;
-    // Strategy configuration is fixed by construction.
+    // The immutable algorithm remains fixed; only the received depositor grid is adjustable.
+    StrategyStateLib.DepositorPolicy private _depositorPolicy;
+    event DepositorVotingInstalled(address indexed voting, bytes32 boundsHash);
+    event DepositorParameterApplied(uint8 indexed parameter, uint32 value, uint256 revision);
+
     uint256 internal _configurationRevision = 1;
     uint256 private _decisionConfigurationRevision;
     uint64 private _lastCheckpointEpoch;
@@ -177,15 +163,10 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     bytes32 private _lastExecutedDecisionHash;
     Decision private _canonicalDecision;
 
-    MarketState public marketState;
+    StrategyStateLib.MarketState public marketState;
     Telemetry private _telemetry;
 
-    uint16[4] private _trendWeights;
-    uint16[3] private _volatilityWeights;
-    uint16[3] private _feeWeights;
-    int24[4] private _trendPredictions;
-    uint24[3] private _volatilityPredictions;
-    uint24[3] private _feePredictions;
+    StrategyStateLib.ExpertState private _experts;
 
     event MarketStateCheckpoint(
         uint64 indexed epoch,
@@ -262,9 +243,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         learningInfluenceBps = cfg.learningInfluenceBps;
         decisionMode = DecisionMode.HYBRID;
 
-        _trendWeights = [uint16(2500), 2500, 2500, 2500];
-        _volatilityWeights = [uint16(3334), 3333, 3333];
-        _feeWeights = [uint16(3334), 3333, 3333];
+        StrategyStateLib.initializeExperts(_experts);
         _transferOwnership(vaultAddress);
     }
 
@@ -290,6 +269,74 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
                 || cfg.maxCenterMoveBps > 10_000 || cfg.maxWidthChangeBps > 10_000 || cfg.transitionCostBps > 1000
                 || cfg.dnMinStressHfBps != 0 || !_hasAlignedHalfWidth(cfg.minHalfRangeTicks, cfg.maxHalfRangeTicks)
         ) revert InvalidConfiguration();
+    }
+
+    /// @notice Link the chain-local ballot contract once, before sealing the Vault.
+    function installDepositorVoting(address voting) external onlyOwner {
+        uint32[12] memory empty;
+        _installDepositorVoting(voting, empty, false);
+    }
+
+    /// @notice Stable markets require their own explicitly received calibration domain.
+    function installDepositorVoting(address voting, uint32[12] calldata bounds) external onlyOwner {
+        _installDepositorVoting(voting, bounds, true);
+    }
+
+    function _installDepositorVoting(address voting, uint32[12] memory bounds, bool custom) private {
+        uint32[4] memory values = [
+            uint32(strategyConfig.minEdgeBps),
+            strategyConfig.rebalanceCooldownSeconds,
+            uint32(learningInfluenceBps),
+            uint32(strategyConfig.maxSkewBps)
+        ];
+        StrategyStateLib.installEngineVoting(
+            _depositorPolicy, voting, owner(), uint8(profile), maxLearningInfluenceBps, values, bounds, custom
+        );
+    }
+
+    function depositorVoting() public view returns (address) {
+        return _depositorPolicy.voting;
+    }
+
+    function depositorConfigurationRevision() external view returns (uint256) {
+        return _configurationRevision;
+    }
+
+    function depositorParameter(uint8 parameter)
+        external
+        view
+        returns (uint32 current, uint32 minimum, uint32 maximum, uint32 step)
+    {
+        return StrategyStateLib.engineVoteParameter(_depositorPolicy, parameter, _depositorValue(parameter));
+    }
+
+    function applyDepositorParameter(uint8 parameter, uint32 value, uint256 expectedRevision) external {
+        StrategyStateLib.validateEngineVote(
+            _depositorPolicy, parameter, value, expectedRevision, _configurationRevision, _depositorValue(parameter)
+        );
+        if (parameter == 0) strategyConfig.minEdgeBps = uint16(value);
+        else if (parameter == 1) strategyConfig.rebalanceCooldownSeconds = value;
+        else if (parameter == 2) learningInfluenceBps = uint16(value);
+        else strategyConfig.maxSkewBps = uint16(value);
+        ++_configurationRevision;
+        emit DepositorParameterApplied(parameter, value, _configurationRevision);
+    }
+
+    /// @notice The atomic DN HF application also invalidates the cached engine decision.
+    function invalidateDepositorDecision(uint256 expectedRevision) external {
+        if (
+            msg.sender != _depositorPolicy.voting || _depositorPolicy.voting == address(0)
+                || expectedRevision != _configurationRevision || hedgeManager == address(0)
+        ) revert InvalidConfiguration();
+        ++_configurationRevision;
+    }
+
+    function _depositorValue(uint8 parameter) private view returns (uint32) {
+        if (parameter == 0) return strategyConfig.minEdgeBps;
+        if (parameter == 1) return strategyConfig.rebalanceCooldownSeconds;
+        if (parameter == 2) return learningInfluenceBps;
+        if (parameter == 3) return strategyConfig.maxSkewBps;
+        revert InvalidConfiguration();
     }
 
     function checkpointDue() public view override returns (bool) {
@@ -318,10 +365,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         uint256 feeGrowth1 =
             configurationOnly ? marketState.feeGrowthGlobal1X128 : IUniswapV3Pool(pool).feeGrowthGlobal1X128();
         uint64 previousTimestamp = marketState.checkpointTimestamp;
-        int24 previousCanonicalTick = marketState.canonicalTick;
         uint64 elapsed = previousTimestamp == 0 ? 0 : uint64(block.timestamp) - previousTimestamp;
-        int24 realizedMove = previousTimestamp == 0 ? int24(0) : _subTicks(tacticalTick, previousCanonicalTick);
-        uint24 absoluteMove = _absTick(realizedMove);
         uint16 observedFees = configurationOnly
             ? marketState.observedFeeRateBps
             : _observedFeeRateBps(
@@ -335,56 +379,21 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
                 price1
             );
 
-        bool learningUpdated = !configurationOnly && previousTimestamp != 0 && decisionMode == DecisionMode.HYBRID;
-        if (learningUpdated) _updateExpertWeights(realizedMove, absoluteMove, observedFees);
-
-        uint24 fastVol = configurationOnly
-            ? marketState.fastVolatilityTicks
-            : _ewma(marketState.fastVolatilityTicks, absoluteMove, 5000);
-        uint24 slowVol = configurationOnly
-            ? marketState.slowVolatilityTicks
-            : _ewma(marketState.slowVolatilityTicks, absoluteMove, 2000);
-        uint24 upside = configurationOnly
-            ? marketState.upsideSemivarianceTicks
-            : _ewma(marketState.upsideSemivarianceTicks, realizedMove > 0 ? absoluteMove : 0, 3000);
-        uint24 downside = configurationOnly
-            ? marketState.downsideSemivarianceTicks
-            : _ewma(marketState.downsideSemivarianceTicks, realizedMove < 0 ? absoluteMove : 0, 3000);
-        uint16 slowFees = uint16(_ewma(marketState.forecastFeeRateBps, observedFees, 2000));
-
-        if (!configurationOnly) {
-            _setNextPredictions(
-                realizedMove, tacticalTick, strategicTick, fastVol, slowVol, upside, downside, observedFees, slowFees
-            );
-        }
-        (int24 forecastTrend, uint24 forecastVol, uint16 forecastFees, uint16 uncertainty) = RangeOperations.combineStrategyForecasts(
-            _trendPredictions,
-            _volatilityPredictions,
-            _feePredictions,
-            _trendWeights,
-            _volatilityWeights,
-            _feeWeights,
-            decisionMode == DecisionMode.HYBRID ? learningInfluenceBps : 0
+        bool learningUpdated = StrategyStateLib.updateForecast(
+            marketState,
+            _experts,
+            StrategyStateLib.ForecastInput({
+                epoch: epoch,
+                tacticalTick: tacticalTick,
+                strategicTick: strategicTick,
+                observedFees: observedFees,
+                influence: learningInfluenceBps,
+                feeGrowth0: feeGrowth0,
+                feeGrowth1: feeGrowth1,
+                configurationOnly: configurationOnly,
+                hybrid: decisionMode == DecisionMode.HYBRID
+            })
         );
-
-        marketState = MarketState({
-            epoch: epoch,
-            checkpointTimestamp: configurationOnly ? previousTimestamp : uint64(block.timestamp),
-            canonicalTick: tacticalTick,
-            tacticalTwapTick: tacticalTick,
-            strategicTwapTick: strategicTick,
-            forecastTrendTicks: forecastTrend,
-            fastVolatilityTicks: fastVol,
-            slowVolatilityTicks: slowVol,
-            forecastVolatilityTicks: forecastVol,
-            upsideSemivarianceTicks: upside,
-            downsideSemivarianceTicks: downside,
-            observedFeeRateBps: observedFees,
-            forecastFeeRateBps: forecastFees,
-            uncertaintyBps: uncertainty,
-            feeGrowthGlobal0X128: feeGrowth0,
-            feeGrowthGlobal1X128: feeGrowth1
-        });
         _lastCheckpointEpoch = epoch;
         // Configuration refreshes reuse the epoch's observations and weights,
         // without another learning sample, timestamp extension or keeper bounty.
@@ -402,13 +411,13 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             tacticalTwapTick: tacticalTick,
             strategicTwapTick: strategicTick,
             analyticalAnchorTick: summary.analyticalAnchorTick,
-            fastVolatilityTicks: fastVol,
-            slowVolatilityTicks: slowVol,
-            upsideSemivarianceTicks: upside,
-            downsideSemivarianceTicks: downside,
+            fastVolatilityTicks: marketState.fastVolatilityTicks,
+            slowVolatilityTicks: marketState.slowVolatilityTicks,
+            upsideSemivarianceTicks: marketState.upsideSemivarianceTicks,
+            downsideSemivarianceTicks: marketState.downsideSemivarianceTicks,
             observedFeeRateBps: observedFees,
-            forecastFeeRateBps: forecastFees,
-            uncertaintyBps: uncertainty,
+            forecastFeeRateBps: marketState.forecastFeeRateBps,
+            uncertaintyBps: marketState.uncertaintyBps,
             candidateCount: summary.candidateCount,
             admissibleCandidateCount: summary.admissibleCount,
             expectedFeesBps: summary.expectedFeesBps,
@@ -479,36 +488,6 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         uint256 hi = x >> 128;
         uint256 lo = x & type(uint128).max;
         result = hi * y + ((lo * y) >> 128);
-    }
-
-    function _setNextPredictions(
-        int24 realizedMove,
-        int24 tacticalTick,
-        int24 strategicTick,
-        uint24 fastVol,
-        uint24 slowVol,
-        uint24 upside,
-        uint24 downside,
-        uint16 observedFees,
-        uint16 slowFees
-    ) private {
-        _trendPredictions[0] = realizedMove;
-        _trendPredictions[1] = _clampInt24(int256(tacticalTick) - strategicTick);
-        _trendPredictions[2] = _clampInt24((int256(strategicTick) - tacticalTick) / 2);
-        _trendPredictions[3] = 0;
-        _volatilityPredictions[0] = fastVol;
-        _volatilityPredictions[1] = slowVol;
-        _volatilityPredictions[2] = upside > downside ? upside : downside;
-        _feePredictions[0] = observedFees;
-        _feePredictions[1] = slowFees;
-        _feePredictions[2] = uint16((uint256(observedFees) + slowFees) / 2);
-    }
-
-    function _updateExpertWeights(int24 realizedMove, uint24 realizedVol, uint16 realizedFees) private {
-        _trendWeights = RangeOperations.updateTrendExpertWeights(_trendWeights, _trendPredictions, realizedMove);
-        _volatilityWeights =
-            RangeOperations.updateUnsignedExpertWeights(_volatilityWeights, _volatilityPredictions, realizedVol, 25);
-        _feeWeights = RangeOperations.updateUnsignedExpertWeights(_feeWeights, _feePredictions, realizedFees, 5);
     }
 
     function previewDecision() external view override returns (Decision memory decision) {
@@ -728,7 +707,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
 
     function _analyticalRange(int24 liveTick) private view returns (int24 anchor, uint16 halfWidth) {
         StrategyConfig memory cfg = strategyConfig;
-        MarketState memory state = marketState;
+        StrategyStateLib.MarketState memory state = marketState;
         uint256 fallbackWidth = (uint256(cfg.fallbackRangeUpTicks) + cfg.fallbackRangeDownTicks) / 2;
         uint256 forecastVol = state.forecastVolatilityTicks;
         uint256 uncertainty = state.uncertaintyBps;
@@ -910,7 +889,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         override
         returns (uint16[4] memory trend, uint16[3] memory volatility, uint16[3] memory fees)
     {
-        return (_trendWeights, _volatilityWeights, _feeWeights);
+        return (_experts.trendWeights, _experts.volatilityWeights, _experts.feeWeights);
     }
 
     function recordExecution(bytes32 decisionHash, Action action, address keeper) external override {

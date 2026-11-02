@@ -16,6 +16,7 @@ interface IRevenueReceiver {
 }
 
 interface IRangeVaultComm {
+    function feeRecipient() external view returns (address);
     function commissionRate() external view returns (uint256);
     function recordFeesCollected(uint256 fees0, uint256 fees1, uint256 commission0, uint256 commission1) external;
 }
@@ -40,6 +41,19 @@ interface IRmDeposit {
  * @notice Library externe pour les operations complexes du RangeManager
  */
 library RangeOperations {
+    /// @dev Fixed linked-code rollback boundary for optional hedge-inventory venues.
+    function hedgeInventorySwap(address router,address input,address output,uint24 fee,uint256 amount,uint256 minimum,uint160 limit)
+        external returns(uint256 received)
+    {
+        uint256 beforeIn=IERC20(input).balanceOf(address(this));
+        uint256 beforeOut=IERC20(output).balanceOf(address(this));
+        ISwapRouter(router).exactInputSingle(ISwapRouter.ExactInputSingleParams(
+            input,output,fee,address(this),block.timestamp,amount,minimum,limit));
+        if(IERC20(input).balanceOf(address(this))+amount!=beforeIn)revert PartialFill();
+        received=IERC20(output).balanceOf(address(this))-beforeOut;
+        if(received<minimum)revert PartialFill();
+    }
+
     using SafeERC20 for IERC20;
 
     error PartialFill();
@@ -344,7 +358,7 @@ library RangeOperations {
         address token0,
         address token1,
         address contractAddress,
-        address treasuryAddress,
+        address /* treasuryAddress */,
         address vault,
         INonfungiblePositionManager positionManager,
         IUniswapV3Pool pool,
@@ -390,8 +404,9 @@ library RangeOperations {
             uint256 commRate = IRangeVaultComm(vault).commissionRate();
             uint256 commission0 = (fees0 * commRate) / 10000;
             uint256 commission1 = (fees1 * commRate) / 10000;
-            AutonomousRevenueLib.sendCommission(treasuryAddress, token0, commission0);
-            AutonomousRevenueLib.sendCommission(treasuryAddress, token1, commission1);
+            address recipient = IRangeVaultComm(vault).feeRecipient();
+            AutonomousRevenueLib.sendCommission(recipient, token0, commission0);
+            AutonomousRevenueLib.sendCommission(recipient, token1, commission1);
             IRangeVaultComm(vault).recordFeesCollected(fees0, fees1, commission0, commission1);
         }
 
@@ -406,7 +421,7 @@ library RangeOperations {
         address token0,
         address token1,
         address contractAddress,
-        address treasuryAddress,
+        address /* treasuryAddress */,
         address vault,
         INonfungiblePositionManager positionManager
     ) external returns (uint256 fees0, uint256 fees1) {
@@ -432,8 +447,9 @@ library RangeOperations {
             uint256 commRate = IRangeVaultComm(vault).commissionRate();
             uint256 commission0 = (fees0 * commRate) / 10000;
             uint256 commission1 = (fees1 * commRate) / 10000;
-            AutonomousRevenueLib.sendCommission(treasuryAddress, token0, commission0);
-            AutonomousRevenueLib.sendCommission(treasuryAddress, token1, commission1);
+            address recipient = IRangeVaultComm(vault).feeRecipient();
+            AutonomousRevenueLib.sendCommission(recipient, token0, commission0);
+            AutonomousRevenueLib.sendCommission(recipient, token1, commission1);
             IRangeVaultComm(vault).recordFeesCollected(fees0, fees1, commission0, commission1);
         }
     }

@@ -397,11 +397,16 @@ library ProtocolSafetyLib {
 
     error E40();
 
-    function validateEngine(mapping(address=>bool) storage authorizedExecutors,address previousBot,address previousOperator, address engine, address bot, address pool, address hedge, bool dn)
-        external
-
-        returns (address operator)
-    {
+    function validateEngine(
+        mapping(address => bool) storage authorizedExecutors,
+        address previousBot,
+        address previousOperator,
+        address engine,
+        address bot,
+        address pool,
+        address hedge,
+        bool dn
+    ) external returns (address operator) {
         operator = IExecutionBot(bot).botAddress();
         IRangeStrategyEngine candidate = IRangeStrategyEngine(engine);
         if (
@@ -411,9 +416,9 @@ library ProtocolSafetyLib {
                         ? candidate.profile() != IRangeStrategyEngine.StrategyProfile.DELTA_NEUTRAL
                         : candidate.profile() == IRangeStrategyEngine.StrategyProfile.DELTA_NEUTRAL)
         ) revert E40();
-        authorizedExecutors[previousBot]=false;
-        authorizedExecutors[previousOperator]=false;
-        authorizedExecutors[bot]=true;
+        authorizedExecutors[previousBot] = false;
+        authorizedExecutors[previousOperator] = false;
+        authorizedExecutors[bot] = true;
     }
 
     function currentDecision(address engine) external view returns (IRangeStrategyEngine.Decision memory decision) {
@@ -477,6 +482,25 @@ library ProtocolSafetyLib {
     }
 
     function hedgeConfigure(HedgeState storage state, address[4] calldata addrs, uint16[4] calldata params) external {
+        _hedgeConfigure(state, addrs, params);
+    }
+
+    function hedgeFactoryConfigure(
+        HedgeState storage state,
+        address[4] calldata addrs,
+        uint16[4] calldata params,
+        uint16 criticalBps,
+        uint32 cooldown
+    ) external {
+        require(!state.installationSealed, AutonomousCheck(0x9a247fa1));
+        if (criticalBps < 250 || criticalBps > 3000 || criticalBps < uint256(params[0]) + 250) revert HedgeCheck(54);
+        if (cooldown > 86400) revert HedgeCheck(36);
+        state.criticalHedgeBps = criticalBps;
+        state.hedgeAdjustCooldown = cooldown;
+        _hedgeConfigure(state, addrs, params);
+    }
+
+    function _hedgeConfigure(HedgeState storage state, address[4] calldata addrs, uint16[4] calldata params) private {
         if (state.installationSealed) {
             require(
                 addrs[1] == state.treasuryAddress && params[0] == state.adjustHedgeBps
@@ -749,10 +773,9 @@ library ProtocolSafetyLib {
         IERC20 weth = IERC20(volatileToken);
         address aTokenUsdc = collateral;
         ISwapRouter swapRouter = ISwapRouter(router);
-        (uint256 amountInMaximum, uint160 sqrtPriceLimitX96) =
-            DnDepositLib.aaveOracleMaxToken1ForToken0(
-                flashOwed, manager, dec0, dec1, slippage, address(usdc) < address(weth)
-            );
+        (uint256 amountInMaximum, uint160 sqrtPriceLimitX96) = DnDepositLib.aaveOracleMaxToken1ForToken0(
+            flashOwed, manager, dec0, dec1, slippage, address(usdc) < address(weth)
+        );
         uint256 budget = usdc.balanceOf(address(this));
         (uint256 capped, uint256 toWithdraw) = DnDepositLib.aaveHfSafeSwapBudget(
             budget, amountInMaximum, address(pool), address(aTokenUsdc), threshold, targetHfBps

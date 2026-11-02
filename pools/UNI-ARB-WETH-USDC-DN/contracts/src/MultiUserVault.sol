@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.38;
 import "./ProtocolAccountingLib.sol";
+import {VaultAccountingLib,VaultAccountingTypes} from "./VaultAccountingLib.sol";
 import "./AutonomousErrors.sol";
 import "./ProtocolSafetyLib.sol";
 import "./AutonomousPoolLib.sol";
+import "./interfaces/IGovernancePoolIntegration.sol";
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -91,7 +93,7 @@ interface IBotNav {
         returns (bool);
 }
 
-contract MultiUserVault is Ownable, ReentrancyGuard {
+contract MultiUserVault is Ownable, ReentrancyGuard, VaultAccountingTypes {
     function _calculateDepositValue(uint256 a, uint256 b) private view returns (uint256) {
         return ProtocolAccountingLib.depositValue(address(rangeManager), a, b);
     }
@@ -163,27 +165,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     // ===== STRUCTURES =====
 
-    struct UserInfo {
-        uint256 shares;
-        uint256 depositedToken0;
-        uint256 depositedToken1;
-        uint256 depositedValueUSD; // Valeur USD au moment du dépôt (fixe)
-        uint256 lastDepositTime;
-        uint256 totalFeesEarnedToken0;
-        uint256 totalFeesEarnedToken1;
-        // AUDIT (nettoyage code mort) : timeWeightedShares + lastTimeUpdate RETIRÉS (jamais écrits, modèle
-        // accFeePerShare). ABIs off-chain userInfo() mises à jour en conséquence (décodage positionnel).
-        uint256 firstDepositTime; // Timestamp du premier dépôt d'une période de détention. Reset à 0 sur withdraw 100%.
-        uint256 lastDepositBlock; // Block du dernier dépôt processé. Bloque deposit+withdraw atomique (anti-flash-loan).
-    }
-
-    struct PendingDeposit {
-        address user;
-        uint256 amount0;
-        uint256 amount1;
-        uint256 timestamp;
-    }
-
     // ===== VARIABLES D'ETAT =====
 
     IRangeManager public rangeManager;
@@ -213,47 +194,20 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // ===== DELTA NEUTRAL HEDGE MANAGER =====
     address public hedgeManager;
 
-    PendingDeposit[] public pendingDeposits;
-    // Moving-head queue: each removal clears its own record. Emptying the queue only resets
-    // its length; no user or keeper ever clears the history of previously removed requests.
-    uint256 private _pendingHead;
-    mapping(address => uint256) private _pendingIndexPlusOne;
-    uint256 private _pendingTotal0;
-    uint256 private _pendingTotal1;
+    PendingQueue private _pendingQueue;
+
+    function pendingDeposits(uint256 index) external view returns(address user,uint256 amount0,uint256 amount1,uint256 timestamp) {
+        PendingDeposit storage pd=_pendingQueue.items[index];
+        return(pd.user,pd.amount0,pd.amount1,pd.timestamp);
+    }
 
     function _pendingCount() internal view returns (uint256) {
-        uint256 len = pendingDeposits.length;
-        return len > _pendingHead ? len - _pendingHead : 0;
+        uint256 len = _pendingQueue.items.length;
+        return len > _pendingQueue.head ? len - _pendingQueue.head : 0;
     }
 
     function _removePending(uint256 index, PendingDeposit memory pd) private {
-        hasPendingDeposit[pd.user] = false;
-        delete _pendingIndexPlusOne[pd.user];
-        _pendingTotal0 -= pd.amount0;
-        _pendingTotal1 -= pd.amount1;
-
-        uint256 head = _pendingHead;
-        uint256 last = pendingDeposits.length - 1;
-        if (index == head) {
-            delete pendingDeposits[index];
-            _pendingHead = head + 1;
-        } else {
-            if (index != last) {
-                PendingDeposit memory moved = pendingDeposits[last];
-                pendingDeposits[index] = moved;
-                _pendingIndexPlusOne[moved.user] = index + 1;
-            }
-            pendingDeposits.pop();
-        }
-
-        if (_pendingHead >= pendingDeposits.length) {
-            // Every former slot was cleared by the head branch or pop(). Reset only the length:
-            // Solidity's `delete pendingDeposits` would still traverse all historical indices.
-            assembly ("memory-safe") {
-                sstore(pendingDeposits.slot, 0)
-            }
-            _pendingHead = 0;
-        }
+        VaultAccountingLib.removePending(_pendingQueue,hasPendingDeposit,index,pd);
     }
 
     uint256 public totalShares;
@@ -338,14 +292,76 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     /// @notice Permanently closes installation before public deposits.
 
+    uint256 private _governanceAccountingBusy;
+    modifier accountingTransition() {
+        _governanceAccountingBusy = 1;
+        _;
+        _governanceAccountingBusy = 0;
+    }
     bool public installationSealed;
     event InstallationSealed(address indexed safe);
 
     function sealInstallation() external onlyOwner {
         require(!installationSealed, AutonomousCheck(0x9a247fa1));
+        _sealInstallation();
+    }
+
+    function _sealInstallation() private {
         ProtocolSafetyLib.validateVaultInstallation(botModule, address(rangeManager));
         installationSealed = true;
         emit InstallationSealed(emergencySafe);
+    }
+
+    /// @dev Read-only controller ABI includes technicalGovernance, depositorVoting,
+    /// exposure journal and lifecycle. STATICCALL never forwards authority or value.
+    fallback(bytes calldata input) external returns (bytes memory output) {
+        bool ok;
+        (ok, output) = pauseController.staticcall(input);
+        if (!ok) assembly ("memory-safe") { revert(add(output, 32), mload(output)) }
+    }
+
+    function governanceRegistry() public view returns (address) {
+        return IGovernancePoolController(pauseController).governanceRegistry();
+    }
+
+    function feeRecipient() external view returns (address) {
+        address rebate = IGovernancePoolController(pauseController).feeRebate();
+        return rebate == address(0) ? treasuryAddress : rebate;
+    }
+
+    /// @dev Quotes cannot certify a transient withdrawal/rebalance NAV.
+    function checkpointAccountingBusy() external view returns (bool) {
+        return _processingRebalance || _governanceAccountingBusy != 0;
+    }
+
+    function installEngineDepositorVoting(address voting, uint32[12] calldata bounds, bool stable)
+        external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
+        VaultAccountingLib.installPoolVoting(address(rangeManager), voting, bounds, stable);
+    }
+
+    function applyGovernanceLifecycle(uint8 action, bytes32 decisionId) external {
+        require(msg.sender == governanceRegistry(), AutonomousCheck(0x486e7412));
+        IGovernancePoolController(pauseController).applyLifecycleFromVault(action, decisionId);
+    }
+
+    function reportSafetyClosure() external {
+        require(msg.sender == pauseController, AutonomousCheck(0x486e7412));
+        IGovernancePoolRegistry(governanceRegistry()).notifySafetyClosure();
+    }
+
+    function _notifyGovernanceShares(address wallet, bool withdrawal) private {
+        UserInfo storage user = userInfo[wallet];
+        VaultAccountingLib.notifyGovernanceShares(pauseController, wallet, user.shares,
+            user.depositedValueUSD, withdrawal, totalShares);
+    }
+
+    /// @notice Atomic terminal installation; no instance requires a subsequent Safe signature.
+    function finalizeFactoryInstallation(address expectedSafe) external onlyOwner {
+        require(!installationSealed, AutonomousCheck(0x9a247fa1));
+        VaultAccountingLib.validateFactorySafe(pauseController, expectedSafe, emergencySafe);
+        _transferOwnership(expectedSafe);
+        _sealInstallation();
     }
 
     function transferOwnership(address next) public override onlyOwner {
@@ -451,6 +467,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     // ===== DEPOSIT FUNCTIONS =====
 
+    error PoolTvlCapacityExceeded();
+    function getAvailableDepositCapacityUsd8() public view returns(uint256) {
+        return ProtocolAccountingLib.availableDepositCapacity(_pendingQueue);
+    }
+
     function deposit(uint256 amount0, uint256 amount1) external nonReentrant {
         require(installationSealed, AutonomousCheck(0x60715aca));
         _requirePause(0x5ea9e82a); // requireInflowsActive()
@@ -466,10 +487,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (!valid || p0 == 0 || p1 == 0 || block.timestamp - uint256(ts) > depositMaxCacheAge) revert E72();
 
         uint256 depositValueUSD = _calculateDepositValue(amount0, amount1);
+        VaultAccountingLib.validateAdditionalCapital(pauseController,depositValueUSD);
         if (depositValueUSD < minDepositUSD) revert E23();
         // Anti-DoS file (refonte DN) : plafond de dépôt compatible avec DN_MAX_SWAP_CHUNKS, pour qu'un dépôt
         // ne puisse pas exiger > 10 chunks de swap (sinon il bloquerait la tête de file en permissionless).
         if (dnMaxDepositUsd > 0 && depositValueUSD > dnMaxDepositUsd) revert E_DEPOSIT_TOO_LARGE();
+        if(depositValueUSD>getAvailableDepositCapacityUsd8())revert PoolTvlCapacityExceeded();
 
         // Transferer les tokens au vault
         if (amount1 > 0) {
@@ -477,14 +500,14 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
 
         // Ajouter a la queue
-        pendingDeposits.push(
+        _pendingQueue.items.push(
             PendingDeposit({user: msg.sender, amount0: amount0, amount1: amount1, timestamp: block.timestamp})
         );
 
         hasPendingDeposit[msg.sender] = true;
-        _pendingIndexPlusOne[msg.sender] = pendingDeposits.length;
-        _pendingTotal0 += amount0;
-        _pendingTotal1 += amount1;
+        _pendingQueue.indexPlusOne[msg.sender] = _pendingQueue.items.length;
+        _pendingQueue.total0 += amount0;
+        _pendingQueue.total1 += amount1;
 
         emit PendingDepositAdded(msg.sender, amount0, amount1);
     }
@@ -496,21 +519,22 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     ///      Déclenchable par n'importe qui après `dnDepositRefundDelay`. Avance la tête comme un traitement.
     function refundStaleHeadDeposit() external nonReentrant {
         if (_pendingCount() == 0) revert E24();
-        _refundStaleDeposit(_pendingHead);
+        _refundStaleDeposit(_pendingQueue.head);
     }
 
     /// @notice Refund the matured request identified by its depositor once it reaches the queue head.
     /// @dev Keeping this overload head-only preserves FIFO order while any caller can still unblock the head.
     function refundStaleDeposit(address depositor) external nonReentrant {
-        uint256 indexPlusOne = _pendingIndexPlusOne[depositor];
+        uint256 indexPlusOne = _pendingQueue.indexPlusOne[depositor];
         if (indexPlusOne == 0) revert E24();
-        if (indexPlusOne != _pendingHead + 1) revert DepositNotQueueHead();
+        if (indexPlusOne != _pendingQueue.head + 1) revert DepositNotQueueHead();
         _refundStaleDeposit(indexPlusOne - 1);
     }
 
     function _refundStaleDeposit(uint256 index) private {
-        PendingDeposit memory pd = pendingDeposits[index];
-        if (block.timestamp < pd.timestamp + dnDepositRefundDelay) revert E_NOT_REFUNDABLE();
+        PendingDeposit memory pd = _pendingQueue.items[index];
+        if (block.timestamp < pd.timestamp + dnDepositRefundDelay
+            && IGovernancePoolController(pauseController).lifecycle() == 0) revert E_NOT_REFUNDABLE();
 
         _removePending(index, pd);
 
@@ -552,7 +576,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (_pendingCount() == 0) {
             return (address(0), 0, 0, 0, false);
         }
-        PendingDeposit memory pd = pendingDeposits[_pendingHead];
+        PendingDeposit memory pd = _pendingQueue.items[_pendingQueue.head];
         return (pd.user, pd.amount0, pd.amount1, pd.timestamp, true);
     }
 
@@ -562,7 +586,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     /// @return zeroForOne true si swap token0→token1 ; amountIn en unités natives du token d'entrée (0 = pas de swap).
     function getDepositSwapParams() external view returns (bool zeroForOne, uint256 amountIn) {
         if (_pendingCount() == 0) return (false, 0);
-        PendingDeposit memory pd = pendingDeposits[_pendingHead];
+        PendingDeposit memory pd = _pendingQueue.items[_pendingQueue.head];
         // DnDepositLib lit lui-même priceCache/config via le RangeManager (évite de décoder les gros structs
         // côté Vault — EIP-170). On ne passe que le rangeManager + les montants du dépôt en tête.
         return DnDepositLib.getDepositSwapParams(address(rangeManager), pd.amount0, pd.amount1);
@@ -587,11 +611,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         returns (PendingDeposit memory pd, uint256 depositValue, uint256 currentTotalValue, uint256 totalSharesBefore)
     {
         _requirePause(0x5ea9e82a); // requireInflowsActive()
-        // Récupérer le premier dépôt EN ATTENTE (tête = _pendingHead)
-        pd = pendingDeposits[_pendingHead];
+        // Récupérer le premier dépôt EN ATTENTE (tête = _pendingQueue.head)
+        pd = _pendingQueue.items[_pendingQueue.head];
 
         currentTotalValue = getCurrentPortfolioValue();
         depositValue = _calculateDepositValue(pd.amount0, pd.amount1);
+        VaultAccountingLib.validateAdditionalCapital(pauseController,depositValue);
         totalSharesBefore = totalShares;
         if (totalSharesBefore > DEAD_SHARES) {
             if (currentTotalValue == 0) revert E25();
@@ -608,7 +633,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             token1.safeTransfer(address(rangeManager), pd.amount1);
         }
 
-        _removePending(_pendingHead, pd);
+        _removePending(_pendingQueue.head, pd);
 
         return (pd, depositValue, currentTotalValue, totalSharesBefore);
     }
@@ -619,39 +644,13 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 currentTotalValue,
         uint256 totalSharesBefore
     ) private returns (uint256 sharesToMint) {
-        if (creditedValue == 0) revert E_ZERO_SHARES();
-
-        if (totalSharesBefore <= DEAD_SHARES) {
-            totalShares = 0;
-            // A pre-mint donation is included in the initial share base, so dust cannot freeze the pool.
-            sharesToMint = (creditedValue + currentTotalValue) * 1e10;
-            if (sharesToMint <= DEAD_SHARES) revert E24();
-            sharesToMint -= DEAD_SHARES;
-            totalShares = DEAD_SHARES;
-        } else {
-            sharesToMint = (creditedValue * totalSharesBefore) / currentTotalValue;
-            if (sharesToMint == 0) revert E_ZERO_SHARES();
-        }
-
-        UserInfo storage user = userInfo[pd.user];
-        _updateUserFees(pd.user);
-        if (user.shares == 0) {
-            user.firstDepositTime = block.timestamp;
-        }
-
-        user.shares += sharesToMint;
-        user.depositedToken0 += pd.amount0;
-        user.depositedToken1 += pd.amount1;
-        user.depositedValueUSD += creditedValue;
-        user.lastDepositTime = block.timestamp;
-        user.lastDepositBlock = block.number;
-
-        userFeeDebtToken0[pd.user] = user.shares * accFeePerShare0;
-        userFeeDebtToken1[pd.user] = user.shares * accFeePerShare1;
-
-        totalShares += sharesToMint;
-
-        emit Deposit(pd.user, pd.amount0, pd.amount1, sharesToMint);
+        (sharesToMint,totalShares)=VaultAccountingLib.finalizeDeposit(userInfo[pd.user],
+            userFeeDebtToken0,userFeeDebtToken1,pd.user,accFeePerShare0,accFeePerShare1,
+            VaultAccountingLib.DepositUpdate(creditedValue,currentTotalValue,totalSharesBefore,pd.amount0,pd.amount1,true));
+        _notifyGovernanceShares(pd.user,false);
+        address registry=governanceRegistry();
+        if(registry!=address(0)) IGovernancePoolRegistry(registry).markPoolStarted(address(this));
+        emit Deposit(pd.user,pd.amount0,pd.amount1,sharesToMint);
     }
 
     /**
@@ -660,8 +659,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      *      en liquidite LP, sans le bot du fondateur. En UNE tx : refresh oracle -> calcul shares
      *      (oracle) -> transfert fonds au RM -> swaps bornes oracle (anti-MEV) -> addLiquidity ->
      *      deposit bounty. Verrou _processingRebalance pose pendant toute la fonction (un withdraw
-     *      concurrent revert E32). En DN, le tout premier mint reste reserve au botModule/owner ; apres
-     *      bootstrap, les keepers peuvent aussi recreer atomiquement une position retiree integralement.
+     *      concurrent revert E32). The initial and subsequent mints are public and use the complete atomic DN guards.
      */
     function processDepositPermissionless(
         uint256[] calldata swapAmountsIn,
@@ -675,12 +673,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (swapAmountsIn.length > DN_MAX_SWAP_CHUNKS) revert E_DEPOSIT_TOO_LARGE();
         // 1. File non vide (anti-drain bounty)
         if (_pendingCount() == 0) revert E24();
-        // 2. Etat LP : le premier mint hedgé reste botModule/owner. Après qu'une position a déjà existé,
-        // un keeper peut la recréer après un retrait intégral avec les contrôles DN complets ci-dessous.
+        // The initial and subsequent mints share the same public, fully hedged path.
         bool hasPosition = rangeManager.getOwnerPositions().length > 0;
-        if (!hasPosition && !initialPositionEstablished && msg.sender != botModule && msg.sender != owner()) {
-            revert E03();
-        }
         // 3. Refresh oracle atomique avant toute valorisation du depot permissionless.
         rangeManager.refreshPriceCache();
         if (hasPosition) {
@@ -712,7 +706,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 depositPostCheckMaxDriftBps = uint16(inheritedLimit);
             }
         }
-        PendingDeposit memory pdPlan = pendingDeposits[_pendingHead];
+        PendingDeposit memory pdPlan = _pendingQueue.items[_pendingQueue.head];
         uint256 plannedDepositValue = _calculateDepositValue(pdPlan.amount0, pdPlan.amount1);
         try DnDepositLib.validateDepositSwapPlan(
             address(rangeManager),
@@ -805,7 +799,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (_pendingCount() == 0) {
             return 0;
         }
-        PendingDeposit memory pd = pendingDeposits[_pendingHead];
+        PendingDeposit memory pd = _pendingQueue.items[_pendingQueue.head];
         return _calculateDepositValue(pd.amount0, pd.amount1);
     }
 
@@ -845,7 +839,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         return (_processingRebalance, _rebalanceStartedAt);
     }
 
-    function withdraw(uint256 shareAmount) external nonReentrant {
+    function withdraw(uint256 shareAmount) external nonReentrant accountingTransition {
         _withdrawInternal(shareAmount);
     }
 
@@ -853,7 +847,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice Retire un pourcentage des shares de l'utilisateur
      * @param pct Le pourcentage à retirer (1-100)
      */
-    function withdrawPercentage(uint256 pct) external nonReentrant {
+    function withdrawPercentage(uint256 pct) external nonReentrant accountingTransition {
         if (pct == 0 || pct > 100) revert E31();
         _withdrawInternal((userInfo[msg.sender].shares * pct) / 100);
     }
@@ -934,6 +928,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         ) revert WithdrawalValueTooLow();
         _transferPair(msg.sender, toSend0, toSend1);
 
+        _notifyGovernanceShares(msg.sender, true);
         emit Withdraw(msg.sender, toSend0, toSend1, shareAmount);
     }
 
@@ -996,6 +991,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 netFees0 = fees0 > commission0 ? fees0 - commission0 : 0;
         uint256 netFees1 = fees1 > commission1 ? fees1 - commission1 : 0;
         _distributeFees(netFees0, netFees1);
+        VaultAccountingLib.recordGovernanceFees(pauseController, fees0, fees1, commission0, commission1);
     }
 
     // La distribution reste O(1) : le modele lazy regle chaque utilisateur lors de sa prochaine interaction.
@@ -1005,21 +1001,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     ///      (deposit/withdraw) pour figer la dette sur l'ancien solde. shares constant entre 2 checkpoints =>
     ///      formule exacte (pas de surcomptage multi-distribution comme l'ancien modele TW).
     function _updateUserFees(address userAddress) private {
-        UserInfo storage user = userInfo[userAddress];
-        uint256 s = user.shares;
-        if (s == 0) {
-            // Rien a regler ; on (re)pose la dette au niveau courant pour un futur depot propre.
-            userFeeDebtToken0[userAddress] = 0;
-            userFeeDebtToken1[userAddress] = 0;
-            return;
-        }
-
-        uint256 accrued0 = s * accFeePerShare0;
-        uint256 accrued1 = s * accFeePerShare1;
-        user.totalFeesEarnedToken0 += (accrued0 - userFeeDebtToken0[userAddress]) / 1e36;
-        user.totalFeesEarnedToken1 += (accrued1 - userFeeDebtToken1[userAddress]) / 1e36;
-        userFeeDebtToken0[userAddress] = accrued0;
-        userFeeDebtToken1[userAddress] = accrued1;
+        VaultAccountingLib.updateFees(userInfo[userAddress],userFeeDebtToken0,userFeeDebtToken1,
+            userAddress,accFeePerShare0,accFeePerShare1);
     }
 
     // ===== WITHDRAW PROTOCOL FEES =====
@@ -1158,32 +1141,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      *         _updateUserFees(msg.sender) en amont du withdraw (dette = ancien_solde * acc).
      */
     function _updateUserStateAfterWithdrawal(UserInfo storage user, uint256 shareAmount) private {
-        user.shares -= shareAmount;
-
-        if (user.shares == 0) {
-            // Retrait total : tout a zero.
-            user.depositedToken0 = 0;
-            user.depositedToken1 = 0;
-            user.depositedValueUSD = 0;
-            user.totalFeesEarnedToken0 = 0;
-            user.totalFeesEarnedToken1 = 0;
-            user.firstDepositTime = 0;
-            // Dette a zero (shares==0) pour un re-depot propre.
-            userFeeDebtToken0[msg.sender] = 0;
-            userFeeDebtToken1[msg.sender] = 0;
-        } else {
-            // Retrait partiel : reduire proportionnellement les compteurs comptables.
-            uint256 percentWithdrawn = (shareAmount * 1e18) / (user.shares + shareAmount);
-            user.depositedToken0 = (user.depositedToken0 * (1e18 - percentWithdrawn)) / 1e18;
-            user.depositedToken1 = (user.depositedToken1 * (1e18 - percentWithdrawn)) / 1e18;
-            user.depositedValueUSD = (user.depositedValueUSD * (1e18 - percentWithdrawn)) / 1e18;
-            user.totalFeesEarnedToken0 = (user.totalFeesEarnedToken0 * (1e18 - percentWithdrawn)) / 1e18;
-            user.totalFeesEarnedToken1 = (user.totalFeesEarnedToken1 * (1e18 - percentWithdrawn)) / 1e18;
-
-            // audit V1 (M3-B-fix) — RE-CHECKPOINT la dette sur le NOUVEAU solde de shares : debt = shares * acc.
-            userFeeDebtToken0[msg.sender] = user.shares * accFeePerShare0;
-            userFeeDebtToken1[msg.sender] = user.shares * accFeePerShare1;
-        }
+        VaultAccountingLib.reduceUser(user,userFeeDebtToken0,userFeeDebtToken1,
+            msg.sender,shareAmount,accFeePerShare0,accFeePerShare1);
     }
 
     // ===== FONCTIONS DE CONFIGURATION =====
@@ -1294,103 +1253,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @dev Le depot pending est retrouve par index 1-based puis retire par swap-and-pop. Le chemin reste O(1)
      *      quelle que soit la longueur de la file et ne demande aucun drainage prealable.
      */
-    function EmergencyRecoverUser(address userAddress) external nonReentrant {
-        if (!ProtocolSafetyLib.recoveryAllowed(pauseController, emergencySafe, userAddress, 1)) revert E03();
-        if (userAddress == address(0)) revert E43();
-
-        UserInfo storage user = userInfo[userAddress];
-        uint256 userShares = user.shares;
-        uint256 totalSharesBefore = totalShares;
-
-        if (userShares == 0 && !hasPendingDeposit[userAddress]) revert E44();
-
-        uint256 userAmount0 = 0;
-        uint256 userAmount1 = 0;
-        uint256 n0 = 0;
-        uint256 n1 = 0;
-
-        // 1. Shares actives (cas normal)
-        //    EmergencyBurnPositions doit etre appele avant pour ramener les tokens sur vault/RM
-        if (userShares > 0) {
-            (userAmount0, userAmount1, n0, n1) = ProtocolSafetyLib.emergencyShares(
-                address(rangeManager),
-                address(token0),
-                address(token1),
-                _pendingTotal0,
-                _pendingTotal1,
-                userShares,
-                totalSharesBefore
-            );
-        }
-
-        // 2. Depot en attente: index direct + swap-and-pop, donc O(1).
-        if (hasPendingDeposit[userAddress]) {
-            uint256 idx1 = _pendingIndexPlusOne[userAddress];
-            uint256 len = pendingDeposits.length;
-            if (idx1 == 0 || idx1 <= _pendingHead || idx1 > len) revert E44();
-            uint256 i = idx1 - 1;
-            PendingDeposit memory pd = pendingDeposits[i];
-            if (pd.user != userAddress) revert E44();
-            userAmount0 += pd.amount0;
-            userAmount1 += pd.amount1;
-            _removePending(i, pd);
-            delete userFeeDebtToken0[userAddress];
-            delete userFeeDebtToken1[userAddress];
-        }
-
-        // 3. Settle hedge proportionnel pour pools DN
-        uint256 proportionX18 =
-            totalSharesBefore > 0 ? RangeOperations.mulDivUp(userShares, 1e18, totalSharesBefore) : 0;
-        bool isFullWithdraw = totalSharesBefore > userShares ? totalSharesBefore - userShares <= DEAD_SHARES : true;
-
-        // 4. Mettre a jour les stats avant les appels externes.
-        if (userShares > 0) {
-            totalShares = totalSharesBefore > userShares ? totalSharesBefore - userShares : 0;
-            delete userInfo[userAddress];
-            delete userFeeDebtToken0[userAddress];
-            delete userFeeDebtToken1[userAddress];
-        }
-
-        uint256 bal0BeforeWithdraw = token0.balanceOf(address(this));
-        if (n0 > 0 || n1 > 0) {
-            (uint256 received0, uint256 received1) =
-                IRangeManager(address(rangeManager)).emergencyWithdrawForUser(n0, n1, address(this));
-            if (received0 != n0 || received1 != n1) revert E46();
-        }
-
-        // Emergency DN : le settlement AAVE envoie directement la part hedge au user. Cela evite de sous-compter
-        // le token0 eventuellement renvoye par le HedgeManager et garde le Vault plafonne au reliquat LP/pending.
-        uint256 wethForRepay = 0;
-        if (hedgeManager != address(0) && userShares > 0) {
-            uint256 bal0AfterWithdraw = token0.balanceOf(address(this));
-            wethForRepay = bal0AfterWithdraw > bal0BeforeWithdraw ? bal0AfterWithdraw - bal0BeforeWithdraw : 0;
-            if (wethForRepay > 0) {
-                token0.safeTransfer(hedgeManager, wethForRepay);
-            }
-            IAaveHedgeSettlement(hedgeManager)
-                .emergencySettleForVault(wethForRepay, proportionX18, isFullWithdraw, userAddress);
-        }
-
-        // 5. Envoyer les fonds.
-        // SÉCURITÉ (audit V1) : ne JAMAIS envoyer balanceOf(vault) entier — il inclut les dépôts EN
-        // ATTENTE des AUTRES users. À ce stade, le pending de CE user a déjà été retiré de la queue
-        // (étape 2) ; il reste donc sur le vault les pending des autres, à exclure. On borne le solde
-        // disponible à (balanceOf − pending des autres) puis on plafonne par le dû du user.
-        uint256 rawBal0 = token0.balanceOf(address(this));
-        uint256 rawBal1 = token1.balanceOf(address(this));
-        if (rawBal0 < _pendingTotal0 || rawBal1 < _pendingTotal1) revert E46();
-        uint256 bal0 = rawBal0 - _pendingTotal0;
-        uint256 bal1 = rawBal1 - _pendingTotal1;
-        // La part token0 envoyee au HedgeManager sert au settlement AAVE de cet utilisateur. Le reliquat LP
-        // et la totalite du token1 doivent rester disponibles avant d'effacer definitivement ses shares.
-        // Toute incoherence revert atomiquement au lieu de convertir une recuperation en perte silencieuse.
-        if (wethForRepay > userAmount0) revert E46();
-        uint256 toSend0 = userAmount0 - wethForRepay;
-        uint256 toSend1 = userAmount1;
-        if (bal0 < toSend0 || bal1 < toSend1) revert E46();
-        _transferPair(userAddress, toSend0, toSend1);
-
-        emit EmergencyUserRecovered(userAddress, toSend0, toSend1, userShares);
+    function EmergencyRecoverUser(address userAddress) external nonReentrant accountingTransition {
+        totalShares=VaultAccountingLib.recoverDn(userInfo,userFeeDebtToken0,userFeeDebtToken1,hasPendingDeposit,
+            _pendingQueue,VaultAccountingLib.Recovery(address(rangeManager),address(token0),address(token1),
+                pauseController,emergencySafe,hedgeManager,totalShares),userAddress);
     }
 
     /**

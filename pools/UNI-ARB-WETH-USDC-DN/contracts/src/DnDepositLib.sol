@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.38;
+import "./AutonomousRevenueLib.sol";
+import "./interfaces/ILiquidityRoutes.sol";
 import "./ProtocolAccountingLib.sol";
 
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
@@ -494,30 +496,9 @@ library DnDepositLib {
 
     /// @dev Executes an oracle-bounded exact-output swap and reports the output-token delta received by the
     ///      calling HedgeManager. The caller remains responsible for rejecting a partial Uniswap fill.
-    function aaveExactOutput(
-        address router,
-        address tokenIn,
-        address tokenOut,
-        uint24 fee,
-        uint256 amountOut,
-        uint256 amountInMaximum,
-        uint160 sqrtPriceLimitX96
-    ) external returns (uint256 received) {
-        uint256 beforeBalance = IERC20(tokenOut).balanceOf(address(this));
-        ISwapRouter(router)
-            .exactOutputSingle(
-                ISwapRouter.ExactOutputSingleParams({
-                    tokenIn: tokenIn,
-                    tokenOut: tokenOut,
-                    fee: fee,
-                    recipient: address(this),
-                    deadline: block.timestamp,
-                    amountOut: amountOut,
-                    amountInMaximum: amountInMaximum,
-                    sqrtPriceLimitX96: sqrtPriceLimitX96
-                })
-            );
-        received = IERC20(tokenOut).balanceOf(address(this)) - beforeBalance;
+    function aaveExactOutput(address router,address tokenIn,address tokenOut,uint24 fee,uint256 amountOut,
+        uint256 amountInMaximum,uint160 sqrtPriceLimitX96) external returns(uint256) {
+        return AutonomousRevenueLib.aaveExactOutput(router,tokenIn,tokenOut,fee,amountOut,amountInMaximum,sqrtPriceLimitX96);
     }
 
     function settleAaveNoDebt(
