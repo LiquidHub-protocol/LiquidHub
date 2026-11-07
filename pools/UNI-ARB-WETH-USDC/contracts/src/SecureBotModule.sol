@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.38;
+import "./VaultAccountingLib.sol";
 import "./ProtocolAccountingLib.sol";
 import "./AutonomousErrors.sol";
+import "./interfaces/ILiquidityRoutes.sol";
 import "./AutonomousPoolLib.sol";
 import "./ProtocolSafetyLib.sol";
 
@@ -57,7 +59,11 @@ interface IProgressiveRangeManager {
 interface IProgressiveVault {
     function syncFeesForDeposits() external;
     function endRebalance() external;
+    function startRebalance() external;
     function isRebalancing() external view returns (bool);
+    function getRebalanceLockStatus() external view returns (bool locked, uint64 startedAt);
+    function initialPositionEstablished() external view returns (bool);
+    function minDepositUSD() external view returns (uint256);
 }
 
 interface IProgressiveStrategy {
@@ -114,6 +120,8 @@ contract SecureBotModule {
     uint256 public progressiveSwapBudgetUsdE8;
     uint256 public progressiveReverseBudgetUsdE8;
     bool public progressiveInitialZeroForOne;
+    uint256 private constant PROGRESSIVE_IDLE_RECOVERY_DELAY = 3600;
+    uint64 public progressiveLastProgressAt;
 
     // endRebalance() est exempte de la limite quotidienne: ce deverrouillage ne deplace aucun fonds.
     // Mints, depots et rebalances utilisent leurs entrees atomiques; l'ancien automate module
@@ -137,6 +145,7 @@ contract SecureBotModule {
     event ProgressiveRebalanceRefreshed(bytes32 indexed decisionHash, int24 tickLower, int24 tickUpper, address keeper);
     event ProgressiveRebalanceChunk(uint256 amountIn, uint256 amountOut, address keeper);
     event ProgressiveRebalanceFinalized(bytes32 indexed decisionHash, address keeper);
+    event ProgressiveIdleRecovery(bool reminted, address indexed caller);
     event ProgressiveRebalanceCancelled(bytes32 indexed decisionHash, address safe);
 
     constructor(
@@ -188,8 +197,6 @@ contract SecureBotModule {
         _allowedFunctions[bytes4(keccak256("convertSourceFeesToUSDC(address,address)"))] = true;
         _allowedFunctions[bytes4(keccak256("convertFeesToUSDC(address)"))] = true;
         _allowedFunctions[bytes4(keccak256("wrapNativeFees()"))] = true;
-        _allowedFunctions[bytes4(keccak256("bridgeRevenue(uint256)"))] = true; // bridgeRevenue(uint256)
-        _allowedFunctions[bytes4(keccak256("forwardRevenue(uint256)"))] = true; // forwardRevenue(uint256) - bridge treasury same-chain
     }
 
     receive() external payable {}
@@ -208,54 +215,7 @@ contract SecureBotModule {
     }
 
     function _compoundPosition() private returns (uint256) {
-        IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
-        uint256[] memory positions = rm.getOwnerPositions();
-        if (positions.length != 1) return 0;
-        rm.refreshPriceCache();
-        RangeOperations.PriceCache memory cache = _progressiveCache();
-        // A STABLE depeg pauses investment, not ordinary checkpoint-stale maintenance.
-        if (
-            IRangeStrategyEngine(strategyEngine).previewDecision().reason
-                == IRangeStrategyEngine.ReasonCode.ORACLE_GUARD
-        ) {
-            revert ProgressiveMarketGuard();
-        }
-        (,,,,, int24 lower, int24 upper,,,,,) = rm.positionManager().positions(positions[0]);
-        if (cache.poolTick <= lower || cache.poolTick >= upper) return 0;
-        IProgressiveVault(vault).syncFeesForDeposits();
-        RangeOperations.RangeConfig memory cfg = rm.config();
-        address t0 = rm.token0();
-        address t1 = rm.token1();
-        uint256 b0 = IERC20Sweep(t0).balanceOf(rangeManager);
-        uint256 b1 = IERC20Sweep(t1).balanceOf(rangeManager);
-        RangeOperations.OptimalSwapParams memory plan =
-            RangeOperations.calculateOptimalSwapParams(b0, b1, cache, cfg, lower, upper);
-        if (plan.swapNeeded && plan.amountIn > 0) {
-            uint256 priceIn = plan.zeroForOne ? cache.price0 : cache.price1;
-            uint256 priceOut = plan.zeroForOne ? cache.price1 : cache.price0;
-            uint256 scaleIn = 10 ** (plan.zeroForOne ? cfg.token0Decimals : cfg.token1Decimals);
-            uint256 scaleOut = 10 ** (plan.zeroForOne ? cfg.token1Decimals : cfg.token0Decimals);
-            uint256 cap = Math.mulDiv(rm.initMultiSwapTvl() * 1e8, scaleIn, priceIn);
-            uint256 amount = Math.min(plan.amountIn, cap);
-            uint256 minOut = Math.mulDiv(amount, priceIn * scaleOut, priceOut * scaleIn);
-            minOut = Math.mulDiv(minOut, 10000 - cfg.maxSlippageBps, 10000);
-            if (amount > 0 && minOut > 0) {
-                rm.executeSwap(plan.zeroForOne ? t0 : t1, plan.zeroForOne ? t1 : t0, amount, minOut);
-            }
-            b0 = IERC20Sweep(t0).balanceOf(rangeManager);
-            b1 = IERC20Sweep(t1).balanceOf(rangeManager);
-        }
-        // Skip quantities below oracle precision before calling the position manager.
-        if (
-            Math.mulDiv(b0, cache.price0, 10 ** cfg.token0Decimals) == 0
-                || Math.mulDiv(b1, cache.price1, 10 ** cfg.token1Decimals) == 0
-        ) return 0;
-        rm.addLiquidityToPosition();
-        uint256 added0 = b0 - IERC20Sweep(t0).balanceOf(rangeManager);
-        uint256 added1 = b1 - IERC20Sweep(t1).balanceOf(rangeManager);
-        emit LiquidityCompounded(positions[0], added0, added1, msg.sender);
-        return Math.mulDiv(added0, cache.price0, 10 ** cfg.token0Decimals)
-            + Math.mulDiv(added1, cache.price1, 10 ** cfg.token1Decimals);
+        return VaultAccountingLib.compoundPosition(rangeManager,vault,strategyEngine,address(0));
     }
 
     /// @notice Permissionless high-TVL path. It remains callable if the hot-bot relay is paused because
@@ -281,6 +241,7 @@ contract SecureBotModule {
         progressiveTickLower = lower;
         progressiveTickUpper = upper;
         progressiveDecisionHash = expectedDecisionHash;
+        progressiveLastProgressAt = uint64(block.timestamp);
         progressiveRebalanceStatus = 2;
         emit ProgressiveRebalanceStarted(expectedDecisionHash, lower, upper, msg.sender);
     }
@@ -375,6 +336,16 @@ contract SecureBotModule {
     error ProgressiveMarketGuard();
 
     function continueProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
+        _continueProgressive(amountIn,minAmountOut,0,bytes(""));
+    }
+    function continueProgressiveRebalanceWithRoute(uint256 amountIn,uint256 minAmountOut,uint8 route,bytes calldata data)
+        external returns(uint256)
+    {
+        require(route > 0 && route <= 4, AutonomousCheck(0x60ec026f));
+        return _continueProgressive(amountIn,minAmountOut,route,data);
+    }
+    error ProgressiveUnfundedReversal();
+    function _continueProgressive(uint256 amountIn,uint256 minAmountOut,uint8 route,bytes memory data) private returns(uint256 amountOut) {
         AutonomousPoolLib.requireOperating(pauseController);
         _requireCurrentModule();
         require(
@@ -389,7 +360,19 @@ contract SecureBotModule {
         IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
         address tokenIn = plan.zeroForOne ? rm.token0() : rm.token1();
         address tokenOut = plan.zeroForOne ? rm.token1() : rm.token0();
-        uint256 amountOut = rm.executeSwap(tokenIn, tokenOut, amountIn, minAmountOut);
+        amountOut = route == 0 ? rm.executeSwap(tokenIn, tokenOut, amountIn, minAmountOut)
+            : ILiquidityRange(rangeManager).executeRoutedSwap(plan.zeroForOne,amountIn,minAmountOut,route,data);
+        // Reject a route which makes the remaining inverse correction unaffordable.
+        // Rolling the whole tranche back preserves inventory and lets another route be tried.
+        RangeOperations.OptimalSwapParams memory next = _progressiveSwapParams();
+        if (next.swapNeeded && next.zeroForOne != progressiveInitialZeroForOne) {
+            RangeOperations.PriceCache memory pc = _progressiveCache();
+            RangeOperations.RangeConfig memory cfg = rm.config();
+            uint256 reverseUsd = Math.mulDiv(next.amountIn, next.zeroForOne ? pc.price0 : pc.price1,
+                10 ** (next.zeroForOne ? cfg.token0Decimals : cfg.token1Decimals));
+            if (reverseUsd > progressiveReverseBudgetUsdE8) revert ProgressiveUnfundedReversal();
+        }
+        progressiveLastProgressAt = uint64(block.timestamp);
         progressiveRebalanceStatus = 2;
         emit ProgressiveRebalanceChunk(amountIn, amountOut, msg.sender);
     }
@@ -432,6 +415,52 @@ contract SecureBotModule {
         emit ProgressiveRebalanceFinalized(decisionHash, msg.sender);
     }
 
+    /// @notice Reopen withdrawals after one hour without progress, or three hours total.
+    /// @dev No recipient, bounty, price or range is selected by the caller. A guarded canonical
+    ///      no-swap mint is attempted first; failure leaves the same assets backing the shares idle.
+    function recoverProgressiveToIdle() external {
+        _requireCurrentModule();
+        IProgressiveVault v = IProgressiveVault(vault);
+        (bool locked, uint64 startedAt) = v.getRebalanceLockStatus();
+        uint256 lastProgressAt = progressiveRebalanceStatus == 2 && progressiveLastProgressAt > startedAt
+            ? progressiveLastProgressAt : startedAt;
+        // Successful chunks renew the one-hour stall clock; the absolute three-hour cap
+        // prevents tiny permissionless chunks from locking shareholder withdrawals indefinitely.
+        uint256 recoveryAt = lastProgressAt + PROGRESSIVE_IDLE_RECOVERY_DELAY;
+        uint256 hardLimitAt = uint256(startedAt) + 3 * PROGRESSIVE_IDLE_RECOVERY_DELAY;
+        if (recoveryAt > hardLimitAt) recoveryAt = hardLimitAt;
+        require(
+            locked && startedAt != 0 && block.timestamp >= recoveryAt,
+            AutonomousCheck(0x4452436a)
+        );
+        require(progressiveRebalanceStatus == 0 || progressiveRebalanceStatus == 2, AutonomousCheck(0xe9b99400));
+        require(IRangeManagerBotState(rangeManager).getOwnerPositions().length == 0, AutonomousCheck(0xffc26b51));
+        progressiveRebalanceStatus = 3;
+        bool reminted;
+        try IProgressiveRangeManager(rangeManager).mintInitialPosition() returns (uint256, uint128) {
+            reminted = true;
+        } catch {}
+        _clearProgressiveRebalance();
+        v.endRebalance();
+        emit ProgressiveIdleRecovery(reminted, msg.sender);
+    }
+
+    /// @notice Remint a recovered position only after guarded fresh-price checks succeed.
+    function mintIdlePosition() external {
+        AutonomousPoolLib.requireOperating(pauseController);
+        _requireCurrentModule();
+        IProgressiveVault v = IProgressiveVault(vault);
+        require(v.initialPositionEstablished(), AutonomousCheck(0x4452436a));
+        require(progressiveRebalanceStatus == 0 && !v.isRebalancing(), AutonomousCheck(0xe9b99400));
+        IRangeManagerBotState rm = IRangeManagerBotState(rangeManager);
+        require(rm.getOwnerPositions().length == 0, AutonomousCheck(0xffc26b51));
+        rm.refreshPriceCache();
+        require(_progressiveAssetsUsd() >= v.minDepositUSD(), AutonomousCheck(0x60ec026f));
+        v.startRebalance();
+        IProgressiveRangeManager(rangeManager).mintInitialPosition();
+        v.endRebalance();
+    }
+
     function _clearProgressiveRebalance() private {
         delete progressivePlanEpoch;
         delete progressivePlanValidUntil;
@@ -442,6 +471,7 @@ contract SecureBotModule {
         delete progressiveSwapBudgetUsdE8;
         delete progressiveReverseBudgetUsdE8;
         delete progressiveInitialZeroForOne;
+        delete progressiveLastProgressAt;
         progressiveRebalanceStatus = 0;
     }
 
@@ -596,7 +626,7 @@ contract SecureBotModule {
         emit FunctionExecuted(selector, dailySpent);
     }
 
-    /// @notice Execute a Treasury function (bridge operations only, per whitelist)
+    /// @notice Execute a whitelisted local Treasury maintenance function
     function executeTreasuryFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) withinDailyLimit {
         _execute(treasury, 0, data);
 
@@ -604,31 +634,8 @@ contract SecureBotModule {
         emit FunctionExecuted(selector, dailySpent);
     }
 
-    /// @notice Execute a Treasury function with native ETH value (Stargate cross-chain fees)
 
-    function executeTreasuryFunctionWithValue(bytes calldata data, uint256 value)
-        external
-        payable
-        onlyBot
-        onlyAllowedFunction(data)
-        withinDailyLimit
-    {
-        require(msg.value == value, AutonomousCheck(0x23a54c99));
 
-        uint256 nativeBefore = address(this).balance - msg.value;
-        (address refundToken, uint256 tokenBefore) = _treasuryUsdcBalance();
-        _execute(treasury, value, data);
-        if (directExecution && address(this).balance > nativeBefore) {
-            uint256 refund = address(this).balance - nativeBefore;
-            (bool ok,) = botAddress.call{value: refund}("");
-            require(ok, AutonomousCheck(0xcef6850b));
-            emit ModuleSweep(address(0), refund);
-        }
-        _sweepTreasuryUsdcToBot(refundToken, tokenBefore);
-
-        bytes4 selector = bytes4(data[:4]);
-        emit FunctionExecuted(selector, dailySpent);
-    }
 
     function allowFunction(bytes4 selector, bool allowed) external onlyOwner {
         AutonomousPoolLib.requireInstallation(vault);
@@ -680,14 +687,9 @@ contract SecureBotModule {
         emit ModuleSweep(token, amount);
     }
 
-    function _treasuryUsdcBalance() private view returns (address token, uint256 balance) {
-        return ProtocolSafetyLib.bountyBalance(treasury);
-    }
 
-    function _sweepTreasuryUsdcToBot(address token, uint256 balanceBefore) private {
-        uint256 amount = ProtocolSafetyLib.sweepBountyDelta(treasury, botAddress, token, balanceBefore);
-        if (amount > 0) emit ModuleSweep(token, amount);
-    }
+
+
 
     function _execute(address target, uint256 value, bytes memory data) private {
         (bool success, bytes memory reason) = target.call{value: value}(data);
@@ -737,11 +739,9 @@ contract SecureBotModule {
         return selector == 0x0be1c372 // refreshPriceCache()
             || selector == CHECKPOINT_SELECTOR || selector == REBALANCE_SELECTOR || selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
             || selector == 0x0040718e // endRebalance()
-            || selector == bytes4(keccak256("bridgeRevenue(uint256)")) // bridgeRevenue(uint256)
-            || selector == bytes4(keccak256("forwardRevenue(uint256)"))
             || selector == bytes4(keccak256("convertSourceFeesToUSDC(address,address)"))
             || selector == bytes4(keccak256("convertSourceFeeChunk(address,address,uint256)"))
             || selector == bytes4(keccak256("convertFeesToUSDC(address)"))
-            || selector == bytes4(keccak256("wrapNativeFees()")); // forwardRevenue(uint256)
+            || selector == bytes4(keccak256("wrapNativeFees()"));
     }
 }

@@ -6,6 +6,7 @@ import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 import "v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import "./RangeOperations.sol";
+import "./AutonomousRevenueLib.sol";
 import "./interfaces/IRangeStrategyEngine.sol";
 
 interface IDnRangeManagerState {
@@ -44,6 +45,7 @@ interface IDnNegativeHedgeContext {
     function stableDecimals() external view returns (uint8);
     function donationDustToken0() external view returns (uint256);
     function swapSlippageBps() external view returns (uint16);
+    function increaseEffectiveShortVia(uint256 amount,uint256 minimum,uint24 fee,uint160 limit) external;
 }
 
 interface IDnAaveSupply {
@@ -78,6 +80,32 @@ interface IDnAaveStrategyState {
 /// @notice Stateless Delta Neutral projection math used by RangeStrategyEngine.
 /// @dev The library has no storage, owner, funds or upgrade path. Its linked bytecode is fixed at deployment.
 library RangeStrategyDnLib {
+    /// @dev Size preference only; each resulting swap retains its oracle floor and HF checks.
+    function hedgeChunkCount(uint256 amount) external view returns(uint256) {
+        IDnNegativeHedgeContext h=IDnNegativeHedgeContext(address(this));
+        IDnRangeManagerState rm=IDnRangeManagerState(h.rangeManager());
+        (uint128 price,,,,,)=rm.priceCache();
+        if(price==0)return 1;
+        uint256 target=Math.mulDiv(rm.initMultiSwapTvl()*1e8,10**h.volatileDecimals(),price);
+        return target==0?1:Math.min(Math.ceilDiv(amount,target),16);
+    }
+    /// @dev Ordinary hedge routing only. A failed self-call rolls back borrow/swap/supply.
+    /// No API dependency or change to the dedicated emergency repayment path.
+    function tryHedgeLiquidity(uint256 amount,uint256 minimum,uint256 unavailable)
+        external returns(bool,uint256)
+    {
+        IDnNegativeHedgeContext h=IDnNegativeHedgeContext(address(this));
+        (uint24 preferred,uint24 alternate)=AutonomousRevenueLib.liquidityHedgeFees();
+        uint24 fee=h.swapPoolFee();uint24[3] memory candidates=[preferred,alternate,uint24(0)];
+        for(uint256 i;i<3;++i){
+            if((unavailable&(1<<i))!=0||(i<2&&(candidates[i]==0||candidates[i]==fee
+                ||(i==1&&candidates[i]==preferred))))continue;
+            uint256 budget=gasleft()/2;if(budget>2000000)budget=2000000;
+            try h.increaseEffectiveShortVia{gas:budget}(amount,minimum,candidates[i],0){return(true,unavailable);}
+            catch{unavailable|=1<<i;}
+        }
+        return(false,unavailable);
+    }
     uint256 private constant BPS = 10_000;
     uint256 private constant EXIT_CONFIRMATION_DEPTH_BPS = 1_000;
     uint256 private constant EXIT_CONFIRMATION_MIN_SPACINGS = 2;

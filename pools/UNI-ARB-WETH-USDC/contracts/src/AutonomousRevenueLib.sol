@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.38;
+import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
+import "./RangeOperations.sol";
+import "./interfaces/ILiquidityRoutes.sol";
 
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "openzeppelin-contracts/contracts/utils/math/Math.sol";
 import "./AutonomousErrors.sol";
+import {TreasuryPolicyLib, ISourceInstallation} from "./TreasuryPolicyLib.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -14,60 +18,16 @@ interface IRevenueRecorder {
     function recordRevenue(address token, uint256 amount) external;
 }
 
-struct RevenueSendParam {
-    uint32 dstEid;
-    bytes32 to;
-    uint256 amountLD;
-    uint256 minAmountLD;
-    bytes extraOptions;
-    bytes composeMsg;
-    bytes oftCmd;
-}
-
-struct RevenueMessagingFee {
-    uint256 nativeFee;
-    uint256 lzTokenFee;
-}
-
-struct RevenueMessagingReceipt {
-    bytes32 guid;
-    uint64 nonce;
-    RevenueMessagingFee fee;
-}
-
-struct RevenueOFTReceipt {
-    uint256 amountSentLD;
-    uint256 amountReceivedLD;
-}
-
-struct RevenueOFTLimit {
-    uint256 minAmountLD;
-    uint256 maxAmountLD;
-}
-
-struct RevenueOFTFeeDetail {
-    int256 feeAmountLD;
-    string description;
-}
-
-struct RevenueTicket {
-    uint72 ticketId;
-    bytes passengerBytes;
-}
-
-interface IRevenueStargate {
-    function quoteSend(RevenueSendParam calldata, bool) external view returns (RevenueMessagingFee memory);
-    function quoteOFT(RevenueSendParam calldata)
-        external
-        view
-        returns (RevenueOFTLimit memory, RevenueOFTFeeDetail[] memory, RevenueOFTReceipt memory);
-    function sendToken(RevenueSendParam calldata, RevenueMessagingFee calldata, address)
-        external
-        payable
-        returns (RevenueMessagingReceipt memory, RevenueOFTReceipt memory, RevenueTicket memory);
-}
-
 interface IFeeSwapRouter {
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256);
+
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
@@ -95,6 +55,7 @@ interface IRevenueConversionPolicy {
     function swapFeedSlippageBps(address) external view returns (uint16);
     function swapPoolFees(address) external view returns (uint24);
     function conversionRouters(address) external view returns (address);
+    function conversionPath(address) external view returns (bytes memory);
     function swapRouter() external view returns (address);
 }
 
@@ -108,7 +69,87 @@ interface IDirectSettlementPool {
     function withdraw(address, uint256, address) external returns (uint256);
 }
 
+
+
+interface IHedgeRouteContext { function rangeManager() external view returns(address); }
+
 library AutonomousRevenueLib {
+    /// @dev Optional metadata must never disable debt settlement or emergency HF repair. A typed
+    /// call's ABI-decoding failure can escape try/catch; inspect bounded raw responses instead.
+    function liquidityHedgeFees() public view returns(uint24 preferred,uint24 alternate) {
+        (bool ok,bytes memory context)=address(this).staticcall{gas:10000}(abi.encodeWithSignature("rangeManager()"));
+        if(!ok||context.length!=32)return (0,0);
+        address rm;assembly("memory-safe"){rm:=mload(add(context,32))}
+        (ok,context)=rm.staticcall{gas:50000}(abi.encodeWithSelector(ILiquidityRange.liquidityRoutes.selector));
+        if(!ok||context.length<224)return (0,0);
+        uint256 lp;uint256 hedge;
+        assembly("memory-safe"){lp:=mload(add(context,160))}
+        if(context.length>=320)assembly("memory-safe"){hedge:=mload(add(context,320))}
+        if(lp==100||lp==500||lp==3000||lp==10000)alternate=uint24(lp);
+        if(hedge==100||hedge==500||hedge==3000||hedge==10000)preferred=uint24(hedge);
+        else preferred=alternate;
+    }
+    function hedgeAlternativeFee() public view returns(uint24 preferred) { (preferred,)=liquidityHedgeFees(); }
+    /// @dev implementation is address(RangeOperations) from fixed linked caller code.
+    /// Failed/partial optional fills roll back; the final canonical venue keeps its price limit and full gas.
+    function hedgeInventoryInput(address implementation,address router,address input,address output,uint24 fee,uint256 amount,uint256 minimum,uint160 limit)
+        external returns(uint256)
+    {
+        (uint24 preferred,uint24 alternate)=liquidityHedgeFees();uint24[3] memory venues=[preferred,alternate,fee];
+        for(uint256 i;i<3;++i){uint24 candidate=venues[i];
+            if(i<2&&(candidate==0||candidate==fee||(i==1&&candidate==preferred)))continue;
+            (bool ok,bytes memory ret)=implementation.delegatecall{gas:i==2?gasleft():gasleft()/2}(abi.encodeWithSelector(
+                bytes4(keccak256("hedgeInventorySwap(address,address,address,uint24,uint256,uint256,uint160)")),router,input,output,candidate,amount,minimum,i==2?limit:0));
+            if(ok)return abi.decode(ret,(uint256));
+            if(i==2)assembly("memory-safe"){revert(add(ret,32),mload(ret))}
+        }
+        revert HedgeCheck(46);
+    }
+    function aaveExactOutput(
+        address router,
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        uint256 amountOut,
+        uint256 amountInMaximum,
+        uint160 sqrtPriceLimitX96
+    ) external returns (uint256 received) {
+        uint256 beforeBalance = IERC20(tokenOut).balanceOf(address(this));
+        // Alternate fixed V3 tier from the installed RangeManager. A failed read must never disable HF repair.
+        (uint24 preferred,uint24 alternate)=liquidityHedgeFees();
+        uint24[2] memory candidates=[preferred,alternate];
+        for(uint256 i;i<2;++i) {
+            uint24 candidate=candidates[i];
+            if(candidate==0||candidate==fee||(i==1&&candidate==preferred))continue;
+            // No fixed gas ceiling on an HF venue: reserve half for the next/canonical route.
+            // The transaction estimator may provide more gas; no gas-price cap is introduced.
+            uint256 routeGas=gasleft()/2;
+            try ISwapRouter(router).exactOutputSingle{gas:routeGas}(ISwapRouter.ExactOutputSingleParams({
+                tokenIn:tokenIn,tokenOut:tokenOut,fee:candidate,recipient:address(this),deadline:block.timestamp,
+                amountOut:amountOut,amountInMaximum:amountInMaximum,sqrtPriceLimitX96:0
+            })) returns (uint256) {
+                return IERC20(tokenOut).balanceOf(address(this))-beforeBalance;
+            } catch {}
+        }
+        ISwapRouter(router)
+            .exactOutputSingle(
+                ISwapRouter.ExactOutputSingleParams({
+                    tokenIn: tokenIn,
+                    tokenOut: tokenOut,
+                    fee: fee,
+                    recipient: address(this),
+                    deadline: block.timestamp,
+                    amountOut: amountOut,
+                    amountInMaximum: amountInMaximum,
+                    sqrtPriceLimitX96: sqrtPriceLimitX96
+                })
+            );
+        received = IERC20(tokenOut).balanceOf(address(this)) - beforeBalance;
+    }
+
+
+
+
     event TokenRescued(address indexed token, address indexed to, uint256 amount);
     event SwappedToUSDC(address indexed tokenIn, uint24 fee, uint256 amountIn, uint256 usdcOut);
     uint256 private constant BPS = 10000;
@@ -137,7 +178,30 @@ library AutonomousRevenueLib {
         uint256 spent;
     }
 
+    struct LegacyBounties {
+        bool keeperBountyEnabled;
+        uint256 keeperBountyAmount;
+        uint256 keeperBountyDailyCap;
+        bool strategyCheckpointBountyEnabled;
+        uint256 strategyCheckpointBountyAmount;
+        uint256 strategyCheckpointBountyDailyCap;
+        bool hedgeBountyEnabled;
+        uint256 hedgeBountyAmount;
+        uint256 hedgeBountyDailyCap;
+        bool depositBountyEnabled;
+        uint256 depositBountyAmount;
+        uint64 depositBountyCooldown;
+        uint64 depositBountyKeeperCooldown;
+        uint256 depositBountyDailyCap;
+        bool conversionBountyEnabled;
+        uint256 conversionBountyAmount;
+        uint64 conversionBountyCooldown;
+        uint64 lastConversionBountyAt;
+        uint16 conversionBountyMinRatio;
+    }
+
     struct State {
+        LegacyBounties legacy;
         mapping(address => mapping(address => ConversionWindow)) conversions;
         mapping(address => address) sourceOf;
         mapping(address => bool) sourceInstalled;
@@ -152,8 +216,9 @@ library AutonomousRevenueLib {
         mapping(address => uint256) reserve;
         mapping(address => uint256) revenue;
         mapping(address => uint256) remainder;
-        mapping(address => uint256) bridgeRemainder;
+        mapping(address => uint256) conversionRemainder;
         uint256 totalReserve;
+        TreasuryPolicyLib.Policy policy;
     }
     event SourceInstalled(address indexed source, address indexed actor);
     event RevenueRecorded(address indexed source, address indexed token, uint256 amount);
@@ -162,61 +227,29 @@ library AutonomousRevenueLib {
     event BountyFunded(address indexed source, uint256 amount);
 
     function install(State storage s, address source, address[] calldata actors) external {
-        require(
-            source != address(0) && source != address(this) && !s.sourceInstalled[source] && actors.length > 0,
-            AutonomousCheck(0x16001604)
-        );
-        s.sourceInstalled[source] = true;
-        for (uint256 i; i < actors.length; ++i) {
-            address actor = actors[i];
-            require(actor.code.length > 0 && s.sourceOf[actor] == address(0), AutonomousCheck(0x280035fb));
-            s.sourceOf[actor] = source;
-            emit SourceInstalled(source, actor);
-        }
+        TreasuryPolicyLib.install(s, source, actors);
     }
 
     function authorize(State storage s, address actor, bool allowed, uint8 role) external {
-        require(!s.sourceSealed[s.sourceOf[actor]], AutonomousCheck(0x9a247fa1));
-        require(allowed && s.sourceOf[actor] != address(0), AutonomousCheck(0x7ea92fcb));
-        require(actor.code.length > 0, AutonomousCheck(0x2c7a47d0));
-        s.roles[actor] |= role;
+        TreasuryPolicyLib.authorize(s, actor, allowed, role);
     }
     event SourceSealed(address indexed source);
 
     function sealSource(State storage s, address source) external {
-        require(s.sourceInstalled[source] && !s.sourceSealed[source], AutonomousCheck(0x16001604));
-        s.sourceSealed[source] = true;
-        emit SourceSealed(source);
+        TreasuryPolicyLib.sealSource(s, source);
     }
 
     function record(State storage s, address usdc, address token, uint256 amount) external {
-        address source = s.sourceOf[msg.sender];
-        require(source != address(0) && amount > 0, AutonomousCheck(0xdd62405b));
-        _sync(s, usdc, token);
-        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        require(IERC20(token).balanceOf(address(this)) - beforeBalance == amount, AutonomousCheck(0xcfa42862));
-        s.accounted[token] += amount;
-        if (token == usdc) _credit(s, source, amount);
-        else s.pending[source][token] += amount;
-        emit RevenueRecorded(source, token, amount);
+        TreasuryPolicyLib.record(s, usdc, token, amount);
     }
 
-    /// @dev Direct donations and Stargate receipts are attributed to the Treasury's own bridge budget.
+    /// @dev Direct commission receipts fund the local Treasury conversion budget.
     function sync(State storage s, address usdc, address token) external returns (uint256 amount) {
-        return _sync(s, usdc, token);
+        return TreasuryPolicyLib.sync(s, usdc, token);
     }
 
     function _sync(State storage s, address usdc, address token) private returns (uint256 amount) {
-        uint256 balance = IERC20(token).balanceOf(address(this));
-        require(balance >= s.accounted[token], AutonomousCheck(0x05435e06));
-        amount = balance - s.accounted[token];
-        s.accounted[token] = balance;
-        if (amount != 0) {
-            if (token == usdc) _credit(s, address(this), amount);
-            else s.pending[address(this)][token] += amount;
-            emit RevenueRecorded(address(this), token, amount);
-        }
+        return TreasuryPolicyLib.sync(s, usdc, token);
     }
 
     function conversionRemaining(State storage s, address source, address token, uint256 cap, uint64 cooldown)
@@ -254,46 +287,23 @@ library AutonomousRevenueLib {
         uint256 amountIn,
         uint256 amountOut
     ) external {
-        require(amountIn <= s.pending[source][token], AutonomousCheck(0x3f381c16));
-        s.pending[source][token] -= amountIn;
-        s.accounted[token] -= amountIn;
-        s.accounted[usdc] += amountOut;
-        _credit(s, source, amountOut);
+        TreasuryPolicyLib.converted(s, usdc, source, token, amountIn, amountOut);
     }
 
     function fund(State storage s, address usdc, address source, uint256 amount) external {
-        require((source == address(this) || s.sourceInstalled[source]) && amount > 0, AutonomousCheck(0xcb003268));
-        _sync(s, usdc, usdc);
-        uint256 beforeBalance = IERC20(usdc).balanceOf(address(this));
-        IERC20(usdc).safeTransferFrom(msg.sender, address(this), amount);
-        require(IERC20(usdc).balanceOf(address(this)) - beforeBalance == amount, AutonomousCheck(0xbd973d7e));
-        s.accounted[usdc] += amount;
-        s.reserve[source] += amount;
-        s.totalReserve += amount;
-        emit BountyFunded(source, amount);
+        TreasuryPolicyLib.fund(s, usdc, source, amount);
     }
 
     function withdraw(State storage s, address usdc, address to, uint256 amount) external {
-        require(to != address(0) && amount > 0, AutonomousCheck(0x92d7cfce));
-        _sync(s, usdc, usdc);
-        require(
-            s.accounted[usdc] >= s.totalReserve && amount <= s.accounted[usdc] - s.totalReserve,
-            AutonomousCheck(0xbac20538)
-        );
-        s.accounted[usdc] -= amount;
-        IERC20(usdc).safeTransfer(to, amount);
+        TreasuryPolicyLib.withdraw(s, usdc, to, amount);
     }
 
     function spend(State storage s, address actor, uint256 amount) external {
-        _spend(s, actor, amount);
+        TreasuryPolicyLib.spend(s, actor, amount);
     }
 
     function _spend(State storage s, address actor, uint256 amount) private {
-        address source = actor == address(this) ? address(this) : s.sourceOf[actor];
-        require(source != address(0) && amount > 0 && s.reserve[source] >= amount, AutonomousCheck(0x933c73ff));
-        s.reserve[source] -= amount;
-        s.totalReserve -= amount;
-        emit BountyReserveSpent(source, amount);
+        TreasuryPolicyLib.spend(s, actor, amount);
     }
 
     struct DepositPolicy {
@@ -306,16 +316,29 @@ library AutonomousRevenueLib {
     }
     event DepositBountyPaid(address indexed keeper, uint256 amount);
 
-    function payDeposit(
-        State storage s,
-        address usdc,
-        address keeper,
-        address depositor,
-        uint256 valueUsd,
-        DepositPolicy calldata policy
-    ) external {
+    function payConfiguredDeposit(State storage s, address usdc, address keeper, address depositor, uint256 valueUsd)
+        external
+    {
+        DepositPolicy memory policy = DepositPolicy(
+            s.legacy.depositBountyEnabled,
+            s.legacy.depositBountyAmount,
+            s.legacy.depositBountyDailyCap,
+            s.legacy.depositBountyCooldown,
+            s.legacy.depositBountyKeeperCooldown,
+            IERC20Metadata(usdc).decimals()
+        );
         require(keeper != address(0) && depositor != address(0) && keeper != depositor, AutonomousCheck(0x77390cd7));
         require((s.roles[msg.sender] & 8) != 0, AutonomousCheck(0x52c79c7b));
+        if (s.policy.governance != address(0)) {
+            require(
+                s.sourceSealed[s.sourceOf[msg.sender]]
+                    && ISourceInstallation(s.sourceOf[msg.sender]).installationSealed(),
+                AutonomousCheck(0x52c79c7b)
+            );
+            policy.enabled = true;
+            (policy.amount, policy.cap) = TreasuryPolicyLib.sourceBounty(s, s.sourceOf[msg.sender], 2);
+            if (policy.cooldown == 0 || policy.keeperCooldown == 0) revert AutonomousCheck(0xc5640d54);
+        }
         require(policy.enabled, AutonomousCheck(0xb897c761));
         require(policy.amount > 0, AutonomousCheck(0x2567641d));
         require(valueUsd >= (policy.amount * 1e8 / (10 ** policy.decimals)) * 100, AutonomousCheck(0x40b07ae4));
@@ -348,80 +371,25 @@ library AutonomousRevenueLib {
     }
 
     function debit(State storage s, address usdc, uint256 amount) external {
-        require(amount <= s.accounted[usdc], AutonomousCheck(0x34be11f1));
-        s.accounted[usdc] -= amount;
+        TreasuryPolicyLib.debit(s, usdc, amount);
     }
 
     function protectedBalance(State storage s, address usdc) public view returns (uint256) {
-        uint256 balance = IERC20(usdc).balanceOf(address(this));
-        require(balance >= s.accounted[usdc], AutonomousCheck(0x05435e06));
-        return s.totalReserve + ((balance - s.accounted[usdc]) * RESERVE_BPS + s.remainder[address(this)]) / 10000;
+        return TreasuryPolicyLib.protectedBalance(s, usdc);
     }
 
     function _credit(State storage s, address source, uint256 amount) private {
-        // Carry survives every inflow and every bounty payment; splitting receipts cannot evade the 5% allocation.
-        uint256 numerator = amount * RESERVE_BPS + s.remainder[source];
-        uint256 reserved = numerator / 10000;
-        s.remainder[source] = numerator % 10000;
-        if (source == address(this)) {
-            s.reserve[source] += reserved;
-        } else {
-            // One fifth of the protected budget pays canonical Treasury bridge work; four fifths remain source-isolated.
-            uint256 split = reserved + s.bridgeRemainder[source];
-            uint256 bridgePart = split / 5;
-            s.bridgeRemainder[source] = split % 5;
-            s.reserve[address(this)] += bridgePart;
-            s.reserve[source] += reserved - bridgePart;
-        }
-        s.totalReserve += reserved;
-        s.revenue[source] += amount;
-        emit BountyReserveCredited(source, amount, reserved);
+        TreasuryPolicyLib.creditRevenue(s, source, amount);
     }
 
     using SafeERC20 for IERC20;
-    error BridgeTransferMismatch();
 
-    function quote(address stargate, uint32 eid, address destination, uint256 amount)
-        external
-        view
-        returns (uint256 nativeFee, uint256 received)
-    {
-        RevenueSendParam memory param = _param(eid, destination, amount);
-        (,, RevenueOFTReceipt memory receipt) = IRevenueStargate(stargate).quoteOFT(param);
-        param.minAmountLD = receipt.amountReceivedLD;
-        nativeFee = IRevenueStargate(stargate).quoteSend(param, false).nativeFee;
-        received = receipt.amountReceivedLD;
-    }
 
-    function send(address stargate, address token, uint32 eid, address destination, uint256 amount, uint16 minBps)
-        external
-        returns (uint256 received, bytes32 guid, uint256 nativeFee)
-    {
-        require(destination != address(0) && eid != 0 && amount > 0 && minBps >= 9000, AutonomousCheck(0x3542e7f4));
-        RevenueSendParam memory param = _param(eid, destination, amount);
-        (,, RevenueOFTReceipt memory quoted) = IRevenueStargate(stargate).quoteOFT(param);
-        require(quoted.amountReceivedLD * 10000 >= amount * minBps, AutonomousCheck(0x88795128));
-        param.minAmountLD = quoted.amountReceivedLD;
-        RevenueMessagingFee memory fee = IRevenueStargate(stargate).quoteSend(param, false);
-        require(msg.value >= fee.nativeFee && fee.lzTokenFee == 0, AutonomousCheck(0x2f450712));
-        IERC20 usdc = IERC20(token);
-        uint256 beforeBalance = usdc.balanceOf(address(this));
-        usdc.safeApprove(stargate, 0);
-        usdc.safeApprove(stargate, amount);
-        (RevenueMessagingReceipt memory receipt, RevenueOFTReceipt memory oft,) =
-            IRevenueStargate(stargate).sendToken{value: fee.nativeFee}(param, fee, msg.sender);
-        usdc.safeApprove(stargate, 0);
-        uint256 afterBalance = usdc.balanceOf(address(this));
-        if (
-            afterBalance > beforeBalance || beforeBalance - afterBalance != amount || oft.amountSentLD != amount
-                || oft.amountReceivedLD < param.minAmountLD
-        ) revert BridgeTransferMismatch();
-        return (oft.amountReceivedLD, receipt.guid, fee.nativeFee);
-    }
 
-    function _param(uint32 eid, address destination, uint256 amount) private pure returns (RevenueSendParam memory) {
-        return RevenueSendParam(eid, bytes32(uint256(uint160(destination))), amount, 0, new bytes(0), new bytes(0), "");
-    }
+
+
+
+
 
     function bounds(
         address tokenIn,
@@ -539,15 +507,27 @@ library AutonomousRevenueLib {
         require(tokenIn != address(usdc), AutonomousCheck(0x02ff93bd));
         require(fee == policy.swapPoolFees(tokenIn) && fee != 0, AutonomousCheck(0xd8bea72e));
         (uint256 floor, uint160 limit) = conversionBounds(policy, tokenIn, amountIn);
-        amountOut = swap(
-            tokenIn,
-            address(usdc),
-            policy.conversionRouters(tokenIn) == address(0) ? policy.swapRouter() : policy.conversionRouters(tokenIn),
-            fee,
-            amountIn,
-            minAmountOut > floor ? minAmountOut : floor,
-            limit
-        );
+        uint256 minimum = minAmountOut > floor ? minAmountOut : floor;
+        address router =
+            policy.conversionRouters(tokenIn) == address(0) ? policy.swapRouter() : policy.conversionRouters(tokenIn);
+        bytes memory path = policy.conversionPath(tokenIn);
+        if (path.length == 66) {
+            IERC20 token = IERC20(tokenIn);
+            uint256 beforeIn = token.balanceOf(address(this));
+            uint256 beforeOut = IERC20(usdc).balanceOf(address(this));
+            require(amountIn > 0 && minimum > 0 && beforeIn >= amountIn, AutonomousCheck(0xf58e91a9));
+            token.safeApprove(router, 0);
+            token.safeApprove(router, amountIn);
+            IFeeSwapRouter(router)
+                .exactInput(IFeeSwapRouter.ExactInputParams(path, address(this), block.timestamp, amountIn, minimum));
+            require(beforeIn - token.balanceOf(address(this)) == amountIn, AutonomousCheck(0x4d8d39b2));
+            amountOut = IERC20(usdc).balanceOf(address(this)) - beforeOut;
+            require(amountOut >= minimum, AutonomousCheck(0x5814aad6));
+            token.safeApprove(router, 0);
+        } else {
+            require(path.length == 0 || path.length == 43, AutonomousCheck(0xd8bea72e));
+            amountOut = swap(tokenIn, usdc, router, fee, amountIn, minimum, limit);
+        }
         emit SwappedToUSDC(tokenIn, fee, amountIn, amountOut);
     }
 
@@ -577,7 +557,8 @@ library AutonomousRevenueLib {
         uint24 swapPoolFee,
         uint256 amount0,
         uint256 minOut,
-        uint160 sqrtLimit
+        uint160 sqrtLimit,
+        bytes calldata path
     ) external {
         IRevenueBorrowPool pool = IRevenueBorrowPool(poolAddress);
         IERC20 weth = IERC20(token0);
@@ -587,7 +568,9 @@ library AutonomousRevenueLib {
         if (idle > 0) pool.supply(address(usdc), idle, address(this), 0);
         uint256 token0Before = weth.balanceOf(address(this));
         pool.borrow(address(weth), amount0, 2, 0, address(this));
-        uint256 amount1 = swapRouter.exactInputSingle(
+        uint256 before1=usdc.balanceOf(address(this));
+        if(path.length==0){
+            swapRouter.exactInputSingle(
             IFeeSwapRouter.ExactInputSingleParams({
                 tokenIn: address(weth),
                 tokenOut: address(usdc),
@@ -599,6 +582,9 @@ library AutonomousRevenueLib {
                 sqrtPriceLimitX96: sqrtLimit
             })
         );
+        }else swapRouter.exactInput(IFeeSwapRouter.ExactInputParams(path,address(this),block.timestamp,amount0,minOut));
+        uint256 amount1=usdc.balanceOf(address(this))-before1;
+        if(amount1<minOut)revert HedgeCheck(46);
         if (weth.balanceOf(address(this)) != token0Before) revert HedgeCheck(46);
         if (amount1 > 0) pool.supply(address(usdc), amount1, address(this), 0);
     }
@@ -689,32 +675,7 @@ library AutonomousRevenueLib {
         spent[actor] = next;
     }
 
-    function refundNativeSurplus(uint256 usedNativeFee) external {
-        if (msg.value <= usedNativeFee) return;
-        (bool ok,) = msg.sender.call{value: msg.value - usedNativeFee}("");
-        require(ok, AutonomousCheck(0xcef6850b));
-    }
 
-    function validateSwapFeed(
-        bool isSealed,
-        address existingFeed,
-        address token,
-        address feed,
-        uint16 _swapSlippageBps,
-        uint32 _maxAge,
-        uint8 usdcDecimals
-    ) external view {
-        require(!isSealed || existingFeed == feed, AutonomousCheck(0x61ac430d));
-        require(token != address(0), AutonomousCheck(0x086efea7));
-        require(feed != address(0), AutonomousCheck(0x422790c9));
-        require(_swapSlippageBps >= 10 && _swapSlippageBps <= 1000, AutonomousCheck(0x3b5e082d));
-        require(_maxAge >= 3600 && _maxAge <= 172800, AutonomousCheck(0xd357f7c0));
-        require(
-            IERC20Metadata(token).decimals() <= 18 && usdcDecimals <= 18
-                && AggregatorV3Interface(feed).decimals() <= 18,
-            AutonomousCheck(0x8a0ba966)
-        );
-    }
 
     function validatePublicConversion(
         bool isSealed,
@@ -733,16 +694,8 @@ library AutonomousRevenueLib {
         }
     }
 
-    function validatePoolFee(bool isSealed, address token, address stable, uint24 fee) external pure {
-        require(!isSealed, AutonomousCheck(0xd3f8500a));
-        require(token != address(0) && token != stable, AutonomousCheck(0x086efea7));
-        require(fee == 100 || fee == 500 || fee == 3000 || fee == 10000, AutonomousCheck(0x6d94368d));
-    }
-
     function distributable(State storage s, address stable) external view returns (uint256) {
-        uint256 balance = IERC20(stable).balanceOf(address(this));
-        uint256 reserve = protectedBalance(s, stable);
-        return balance > reserve ? balance - reserve : 0;
+        return TreasuryPolicyLib.distributable(s, stable);
     }
 
     function rescueToken(State storage s, address tokenAddr, address to, uint256 amount) external {
@@ -756,5 +709,106 @@ library AutonomousRevenueLib {
         require(tokenAddr != policy.usdc(), AutonomousCheck(0xb6c29bb8));
         IERC20(tokenAddr).safeTransfer(to, amount);
         emit TokenRescued(tokenAddr, to, amount);
+    }
+    error ConversionBountyCooldownZero();
+    error ConversionBountyMinRatioZero();
+
+    function _validLegacyBountyCap(uint256 cap) private view returns (bool) {
+        return
+            cap > 0
+                && cap
+                    <= 1000000
+                        * (10 ** uint256(IERC20Metadata(IRevenueConversionPolicy(address(this)).usdc()).decimals()));
+    }
+    event KeeperBountyConfigured(bool enabled, uint256 amount);
+    event KeeperBountyDailyCapConfigured(uint256 cap);
+    event StrategyCheckpointBountyConfigured(bool enabled, uint256 amount);
+    event StrategyCheckpointBountyDailyCapConfigured(uint256 cap);
+    event HedgeBountyConfigured(bool enabled, uint256 amount);
+    event HedgeBountyDailyCapConfigured(uint256 cap);
+    event DepositBountyConfigured(bool enabled, uint256 amount);
+    event DepositBountyLimitsConfigured(uint64 vaultCooldown, uint64 keeperCooldown, uint256 cap);
+    event ConversionBountyConfigured(bool enabled, uint256 amount);
+    event ConversionBountyCooldownConfigured(uint64 cooldown, uint16 ratio);
+
+    function setDepositBounty(State storage s, bool _enabled, uint256 _amount) external {
+        require(!IRevenueConversionPolicy(address(this)).configurationSealed(), AutonomousCheck(0x9a247fa1));
+        if (_enabled) {
+            require(_amount > 0, AutonomousCheck(0x2567641d));
+            require(
+                s.legacy.depositBountyCooldown > 0 && s.legacy.depositBountyKeeperCooldown > 0,
+                AutonomousCheck(0xc5640d54)
+            );
+            require(_amount <= s.legacy.depositBountyDailyCap, AutonomousCheck(0x26bf5266));
+        }
+        s.legacy.depositBountyEnabled = _enabled;
+        s.legacy.depositBountyAmount = _amount;
+        emit DepositBountyConfigured(_enabled, _amount);
+    }
+
+    function setDepositBountyLimits(State storage s, uint64 _vaultCooldown, uint64 _keeperCooldown, uint256 _dailyCap)
+        external
+    {
+        require(!IRevenueConversionPolicy(address(this)).configurationSealed(), AutonomousCheck(0x9a247fa1));
+        require(_vaultCooldown <= 1 days && _keeperCooldown <= 7 days, AutonomousCheck(0x06463f6b));
+        if (s.legacy.depositBountyEnabled) {
+            require(_vaultCooldown > 0 && _keeperCooldown > 0, AutonomousCheck(0xc5640d54));
+        }
+        require(_dailyCap == 0 || _validLegacyBountyCap(_dailyCap), AutonomousCheck(0xdc524c4e));
+        if (s.legacy.depositBountyEnabled) {
+            require(_dailyCap >= s.legacy.depositBountyAmount, AutonomousCheck(0xb5e14be5));
+        }
+        s.legacy.depositBountyCooldown = _vaultCooldown;
+        s.legacy.depositBountyKeeperCooldown = _keeperCooldown;
+        s.legacy.depositBountyDailyCap = _dailyCap;
+        emit DepositBountyLimitsConfigured(_vaultCooldown, _keeperCooldown, _dailyCap);
+    }
+
+    function setConversionBounty(State storage s, bool _enabled, uint256 _amount) external {
+        require(!IRevenueConversionPolicy(address(this)).configurationSealed(), AutonomousCheck(0x9a247fa1));
+        if (_enabled && _amount > 0 && s.legacy.conversionBountyCooldown == 0) revert ConversionBountyCooldownZero();
+        if (_enabled && _amount > 0 && s.legacy.conversionBountyMinRatio == 0) revert ConversionBountyMinRatioZero();
+        if (_enabled) require(_amount > 0 && _validLegacyBountyCap(_amount), AutonomousCheck(0xa540b0da));
+        s.legacy.conversionBountyEnabled = _enabled;
+        s.legacy.conversionBountyAmount = _amount;
+        emit ConversionBountyConfigured(_enabled, _amount);
+    }
+
+    function setConversionBountyCooldown(State storage s, uint64 _cooldown, uint16 _minRatio) external {
+        require(!IRevenueConversionPolicy(address(this)).configurationSealed(), AutonomousCheck(0x9a247fa1));
+        require(_cooldown == 0 || (_cooldown >= 6 hours && _cooldown <= 30 days), AutonomousCheck(0x08938d78));
+        require(_minRatio == 0 || (_minRatio >= 100 && _minRatio <= 10000), AutonomousCheck(0x77b24299));
+        if (s.legacy.conversionBountyEnabled && s.legacy.conversionBountyAmount > 0 && _cooldown == 0) {
+            revert ConversionBountyCooldownZero();
+        }
+        if (s.legacy.conversionBountyEnabled && s.legacy.conversionBountyAmount > 0 && _minRatio == 0) {
+            revert ConversionBountyMinRatioZero();
+        }
+        s.legacy.conversionBountyCooldown = _cooldown;
+        s.legacy.conversionBountyMinRatio = _minRatio;
+        emit ConversionBountyCooldownConfigured(_cooldown, _minRatio);
+    }
+
+    function setLegacyBountyCap(State storage s, uint8 kind, uint256 cap) external {
+        require(!IRevenueConversionPolicy(address(this)).configurationSealed(), AutonomousCheck(0x9a247fa1));
+        require(cap == 0 || _validLegacyBountyCap(cap), AutonomousCheck(0xdc524c4e));
+        bool enabled = kind == 0
+            ? s.legacy.keeperBountyEnabled
+            : kind == 1 ? s.legacy.strategyCheckpointBountyEnabled : s.legacy.hedgeBountyEnabled;
+        uint256 amount = kind == 0
+            ? s.legacy.keeperBountyAmount
+            : kind == 1 ? s.legacy.strategyCheckpointBountyAmount : s.legacy.hedgeBountyAmount;
+        if (enabled || (kind == 1 && cap > 0)) require(cap >= amount, AutonomousCheck(0xb5e14be5));
+        if (kind == 0) {
+            s.legacy.keeperBountyDailyCap = cap;
+            emit KeeperBountyDailyCapConfigured(cap);
+        } else if (kind == 1) {
+            s.legacy.strategyCheckpointBountyDailyCap = cap;
+            emit StrategyCheckpointBountyDailyCapConfigured(cap);
+        } else {
+            require(kind == 3);
+            s.legacy.hedgeBountyDailyCap = cap;
+            emit HedgeBountyDailyCapConfigured(cap);
+        }
     }
 }

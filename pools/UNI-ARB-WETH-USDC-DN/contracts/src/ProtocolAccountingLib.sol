@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity 0.8.38;
+import "./AutonomousRevenueLib.sol";
+import "./StrategyStateLib.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {ProtocolSafetyLib} from "./ProtocolSafetyLib.sol";
 import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import {RangeOperations} from "./RangeOperations.sol";
 import "./AutonomousErrors.sol";
+import {VaultAccountingTypes} from "./VaultAccountingLib.sol";
+import "./interfaces/ILiquidityRoutes.sol";
+import "./interfaces/IGovernancePoolIntegration.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import "openzeppelin-contracts/contracts/utils/math/Math.sol";
@@ -13,7 +18,11 @@ import "v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
 import "chainlink-brownie-contracts/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 /// @notice Fixed accounting and valuation; delegatecall retains payer, recipient and pool context.
+interface IAccountingAdmissionVault { function rangeManager() external view returns(address); function pauseController() external view returns(address); }
+interface IAccountingAdmission { function maxPoolTvlUsd() external view returns(uint64); }
+interface IAccountingPortfolio { function getCurrentPortfolioValue() external view returns(uint256); }
 interface IAccountingRange {
+    function vault() external view returns (address);
     function pool() external view returns (IUniswapV3Pool);
     function addLiquidityToPosition() external;
     function protocolBotAddress() external view returns (address);
@@ -120,6 +129,13 @@ interface ISettlementDnAaveSupply {
 
 interface IAccountingHedgeVault {
     function hedgeManager() external view returns (address);
+}
+
+interface IAccountingStrategyManager {
+    function strategyEngine() external view returns (address);
+}
+interface IAccountingSafeController {
+    function safe() external view returns (address);
 }
 
 library ProtocolAccountingLib {
@@ -426,6 +442,40 @@ library ProtocolAccountingLib {
         return (amount0Sent, amount1Sent);
     }
 
+
+    error LiquidityPostGuard();
+    function _liquidityCache() private view returns (RangeOperations.PriceCache memory) {
+        (uint128 a,uint128 b,uint160 sp,int24 tk,uint64 ts,bool valid)=IAccountingRange(address(this)).priceCache();
+        return RangeOperations.PriceCache(a,b,sp,tk,ts,valid);
+    }
+    function validateAtomicSwap(int24 low,int24 high,uint256[] calldata amounts,uint256[] calldata minimums,
+        address input,address output) external view returns (bool z)
+    {
+        IAccountingRange rm=IAccountingRange(address(this));
+        require(amounts.length==minimums.length && amounts.length<=1,"E91");
+        RangeOperations.PriceCache memory pc=_liquidityCache();
+        RangeOperations.RangeConfig memory cfg=rm.config();
+        (uint256 b0,uint256 b1)=rm.getCurrentBalances();
+        RangeOperations.OptimalSwapParams memory plan=RangeOperations.calculateOptimalSwapParams(b0,b1,pc,cfg,low,high);
+        z=input==rm.token0();
+        uint256 amount;
+        if(amounts.length>0) {
+            require((input==rm.token0()&&output==rm.token1())||(input==rm.token1()&&output==rm.token0()),"E43");
+            RangeOperations.validateMinOutsAgainstOracle(z,amounts,minimums,pc,cfg,rm.initMultiSwapTvl(),
+                IAccountingPortfolio(rm.vault()).getCurrentPortfolioValue());
+            amount=amounts[0];
+        }
+        // Same submitted-plan bounds as the safety facade; keep this lower-level library acyclic.
+        uint256 expected=plan.swapNeeded?plan.amountIn:0;
+        if(expected==0)require(amount==0,"E93");
+        else {
+            require(z==plan.zeroForOne,"E94");
+            uint256 tolerance=expected*uint256(cfg.toleranceBps)/10000;
+            if(tolerance==0)tolerance=1;
+            require(amount+tolerance>=expected && amount<=expected+tolerance,"E93");
+        }
+    }
+
     function executeValidatedSwap(bool tokenInIsToken0, uint256 amountIn, uint256 minAmountOut)
         external
         returns (uint256 amountOut)
@@ -441,6 +491,8 @@ library ProtocolAccountingLib {
         );
         address tokenIn = tokenInIsToken0 ? token0 : token1;
         address tokenOut = tokenInIsToken0 ? token1 : token0;
+        (bool routed,uint256 received)=StrategyStateLib.tryDirectLiquidityRoutes(tokenInIsToken0,amountIn,minAmountOut);
+        if(routed)return received;
         amountOut = RangeOperations.executeSwapCore(
             tokenIn,
             tokenOut,
@@ -453,6 +505,8 @@ library ProtocolAccountingLib {
                 priceCache.poolSqrtPriceX96, config.maxSlippageBps, tokenInIsToken0
             )
         );
+        rm.refreshPriceCache();
+        if (!_liquidityCache().valid) revert LiquidityPostGuard();
         emit SwapExecuted(tokenIn, tokenOut, amountIn, amountOut);
     }
 
@@ -527,7 +581,21 @@ library ProtocolAccountingLib {
         cache.valid = fresh.valid;
     }
 
-    function depositValue(address manager, uint256 amount0, uint256 amount1) external view returns (uint256) {
+    /// @dev The queue is valued once in O(1), using the same fresh oracle as deposit(). Pending capital reserves capacity.
+    function availableDepositCapacity(VaultAccountingTypes.PendingQueue storage queue)
+        external view returns(uint256)
+    {
+        IAccountingAdmissionVault context=IAccountingAdmissionVault(address(this));
+        address manager=context.rangeManager();
+        uint256 ceiling=uint256(IAccountingAdmission(context.pauseController()).maxPoolTvlUsd())*1e8;
+        uint256 invested=IAccountingPortfolio(address(this)).getCurrentPortfolioValue();
+        if(invested>=ceiling)return 0;
+        uint256 pending=depositValue(manager,queue.total0,queue.total1);
+        uint256 available=ceiling-invested;
+        return pending>=available?0:available-pending;
+    }
+
+    function depositValue(address manager, uint256 amount0, uint256 amount1) public view returns (uint256) {
         try IAccountingRange(manager).priceCache() returns (
             uint128 price0, uint128 price1, uint160, int24, uint64, bool valid
         ) {
@@ -623,19 +691,8 @@ library ProtocolAccountingLib {
             : rawLimit > MAX_SQRT_PRICE_LIMIT_X96 ? MAX_SQRT_PRICE_LIMIT_X96 : uint160(rawLimit);
 
         uint256 token0Before = IERC20(token0).balanceOf(address(this));
-        uint256 amount1 = ISwapRouter(context.swapRouter())
-            .exactInputSingle(
-                ISwapRouter.ExactInputSingleParams({
-                    tokenIn: token0,
-                    tokenOut: token1,
-                    fee: context.swapPoolFee(),
-                    recipient: address(this),
-                    deadline: block.timestamp,
-                    amountIn: amount0,
-                    amountOutMinimum: minOut,
-                    sqrtPriceLimitX96: sqrtLimit
-                })
-            );
+        uint256 amount1=AutonomousRevenueLib.hedgeInventoryInput(address(RangeOperations),
+            context.swapRouter(),token0,token1,context.swapPoolFee(),amount0,minOut,sqrtLimit);
         if (IERC20(token0).balanceOf(address(this)) != token0Before - amount0) {
             revert InvalidNegativeHedgeSwap();
         }
@@ -747,6 +804,7 @@ library ProtocolAccountingLib {
         IERC20(token).safeTransfer(to, amount);
         emit TokenSentForHedge(token, amount, to);
     }
+
 
 
 }
